@@ -2,7 +2,11 @@ openapi: 3.1.0
 info:
   title: Silicon Waveform API
   version: 0.1.0
-  description: Provider-independent text-to-speech and speech-to-text for Carbons, Silicons, and applications using IAM OBO Access.
+  summary: Provider-independent text-to-speech and speech-to-text
+  description: |
+    Synchronous speech operations for Carbons, Silicons, and IAM applications
+    using OBO Access. Provider selection and fallback are internal. TTS output
+    is normalized to MP3 and stored in the represented actor's Briefcase.
 servers:
   - url: https://waveform.teamofsilicons.com/api/v1
 security:
@@ -11,129 +15,501 @@ security:
 tags:
   - name: Speech
   - name: Capabilities
+
 paths:
   /tts:
     post:
       tags: [Speech]
       operationId: synthesizeSpeech
       summary: Convert text to speech and store the MP3 in Briefcase
+      description: |
+        Attempts Gemini 3.1 Flash TTS Preview, ElevenLabs Multilingual v2,
+        then OpenAI tts-1. Returns only after the normalized MP3 is stored and
+        both its permanent and temporary Briefcase URLs are available. A
+        completed idempotent retry re-authorizes the stored file and returns a
+        freshly issued temporary URL without rerunning synthesis.
       parameters:
         - $ref: '#/components/parameters/OrgId'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AppId'
+        - $ref: '#/components/parameters/RequestId'
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [text]
-              properties:
-                text: { type: string, minLength: 1 }
-                lang: { type: string, description: BCP 47 language tag; used as a hint where supported }
+            schema: { $ref: '#/components/schemas/TTSRequest' }
       responses:
         '200':
-          description: Synthesized audio
+          description: Stored audio result, with a currently authorized temporary URL
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestId' }
+            Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TTSResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/SourceNotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
         default: { $ref: '#/components/responses/Error' }
+
   /stt:
     post:
       tags: [Speech]
       operationId: transcribeSpeech
-      summary: Transcribe a Briefcase file URL
+      summary: Transcribe an authorized Briefcase file
+      description: |
+        Re-authorizes the permanent Briefcase reference as the represented
+        actor, then attempts Gemini 3.5 Transcribe, OpenAI gpt-transcribe, and
+        Deepgram Nova-3 Multilingual. Waveform never fetches the supplied URL
+        directly. A completed idempotent retry verifies current access to the
+        exact source before returning its cached transcript.
       parameters:
         - $ref: '#/components/parameters/OrgId'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AppId'
+        - $ref: '#/components/parameters/RequestId'
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [file_url]
-              properties:
-                file_url: { type: string, format: uri, description: Permanent authenticated Briefcase URL }
-                language: { type: string, description: Optional BCP 47 language hint }
+            schema: { $ref: '#/components/schemas/STTRequest' }
       responses:
         '200':
-          description: Transcript
+          description: Normalized transcript released after current source authorization
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestId' }
+            Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/STTResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/SourceNotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
         default: { $ref: '#/components/responses/Error' }
+
   /capabilities:
     get:
       tags: [Capabilities]
       operationId: getCapabilities
+      summary: Get the stable Waveform-level speech capabilities
       security: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
       responses:
         '200':
-          description: Normalized service capabilities
+          description: Normalized service capabilities, independent of live provider health
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestId' }
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
           content:
             application/json:
-              schema:
-                type: object
-                required: [tts, stt]
-                properties:
-                  tts:
-                    type: object
-                    properties:
-                      output_format: { const: mp3 }
-                      languages: { type: array, items: { type: string } }
-                  stt:
-                    type: object
-                    properties:
-                      languages: { type: array, items: { type: string } }
-                      accepted_media_types: { type: array, items: { type: string } }
+              schema: { $ref: '#/components/schemas/Capabilities' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        default: { $ref: '#/components/responses/Error' }
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: IAM access token
+      description: Opaque IAM access token for a Carbon or Silicon.
     oboAccess:
       type: apiKey
       in: header
       name: X-IAM-OBO-Access-Proof
-      description: Short-lived IAM OBO Access proof. X-App-ID is also required.
+      description: |
+        Short-lived IAM proof bound to Waveform, the represented actor,
+        organization, and requested action. X-App-ID is also required.
+
   parameters:
-    OrgId: { name: X-Org-ID, in: header, required: true, schema: { type: string } }
-    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 8, maxLength: 255 } }
+    OrgId:
+      name: X-Org-ID
+      in: header
+      required: true
+      description: Organization selected for this operation; it must match verified IAM state.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+        pattern: '^[A-Za-z0-9_-]+$'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Scoped to actor, organization, and operation for at least 24 hours
+        (the default is 24 hours). Reusing a key with a different validated
+        request during retention returns 409.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 255
+        pattern: '^[!-~]+$'
+    AppId:
+      name: X-App-ID
+      in: header
+      required: false
+      description: Required with X-IAM-OBO-Access-Proof and omitted for Bearer requests.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 80
+        pattern: '^[A-Za-z0-9_-]+$'
+    RequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: |
+        Optional attempt correlation UUID. Invalid values are replaced by
+        Waveform. A successful idempotent replay returns the stored canonical
+        operation UUID instead.
+      schema: { type: string, format: uuid }
+
+  headers:
+    RequestId:
+      description: |
+        Waveform request correlation ID. A successful speech replay uses the
+        stored canonical operation UUID; replay-time errors use the current
+        attempt UUID.
+      schema: { type: string, format: uuid }
+    IdempotencyReplayed:
+      description: |
+        True when stable completed-operation state was reused. Any TTS
+        temporary delivery URL in the response was freshly authorized and is
+        not loaded from the idempotency record.
+      schema: { type: boolean }
+    CacheControl:
+      description: Prevents intermediaries from retaining private speech data or correlation IDs.
+      schema: { type: string, const: no-store }
+
   responses:
+    BadRequest:
+      description: Malformed headers, credentials, URL, language hint, or JSON input
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: IAM credentials are missing, invalid, expired, or inactive
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: The represented actor cannot use this organization or resource
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    SourceNotFound:
+      description: Briefcase reports the exact STT source or completed TTS replay file as missing
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Conflict:
+      description: Idempotency key mismatch or another request currently owns the key
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Retry-After: { schema: { type: integer, minimum: 1 } }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    PayloadTooLarge:
+      description: Text, request body, source media, or generated audio exceeds a synchronous limit
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    UnsupportedMediaType:
+      description: Briefcase source media is not accepted by the normalized STT contract
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    TooManyRequests:
+      description: Waveform admission control rejected the request
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Retry-After: { schema: { type: integer, minimum: 1 } }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    BadGateway:
+      description: Every provider failed or returned an invalid response
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    ServiceUnavailable:
+      description: IAM, Briefcase, PostgreSQL, or a required contract capability is unavailable
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Retry-After: { schema: { type: integer, minimum: 1 } }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    GatewayTimeout:
+      description: The bounded synchronous operation exceeded its deadline
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     Error:
-      description: Error
-      content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+      description: Normalized Waveform error
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestId' }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
   schemas:
+    TTSRequest:
+      type: object
+      additionalProperties: false
+      required: [text]
+      properties:
+        text:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Non-whitespace text. The limit counts Unicode scalar values.
+        lang:
+          type: string
+          minLength: 2
+          maxLength: 64
+          description: Optional canonicalizable BCP 47 hint; passed only to Gemini TTS.
+
+    STTRequest:
+      type: object
+      additionalProperties: false
+      required: [file_url]
+      properties:
+        file_url:
+          type: string
+          format: uri
+          pattern: '^https://'
+          description: Permanent authenticated URL at the configured Silicon Briefcase origin.
+        language:
+          type: string
+          minLength: 2
+          maxLength: 64
+          description: Optional canonicalizable BCP 47 transcription hint.
+
     TTSResult:
       type: object
+      additionalProperties: false
       required: [request_id, file_url, temporary_url, media_type, provider, duration_ms]
       properties:
-        request_id: { type: string, format: uuid }
-        file_url: { type: string, format: uri, description: Permanent Briefcase URL }
-        temporary_url: { type: string, format: uri }
-        media_type: { const: audio/mpeg }
-        provider: { type: string, description: Provider that completed the request }
-        duration_ms: { type: integer, minimum: 0 }
+        request_id:
+          type: string
+          format: uuid
+          description: Canonical operation UUID, preserved on completed replay.
+        file_url: { type: string, format: uri, description: Permanent authenticated Briefcase URL }
+        temporary_url:
+          type: string
+          format: uri
+          description: Freshly authorized expiring URL for immediate playback, including on replay.
+        media_type: { type: string, const: audio/mpeg }
+        provider:
+          type: string
+          enum: [gemini, elevenlabs, openai]
+          description: Provider that completed synthesis
+        duration_ms: { type: integer, format: int64, minimum: 0 }
+
     STTResult:
       type: object
-      required: [request_id, transcript, provider]
+      additionalProperties: false
+      required: [request_id, transcript, detected_language, provider, duration_ms]
       properties:
-        request_id: { type: string, format: uuid }
+        request_id:
+          type: string
+          format: uuid
+          description: Canonical operation UUID, preserved on completed replay.
         transcript: { type: string }
         detected_language: { type: [string, 'null'] }
-        provider: { type: string }
-        duration_ms: { type: [integer, 'null'], minimum: 0 }
+        provider:
+          type: string
+          enum: [gemini, openai, deepgram]
+          description: Provider that completed transcription
+        duration_ms: { type: [integer, 'null'], format: int64, minimum: 0 }
+
+    Capabilities:
+      type: object
+      additionalProperties: false
+      required: [tts, stt]
+      properties:
+        tts:
+          type: object
+          additionalProperties: false
+          required: [output_format, languages]
+          properties:
+            output_format: { type: string, const: mp3 }
+            languages:
+              type: array
+              minItems: 78
+              maxItems: 78
+              uniqueItems: true
+              items:
+                type: string
+                enum:
+                  - af
+                  - am
+                  - ar
+                  - az
+                  - be
+                  - bg
+                  - bn
+                  - ca
+                  - ceb
+                  - cmn
+                  - cs
+                  - da
+                  - de
+                  - el
+                  - en
+                  - es
+                  - et
+                  - eu
+                  - fa
+                  - fi
+                  - fil
+                  - fr
+                  - gl
+                  - gu
+                  - he
+                  - hi
+                  - hr
+                  - ht
+                  - hu
+                  - hy
+                  - id
+                  - is
+                  - it
+                  - ja
+                  - jv
+                  - ka
+                  - kn
+                  - ko
+                  - kok
+                  - la
+                  - lb
+                  - lo
+                  - lt
+                  - lv
+                  - mai
+                  - mg
+                  - mk
+                  - ml
+                  - mn
+                  - mr
+                  - ms
+                  - my
+                  - nb
+                  - ne
+                  - nl
+                  - nn
+                  - or
+                  - pa
+                  - pl
+                  - ps
+                  - pt
+                  - ro
+                  - ru
+                  - sd
+                  - si
+                  - sk
+                  - sl
+                  - sq
+                  - sr
+                  - sv
+                  - sw
+                  - ta
+                  - te
+                  - th
+                  - tr
+                  - uk
+                  - ur
+                  - vi
+              description: Best-effort BCP 47 language hints accepted by Waveform.
+        stt:
+          type: object
+          additionalProperties: false
+          required: [languages, accepted_media_types]
+          properties:
+            languages:
+              type: array
+              minItems: 10
+              maxItems: 10
+              uniqueItems: true
+              items:
+                type: string
+                enum: [de, en, es, fr, hi, it, ja, nl, pt, ru]
+              description: Best-effort BCP 47 language hints accepted by Waveform.
+            accepted_media_types:
+              type: array
+              minItems: 11
+              maxItems: 11
+              uniqueItems: true
+              items:
+                type: string
+                enum:
+                  - audio/mpeg
+                  - audio/wav
+                  - audio/flac
+                  - audio/ogg
+                  - audio/webm
+                  - audio/mp4
+                  - audio/aac
+                  - audio/m4a
+                  - video/mp4
+                  - video/mpeg
+                  - video/webm
+
     Error:
       type: object
+      additionalProperties: false
       required: [error]
       properties:
         error:
           type: object
-          required: [code, message]
+          additionalProperties: false
+          required: [code, message, request_id]
           properties:
-            code: { type: string }
-            message: { type: string }
-            request_id: { type: string }
+            code:
+              type: string
+              enum:
+                - invalid_request
+                - unauthenticated
+                - forbidden
+                - payload_too_large
+                - unsupported_media_type
+                - source_not_found
+                - idempotency_key_reused
+                - request_in_progress
+                - providers_exhausted
+                - dependency_contract_unavailable
+                - dependency_unavailable
+                - dependency_timeout
+                - too_many_requests
+                - request_timeout
+                - not_ready
+                - not_found
+                - method_not_allowed
+                - internal_error
+            message: { type: string, minLength: 1 }
+            request_id: { type: string, format: uuid }
