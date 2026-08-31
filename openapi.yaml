@@ -1,0 +1,139 @@
+openapi: 3.1.0
+info:
+  title: Silicon Waveform API
+  version: 0.1.0
+  description: Provider-independent text-to-speech and speech-to-text for Carbons, Silicons, and applications using IAM OBO Access.
+servers:
+  - url: https://waveform.teamofsilicons.com/api/v1
+security:
+  - bearerAuth: []
+  - oboAccess: []
+tags:
+  - name: Speech
+  - name: Capabilities
+paths:
+  /tts:
+    post:
+      tags: [Speech]
+      operationId: synthesizeSpeech
+      summary: Convert text to speech and store the MP3 in Briefcase
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string, minLength: 1 }
+                lang: { type: string, description: BCP 47 language tag; used as a hint where supported }
+      responses:
+        '200':
+          description: Synthesized audio
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TTSResult' }
+        default: { $ref: '#/components/responses/Error' }
+  /stt:
+    post:
+      tags: [Speech]
+      operationId: transcribeSpeech
+      summary: Transcribe a Briefcase file URL
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [file_url]
+              properties:
+                file_url: { type: string, format: uri, description: Permanent authenticated Briefcase URL }
+                language: { type: string, description: Optional BCP 47 language hint }
+      responses:
+        '200':
+          description: Transcript
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/STTResult' }
+        default: { $ref: '#/components/responses/Error' }
+  /capabilities:
+    get:
+      tags: [Capabilities]
+      operationId: getCapabilities
+      security: []
+      responses:
+        '200':
+          description: Normalized service capabilities
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tts, stt]
+                properties:
+                  tts:
+                    type: object
+                    properties:
+                      output_format: { const: mp3 }
+                      languages: { type: array, items: { type: string } }
+                  stt:
+                    type: object
+                    properties:
+                      languages: { type: array, items: { type: string } }
+                      accepted_media_types: { type: array, items: { type: string } }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: IAM access token
+    oboAccess:
+      type: apiKey
+      in: header
+      name: X-IAM-OBO-Access-Proof
+      description: Short-lived IAM OBO Access proof. X-App-ID is also required.
+  parameters:
+    OrgId: { name: X-Org-ID, in: header, required: true, schema: { type: string } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 8, maxLength: 255 } }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    TTSResult:
+      type: object
+      required: [request_id, file_url, temporary_url, media_type, provider, duration_ms]
+      properties:
+        request_id: { type: string, format: uuid }
+        file_url: { type: string, format: uri, description: Permanent Briefcase URL }
+        temporary_url: { type: string, format: uri }
+        media_type: { const: audio/mpeg }
+        provider: { type: string, description: Provider that completed the request }
+        duration_ms: { type: integer, minimum: 0 }
+    STTResult:
+      type: object
+      required: [request_id, transcript, provider]
+      properties:
+        request_id: { type: string, format: uuid }
+        transcript: { type: string }
+        detected_language: { type: [string, 'null'] }
+        provider: { type: string }
+        duration_ms: { type: [integer, 'null'], minimum: 0 }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            request_id: { type: string }
