@@ -1,0 +1,50 @@
+name: silicon-waveform
+
+services:
+  postgres:
+    image: postgres:17.6-bookworm
+    environment:
+      POSTGRES_DB: silicon_waveform
+      POSTGRES_USER: silicon_waveform
+      POSTGRES_PASSWORD: silicon_waveform
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U silicon_waveform -d silicon_waveform"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "5432:5432"
+    volumes:
+      - waveform-postgres:/var/lib/postgresql/data
+
+  waveform:
+    build:
+      context: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      WAVEFORM_ENVIRONMENT: development
+      WAVEFORM_BIND_ADDR: 0.0.0.0:8080
+      WAVEFORM_DATABASE_URL: postgres://silicon_waveform:silicon_waveform@postgres:5432/silicon_waveform
+      WAVEFORM_IAM_BASE_URL: http://host.docker.internal:8081
+      WAVEFORM_IAM_APP_ID: waveform
+      WAVEFORM_IAM_APP_SECRET: ${WAVEFORM_IAM_APP_SECRET:-local-development-only-secret}
+      WAVEFORM_IDEMPOTENCY_DIGEST_KEY: ${WAVEFORM_IDEMPOTENCY_DIGEST_KEY:-local-development-only-idempotency-digest-key}
+      WAVEFORM_BRIEFCASE_BASE_URL: http://host.docker.internal:8082
+      WAVEFORM_BRIEFCASE_PERMANENT_ORIGIN: https://host.docker.internal:8082
+      WAVEFORM_BRIEFCASE_CDN_ORIGIN: https://host.docker.internal:8082
+      WAVEFORM_FFMPEG_PATH: /usr/bin/ffmpeg
+      WAVEFORM_LOG_FILTER: silicon_waveform=debug,tower_http=info
+      WAVEFORM_LOG_JSON: "false"
+      WAVEFORM_GEMINI_API_KEY: ${WAVEFORM_GEMINI_API_KEY:-}
+      WAVEFORM_ELEVENLABS_API_KEY: ${WAVEFORM_ELEVENLABS_API_KEY:-}
+      WAVEFORM_OPENAI_API_KEY: ${WAVEFORM_OPENAI_API_KEY:-}
+      WAVEFORM_DEEPGRAM_API_KEY: ${WAVEFORM_DEEPGRAM_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:8080"
+
+volumes:
+  waveform-postgres:
