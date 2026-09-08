@@ -299,6 +299,11 @@ async fn first_claim_refreshes_timestamps_after_a_unique_conflict_wait()
         candidate_lease_id,
         Duration::from_secs(60),
     );
+    // Prime the transaction's activity snapshot before the contender starts.
+    // The polling helper must refresh it to observe a newly blocked query.
+    sqlx::query("SELECT count(*) FROM pg_stat_activity")
+        .execute(&mut *blocker)
+        .await?;
     let waiting_store = store.clone();
     let waiting_claim = tokio::spawn(async move { waiting_store.claim(pending_claim).await });
     wait_for_idempotency_lock_waiters(
@@ -445,6 +450,11 @@ async fn wait_for_idempotency_lock_waiters(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
+        // PostgreSQL caches activity statistics within this transaction. Each
+        // poll needs a fresh snapshot, otherwise an initial zero stays stale.
+        sqlx::query("SELECT pg_stat_clear_snapshot()")
+            .execute(&mut **transaction)
+            .await?;
         let waiters = sqlx::query_scalar::<_, i64>(
             r"
             SELECT count(*)
