@@ -76,13 +76,17 @@ impl OpenAiProvider {
     }
 
     /// Calls the binary Speech endpoint with the exact `tts-1` model.
-    async fn synthesize_audio(&self, text: &str) -> Result<AudioArtifact, ProviderError> {
+    async fn synthesize_audio(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+    ) -> Result<AudioArtifact, ProviderError> {
         let _permit = self.tts_runtime.try_acquire()?;
         let url = self.tts_runtime.url("v1/audio/speech")?;
         let body = OpenAiSpeechRequest {
             model: &self.tts_model,
             input: text,
-            voice: &self.voice,
+            voice: voice.unwrap_or(&self.voice),
             response_format: "mp3",
         };
         let response = self
@@ -156,6 +160,16 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl TextToSpeechProvider for OpenAiProvider {
+    fn with_api_key(
+        &self,
+        key: secrecy::SecretString,
+    ) -> Option<std::sync::Arc<dyn TextToSpeechProvider>> {
+        let mut provider = self.clone();
+        provider.tts_runtime.api_key = key.clone();
+        provider.stt_runtime.api_key = key.clone();
+        Some(std::sync::Arc::new(provider))
+    }
+
     fn name(&self) -> ProviderName {
         ProviderName::OpenAi
     }
@@ -165,14 +179,30 @@ impl TextToSpeechProvider for OpenAiProvider {
         request: TtsProviderRequest,
         _request_id: RequestId,
     ) -> Result<AudioArtifact, DomainProviderError> {
-        self.synthesize_audio(request.text.as_str())
-            .await
-            .map_err(|error| map_provider_error(ProviderName::OpenAi, error))
+        self.synthesize_audio(
+            request.text.as_str(),
+            match &request.voice {
+                Some(crate::domain::voice::ProviderVoice::OpenAi(voice)) => Some(voice.as_str()),
+                _ => None,
+            },
+        )
+        .await
+        .map_err(|error| map_provider_error(ProviderName::OpenAi, error))
     }
 }
 
 #[async_trait]
 impl SpeechToTextProvider for OpenAiProvider {
+    fn with_api_key(
+        &self,
+        key: secrecy::SecretString,
+    ) -> Option<std::sync::Arc<dyn SpeechToTextProvider>> {
+        let mut provider = self.clone();
+        provider.tts_runtime.api_key = key.clone();
+        provider.stt_runtime.api_key = key.clone();
+        Some(std::sync::Arc::new(provider))
+    }
+
     fn name(&self) -> ProviderName {
         ProviderName::OpenAi
     }
@@ -265,7 +295,7 @@ mod tests {
             .and(body_json(serde_json::json!({
                 "model": OPENAI_TTS_MODEL,
                 "input": "hello",
-                "voice": "alloy",
+                "voice": "shimmer",
                 "response_format": "mp3"
             })))
             .respond_with(
@@ -279,7 +309,19 @@ mod tests {
             return;
         };
 
-        let result = provider.synthesize_audio("hello").await;
+        let result = TextToSpeechProvider::synthesize(
+            &provider,
+            TtsProviderRequest {
+                text: crate::domain::speech::SpeechText::new("hello".into())
+                    .unwrap_or_else(|e| panic!("{e}")),
+                language: None,
+                voice: Some(crate::domain::voice::ProviderVoice::OpenAi(
+                    "shimmer".into(),
+                )),
+            },
+            RequestId::new(uuid::Uuid::new_v4()).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .await;
 
         assert!(matches!(result, Ok(audio) if audio.bytes() == valid_mp3_frame().as_slice()));
     }

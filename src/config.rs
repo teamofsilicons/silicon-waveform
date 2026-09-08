@@ -29,6 +29,8 @@ pub struct Settings {
     pub database: DatabaseSettings,
     /// Silicon IAM integration settings.
     pub iam: IamSettings,
+    /// Product secret storage and IAM webhook verification.
+    pub control: ControlSettings,
     /// Silicon Briefcase integration settings.
     pub briefcase: BriefcaseSettings,
     /// Speech-provider settings.
@@ -109,6 +111,17 @@ pub struct IamSettings {
     pub timeout: Duration,
 }
 
+/// Secrets for product storage and authenticated lifecycle notifications.
+#[derive(Clone, Debug)]
+pub struct ControlSettings {
+    /// Independent 32-byte key encoded as 64 lowercase hexadecimal characters.
+    pub encryption_key: Option<SecretString>,
+    /// Caller-chosen IAM Application webhook signing secret.
+    pub webhook_secret: Option<SecretString>,
+    /// Exact IAM signing-key version currently configured for this Application.
+    pub webhook_key_version: i64,
+}
+
 /// Silicon Briefcase access and download settings.
 #[derive(Clone, Debug)]
 pub struct BriefcaseSettings {
@@ -120,6 +133,8 @@ pub struct BriefcaseSettings {
     pub cdn_origin: Url,
     /// Waveform's Briefcase application-folder identifier.
     pub app_id: String,
+    /// Canonical Briefcase Application audience used for IAM OBO exchange.
+    pub audience: String,
     /// Deadline for one Briefcase API request.
     pub timeout: Duration,
     /// Deadline for a bounded source-media download.
@@ -307,6 +322,22 @@ impl Settings {
         let server = load_server(source, &limits)?;
         let database = load_database(source, environment)?;
         let iam = load_iam(source)?;
+        let control = ControlSettings {
+            encryption_key: optional_secret(source, "WAVEFORM_ENCRYPTION_KEY", 64, 64)?,
+            webhook_secret: optional_secret(source, "WAVEFORM_WEBHOOK_SIGNING_SECRET", 32, 512)?,
+            webhook_key_version: parse_or(source, "WAVEFORM_WEBHOOK_KEY_VERSION", "1")?,
+        };
+        if control.webhook_key_version < 1 {
+            return Err(invalid("WAVEFORM_WEBHOOK_KEY_VERSION", "must be positive"));
+        }
+        if environment == RuntimeEnvironment::Production {
+            if control.encryption_key.is_none() {
+                return Err(SettingsError::Missing("WAVEFORM_ENCRYPTION_KEY"));
+            }
+            if control.webhook_secret.is_none() {
+                return Err(SettingsError::Missing("WAVEFORM_WEBHOOK_SIGNING_SECRET"));
+            }
+        }
         let briefcase = load_briefcase(source, &iam.app_id, &limits)?;
         let providers = load_providers(source)?;
         let audio = load_audio(source)?;
@@ -320,6 +351,7 @@ impl Settings {
             server,
             database,
             iam,
+            control,
             briefcase,
             providers,
             audio,
@@ -445,7 +477,7 @@ fn load_iam(source: &impl EnvironmentSource) -> Result<IamSettings, SettingsErro
             value_or(
                 source,
                 "WAVEFORM_IAM_TOKEN_INTROSPECTION_PATH",
-                "/api/v1/auth/tokens/introspect",
+                "/api/v1/oauth/introspect",
             )?,
         )?,
         obo_verify_path: endpoint_path(
@@ -464,11 +496,11 @@ fn load_iam(source: &impl EnvironmentSource) -> Result<IamSettings, SettingsErro
         )?,
         tts_action: action_name(
             "WAVEFORM_IAM_TTS_ACTION",
-            value_or(source, "WAVEFORM_IAM_TTS_ACTION", "waveform.tts")?,
+            value_or(source, "WAVEFORM_IAM_TTS_ACTION", "obo.issue")?,
         )?,
         stt_action: action_name(
             "WAVEFORM_IAM_STT_ACTION",
-            value_or(source, "WAVEFORM_IAM_STT_ACTION", "waveform.stt")?,
+            value_or(source, "WAVEFORM_IAM_STT_ACTION", "obo.issue")?,
         )?,
         timeout: duration_seconds(source, "WAVEFORM_IAM_TIMEOUT_SECONDS", 5, 1, 60)?,
     })
@@ -500,6 +532,13 @@ fn load_briefcase(
             "WAVEFORM_BRIEFCASE_APP_ID",
             optional(source, "WAVEFORM_BRIEFCASE_APP_ID")?.unwrap_or_else(|| iam_app_id.to_owned()),
             1,
+            80,
+        )?,
+        audience: bounded_string(
+            "WAVEFORM_BRIEFCASE_AUDIENCE",
+            optional(source, "WAVEFORM_BRIEFCASE_AUDIENCE")?
+                .unwrap_or_else(|| "tos>briefcase".to_owned()),
+            3,
             80,
         )?,
         timeout: duration_seconds(source, "WAVEFORM_BRIEFCASE_TIMEOUT_SECONDS", 10, 1, 120)?,
@@ -1245,6 +1284,8 @@ mod tests {
         let settings = Settings::from_source(&TestEnvironment::valid())?;
 
         assert_eq!(settings.environment, RuntimeEnvironment::Development);
+        assert_eq!(settings.iam.tts_action, "obo.issue");
+        assert_eq!(settings.iam.stt_action, "obo.issue");
         assert_eq!(settings.limits.max_text_chars, 4_096);
         assert_eq!(settings.limits.max_media_bytes, 25 * 1_024 * 1_024);
         assert_eq!(settings.idempotency.ttl, Duration::from_hours(24));
@@ -1255,7 +1296,28 @@ mod tests {
         assert_eq!(settings.audio.max_input_bytes, 25 * 1_024 * 1_024);
         assert_eq!(settings.briefcase.permanent_origin.scheme(), "https");
         assert_eq!(settings.briefcase.cdn_origin.scheme(), "https");
+        assert_eq!(
+            settings.iam.token_introspection_path,
+            "/api/v1/oauth/introspect"
+        );
         assert!(!settings.providers.require_full_chain);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_iam_introspection_path_override_is_preserved() -> Result<(), SettingsError> {
+        let mut environment = TestEnvironment::valid();
+        environment.set(
+            "WAVEFORM_IAM_TOKEN_INTROSPECTION_PATH",
+            "/api/v1/auth/tokens/introspect",
+        );
+
+        let settings = Settings::from_source(&environment)?;
+
+        assert_eq!(
+            settings.iam.token_introspection_path,
+            "/api/v1/auth/tokens/introspect"
+        );
         Ok(())
     }
 

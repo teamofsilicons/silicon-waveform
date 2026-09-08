@@ -117,6 +117,15 @@ impl DeepgramProvider {
 
 #[async_trait]
 impl SpeechToTextProvider for DeepgramProvider {
+    fn with_api_key(
+        &self,
+        key: secrecy::SecretString,
+    ) -> Option<std::sync::Arc<dyn SpeechToTextProvider>> {
+        let mut provider = self.clone();
+        provider.runtime.api_key = key.clone();
+        Some(std::sync::Arc::new(provider))
+    }
+
     fn name(&self) -> ProviderName {
         ProviderName::Deepgram
     }

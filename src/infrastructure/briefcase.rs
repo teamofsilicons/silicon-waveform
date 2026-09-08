@@ -1,23 +1,4 @@
-//! Explicitly fail-closed Silicon Briefcase adapter.
-//!
-//! Briefcase currently documents metadata lookup and temporary-URL creation by
-//! entry ID, plus upload to a caller-supplied parent. It does not publish all
-//! operations that Waveform requires to implement its application port safely:
-//!
-//! - there is no safe operation that resolves a permanent URL to an entry ID or
-//!   reads its authenticated content;
-//! - there is no operation that resolves the represented actor's
-//!   `Private/{actor}/apps/{app_id}` destination folder; and
-//! - Waveform cannot obtain a new Briefcase-audience actor proof because IAM's
-//!   safe delegation gap is represented separately by `IamPort::delegate`.
-//!
-//! This adapter therefore makes no HTTP requests. For reads, it first validates
-//! that the permanent URL belongs to the configured Briefcase origin, ensuring
-//! a caller-controlled URL can never become a fetch target. It then validates
-//! the delegated proof's application, purpose, and expiry before returning the
-//! specific `BriefcaseError::ContractUnavailable`. Uploads apply the same
-//! delegation checks and return that contract error without inventing a folder
-//! identifier or wire schema.
+//! Official Briefcase uploads, delegated source reads, and current replay access checks.
 
 use std::str::FromStr as _;
 
@@ -50,11 +31,14 @@ pub enum BriefcaseAdapterBuildError {
     InvalidApplicationIdentity,
 }
 
-/// Briefcase port implementation that preserves the published contract gaps.
+/// Briefcase port backed by the published SDK and fresh per-operation IAM proofs.
 #[derive(Clone, Debug)]
 pub struct FailClosedBriefcaseStore {
     permanent_origin: Origin,
     application_id: ApplicationId,
+    uploader: Option<super::briefcase_sdk::BriefcaseSdkUploader>,
+    environment: Option<briefcase_client::EnvironmentKey>,
+    reader: Option<super::briefcase_reader::BriefcaseSdkReader>,
 }
 
 impl FailClosedBriefcaseStore {
@@ -74,7 +58,40 @@ impl FailClosedBriefcaseStore {
         Ok(Self {
             permanent_origin: settings.permanent_origin.origin(),
             application_id,
+            uploader: None,
+            environment: None,
+            reader: None,
         })
+    }
+
+    /// Enables the published one-shot upload contract with official SDK transport.
+    #[must_use]
+    pub fn with_uploads(mut self, settings: &BriefcaseSettings) -> Self {
+        self.uploader = Some(super::briefcase_sdk::BriefcaseSdkUploader::new(
+            settings.clone(),
+        ));
+        self
+    }
+
+    /// Binds every SDK storage request to the paired Briefcase test plane.
+    #[must_use]
+    pub fn with_environment(mut self, key: briefcase_client::EnvironmentKey) -> Self {
+        self.environment = Some(key);
+        self
+    }
+
+    /// Enables current-file reads using a fresh proof for each storage operation.
+    #[must_use]
+    pub fn with_reads(
+        mut self,
+        settings: &BriefcaseSettings,
+        iam: std::sync::Arc<dyn crate::application::ports::IamPort>,
+    ) -> Self {
+        self.reader = Some(super::briefcase_reader::BriefcaseSdkReader::new(
+            settings.clone(),
+            iam,
+        ));
+        self
     }
 
     fn validate_delegation(
@@ -98,10 +115,14 @@ impl FailClosedBriefcaseStore {
         if request.file_url.as_url().origin() != self.permanent_origin {
             return Err(BriefcaseError::Forbidden);
         }
-        self.validate_delegation(
-            &request.delegated_authorization,
-            DelegationPurpose::ReadBriefcaseFile,
-        )
+        if request
+            .authorization
+            .expires_at
+            .is_some_and(|expiry| expiry <= OffsetDateTime::now_utc())
+        {
+            return Err(BriefcaseError::Unauthorized);
+        }
+        Ok(())
     }
 }
 
@@ -112,7 +133,11 @@ impl BriefcasePort for FailClosedBriefcaseStore {
         request: BriefcaseFileAccessRequest,
     ) -> Result<(), BriefcaseError> {
         self.validate_file_access(&request)?;
-        Err(BriefcaseError::ContractUnavailable)
+        self.reader
+            .as_ref()
+            .ok_or(BriefcaseError::ContractUnavailable)?
+            .verify(request, self.environment.clone())
+            .await
     }
 
     async fn issue_temporary_url(
@@ -130,11 +155,11 @@ impl BriefcasePort for FailClosedBriefcaseStore {
         if request.source_url.as_url().origin() != self.permanent_origin {
             return Err(BriefcaseError::Forbidden);
         }
-        self.validate_delegation(
-            &request.delegated_authorization,
-            DelegationPurpose::ReadBriefcaseFile,
-        )?;
-        Err(BriefcaseError::ContractUnavailable)
+        self.reader
+            .as_ref()
+            .ok_or(BriefcaseError::ContractUnavailable)?
+            .read(request, self.environment.clone())
+            .await
     }
 
     async fn store_generated_audio(
@@ -145,7 +170,30 @@ impl BriefcasePort for FailClosedBriefcaseStore {
             &request.delegated_authorization,
             DelegationPurpose::StoreGeneratedAudio,
         )?;
-        Err(BriefcaseError::ContractUnavailable)
+        let uploader = self
+            .uploader
+            .as_ref()
+            .ok_or(BriefcaseError::ContractUnavailable)?;
+        let entry = uploader
+            .upload(super::briefcase_sdk::AudioUpload {
+                app_id: self.application_id.as_str(),
+                organization: request.authorization.organization_id.as_str(),
+                delegated_authorization: &request.delegated_authorization,
+                environment: self.environment.clone(),
+                filename: &request.filename,
+                audio: &request.audio,
+            })
+            .await
+            .map_err(|error| match error {
+                super::briefcase_sdk::UploadError::InvalidEntry => BriefcaseError::InvalidResponse,
+                super::briefcase_sdk::UploadError::Delegation => BriefcaseError::Unauthorized,
+                _ => BriefcaseError::Unavailable,
+            })?;
+        Ok(StoredAudio {
+            permanent_url: crate::domain::media::BriefcaseFileUrl::new(entry.permanent_url)
+                .map_err(|_| BriefcaseError::InvalidResponse)?,
+            temporary_url: None,
+        })
     }
 }
 
@@ -196,6 +244,7 @@ mod tests {
             permanent_origin: Url::parse("https://briefcase.example.test")?,
             cdn_origin: Url::parse("https://cdn.example.test")?,
             app_id: "waveform".to_owned(),
+            audience: "tos>briefcase".to_owned(),
             timeout: Duration::from_secs(10),
             download_timeout: Duration::from_secs(30),
             max_download_bytes: 25 * 1_024 * 1_024,
@@ -237,7 +286,7 @@ mod tests {
             .read_source_media(ReadSourceMediaRequest {
                 authorization: authorized_actor()?,
                 source_url,
-                delegated_authorization: delegation(DelegationPurpose::ReadBriefcaseFile)?,
+                subject_token: None,
                 size_limit: MediaSizeLimit::default(),
                 request_id: request_id()?,
             })
@@ -258,7 +307,7 @@ mod tests {
             .read_source_media(ReadSourceMediaRequest {
                 authorization: authorized_actor()?,
                 source_url,
-                delegated_authorization: delegation(DelegationPurpose::ReadBriefcaseFile)?,
+                subject_token: None,
                 size_limit: MediaSizeLimit::default(),
                 request_id: request_id()?,
             })
@@ -277,7 +326,7 @@ mod tests {
         )?)?;
         let access_request = BriefcaseFileAccessRequest {
             authorization: authorized_actor()?,
-            delegated_authorization: delegation(DelegationPurpose::ReadBriefcaseFile)?,
+            subject_token: None,
             file_url,
             request_id: request_id()?,
         };
@@ -301,7 +350,7 @@ mod tests {
         let adapter = FailClosedBriefcaseStore::new(&settings()?)?;
         let untrusted = BriefcaseFileAccessRequest {
             authorization: authorized_actor()?,
-            delegated_authorization: delegation(DelegationPurpose::ReadBriefcaseFile)?,
+            subject_token: None,
             file_url: BriefcaseFileUrl::new(Url::parse(
                 "https://attacker.example.test/api/v1/entries/one",
             )?)?,
@@ -312,11 +361,11 @@ mod tests {
             Err(BriefcaseError::Forbidden)
         );
 
-        let mut expired_delegation = delegation(DelegationPurpose::ReadBriefcaseFile)?;
-        expired_delegation.expires_at = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let mut expired_actor = authorized_actor()?;
+        expired_actor.expires_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
         let expired = BriefcaseFileAccessRequest {
-            authorization: authorized_actor()?,
-            delegated_authorization: expired_delegation,
+            authorization: expired_actor,
+            subject_token: None,
             file_url: BriefcaseFileUrl::new(Url::parse(
                 "https://briefcase.example.test/api/v1/entries/one",
             )?)?,

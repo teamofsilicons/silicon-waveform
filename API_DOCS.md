@@ -21,11 +21,17 @@ Waveform provides a provider-independent interface for text-to-speech and speech
 
 Exactly one authentication mode is accepted. Sending both Bearer and OBO
 credentials, or sending only one header from the OBO pair, is a malformed
-request. Waveform verifies the selected organization and requested action online
-with IAM for every speech operation. Bearer tokens use introspection and OBO
-proofs use IAM's published verification operation.
+request. Waveform verifies bearer tokens with IAM introspection. OBO speech is
+currently fail-closed until the released adapter threads the exact request
+method, path, and body digest required by IAM's current proof-verification
+contract; Waveform never forwards an unverified proof downstream.
 
 All current generation requests are synchronous and hold the connection until success or terminal failure.
+
+Production bearer TTS and test-plane TTS uploads are connected to the official
+IAM and Briefcase SDKs. STT delegated source reads and replay access checks use
+Briefcase 0.2.0. Local protocol tests use mocked upstreams; deployed paired
+environment verification remains outstanding.
 
 ## Text to speech
 
@@ -35,16 +41,20 @@ Converts text into speech and stores the final MP3 in Briefcase.
 
 - **Authentication:** Bearer or OBO Access.
 - **Required input:** `text`.
-- **Optional input:** `lang` as a BCP 47 language hint.
+- **Optional input:** `voice_profile` as a catalog ID, `lang` as a BCP 47 language hint and `provider_order` as
+  a provider-name array. The array is a preferred prefix; unlisted providers
+  follow the caller's account order for bearer requests. OBO requests use the
+  configured default order until IAM-backed account lookup is available.
 - **Required header:** `Idempotency-Key`.
-- **Returns:** Request ID, permanent Briefcase URL, temporary URL, provider, media type, and duration.
+- **Returns:** Request ID, permanent Briefcase URL, nullable temporary URL, provider, media type, and duration.
 
 Waveform attempts its configured provider chain in order. Provider failures are internal implementation details unless every provider fails. The output is normalized to `audio/mpeg` regardless of the provider that succeeds.
 
 Waveform creates the file in the represented actor's Briefcase application
 folder using a name based on the canonical operation start time established by
 the first successful PostgreSQL idempotency claim. The permanent URL is the
-durable reference; the temporary URL is for immediate playback.
+durable reference. The published one-shot upload contract returns no signed
+delivery URL, so `temporary_url` is currently null in the running service.
 
 The language hint may be ignored by providers that do not accept it. It must not change the response schema.
 
@@ -61,7 +71,10 @@ Transcribes an audio or video file referenced by a permanent Briefcase URL.
 
 - **Authentication:** Bearer or OBO Access.
 - **Required input:** `file_url`.
-- **Optional input:** `language` as a BCP 47 hint.
+- **Optional input:** `language` as a BCP 47 hint and `provider_order` as a
+  provider-name array. The array is a preferred prefix; unlisted providers
+  follow the caller's account order for bearer requests. OBO requests use the
+  configured default order until IAM-backed account lookup is available.
 - **Required header:** `Idempotency-Key`.
 - **Returns:** Request ID, transcript, detected language, provider, and source duration when available.
 
@@ -93,14 +106,22 @@ every fallback provider supports every language.
 
 ## Idempotency and errors
 
-An idempotency key is scoped to the represented actor, organization, and speech
-operation for at least 24 hours; the default retention is 24 hours. It is bound
+The actor-scoped `GET /jobs` history endpoint accepts optional `operation`,
+`limit` (1–100), and `cursor` query parameters. Rows expose `running`,
+`failed`, or `completed` status; failed rows include an `error_code`, and
+`finished_at` is present for terminal rows. Results are ordered newest
+first and return `next_cursor` when another page exists. Treat the cursor as an
+opaque value and pass it back unchanged; it encodes the last row's creation
+timestamp and UUID for stable keyset pagination.
+
+An idempotency key is scoped to the selected Waveform plane, represented actor,
+organization, and speech operation for at least 24 hours; the default retention is 24 hours. It is bound
 to an HMAC-SHA-256 digest of the validated request. A completed retry returns
 the original operation request ID and stable result fields. Before returning a
 cached STT transcript, Waveform rechecks the current actor's access to the exact
 source file. A completed TTS retry rechecks access to the generated file and
-issues a fresh temporary URL; expiring delivery URLs are never stored in the
-idempotency record. Neither replay reruns a speech provider. Reusing the key for
+returns its permanent URL with `temporary_url: null`; expiring delivery URLs
+are never stored in the idempotency record. Neither replay reruns a speech provider. Reusing the key for
 a different request, or retrying while the first request still owns its lease,
 returns `409`; in-progress responses include `Retry-After`.
 
@@ -136,11 +157,9 @@ configuration, PostgreSQL, FFmpeg, provider availability, and required
 dependency-contract capabilities without making billable provider calls. These
 routes are intentionally outside `/api/v1`.
 
-The shipped dependency composition remains deliberately unavailable for speech:
-`/health/ready` returns `503 not_ready`, and otherwise-valid speech work that
-reaches downstream delegation returns `503` at the first missing IAM or
-Briefcase contract boundary. This happens before a speech provider is called or
-billed.
+The required bearer speech storage contracts are implemented. Readiness reflects
+local database, codec and provider configuration; it does not prove remote IAM
+or Briefcase credentials are valid and does not make billable provider calls.
 
 ## Complete flows
 
@@ -148,34 +167,35 @@ billed.
 
 ```text
 Caller submits text and optional language
-  -> Waveform verifies actor context and obtains Briefcase delegation
+  -> Waveform verifies actor context
   -> Waveform attempts provider chain
   -> successful audio is normalized to MP3
-  -> Waveform stores MP3 in Briefcase through OBO Access
-  -> caller receives permanent and temporary URLs
+  -> Waveform mints an exact-byte proof and stores MP3 in Briefcase through OBO Access
+  -> caller receives a permanent URL and null temporary URL
 ```
 
 ### Voice-message transcription
 
 ```text
 DM uploads voice file to Briefcase
-  -> DM calls Waveform STT through OBO Access
+  -> caller submits the permanent URL using its Waveform-issued bearer token
   -> Waveform verifies actor context and obtains Briefcase delegation
-  -> Waveform reads authorized Briefcase file
+  -> Waveform resolves and reads the authorized Briefcase file with fresh proofs
+  -> Waveform measures decoded source duration
   -> Waveform attempts provider chain
   -> DM sends voice message with transcript or a recorded transcription failure
 ```
 
-## Remaining contract gaps and upstream blockers
+## Remaining integration work and optional extensions
 
-- Long-running asynchronous jobs, status polling, and cancellation are not defined.
-- TTS voice, style, speed, pitch, and output-quality controls are not public inputs.
-- STT timestamps, segments, confidence, diarization, punctuation, and speaker labels are not represented.
-- IAM does not yet define an operation to mint a new Briefcase-audience proof for an actor after Waveform verifies the inbound credential.
-- Briefcase does not yet define actor application-folder resolution or a safe
-  authenticated mapping from permanent file URLs to the entry-ID-based read,
-  access-check, and delivery-URL operations Waveform needs. Waveform fails
-  closed at these boundaries.
-- Usage quotas, cost attribution, per-organization rate limits, and organization policy are undefined.
-- Provider data-processing regions and account-level retention policies still require deployment policy.
-- Synchronous processing remains unsuitable for very long media and needs a durable job API.
+- Deployed paired IAM/Briefcase testing with real test keys and a test login remains required.
+- Inbound OBO speech cannot mint a downstream Briefcase proof from the consumed incoming proof. Use a bearer token issued to Waveform for implemented speech flows.
+- Voice/style controls, diarization, transcript segments, quotas and asynchronous execution are outside the current product contract.
+- Jobs expose running/failed/completed state, polling, cancellation recovery and expired-lease recovery; processing itself remains synchronous and bounded.
+
+### Voice profiles
+
+`GET /api/v1/voice-profiles` returns the selected environment's catalog.
+`PATCH /api/v1/preferences` accepts `voice_profile` to change the account default.
+TTS responses and job history include a nullable `voice_profile: {id, revision}`
+for the mapping used. See [voice profiles](docs/voice-profiles.md) for fallback semantics.

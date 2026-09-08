@@ -1,16 +1,15 @@
 //! Production dependency composition and process lifecycle management.
 //!
 //! Composition deliberately preserves the complete provider order even when a
-//! development credential is absent. A disabled adapter occupies that slot and
-//! returns a redacted configuration failure, allowing the application service
+//! deployment credential is absent. An adapter without a deployment or personal
+//! key returns a redacted configuration failure, allowing the application service
 //! to continue to the next documented provider without making a network call.
 //! Readiness separately requires at least one configured provider for both TTS
-//! and STT. It also remains false while the IAM delegation and Briefcase
-//! content/folder contracts are unavailable.
+//! and STT. Released IAM delegation and Briefcase read/upload contracts are wired;
+//! readiness does not perform paid speech calls or consume user credentials.
 
 use std::{future::IntoFuture as _, str::FromStr as _, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use secrecy::ExposeSecret as _;
 use sqlx::{
     ConnectOptions as _, PgPool,
@@ -36,10 +35,7 @@ use crate::{
     },
     domain::{
         idempotency::{IdempotencyLeaseId, RequestDigestKey},
-        identity::RequestId,
-        media::{AudioArtifact, BriefcaseOrigin, MediaSizeLimit},
-        provider::{ProviderError, ProviderFailureKind, ProviderName},
-        speech::{SttProviderRequest, SttProviderResult, TtsProviderRequest},
+        media::{BriefcaseOrigin, MediaSizeLimit},
     },
     shutdown, telemetry,
 };
@@ -62,7 +58,8 @@ const PROVIDER_RESPONSE_OVERHEAD_BYTES: usize = 1_024 * 1_024;
 const CLEANUP_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const DATABASE_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 const DATABASE_MAX_LIFETIME: Duration = Duration::from_mins(30);
-const DEPENDENCY_CONTRACTS_AVAILABLE: bool = false;
+const ENVIRONMENT_CLEANUP_INTERVAL: Duration = Duration::from_hours(1);
+const DEPENDENCY_CONTRACTS_AVAILABLE: bool = true;
 
 /// Redacted process bootstrap or lifecycle failure.
 #[derive(Debug, Error)]
@@ -135,6 +132,10 @@ async fn run(settings: Settings) -> Result<(), RuntimeError> {
         return Err(RuntimeError::DatabaseMigration);
     }
 
+    if super::testing::seed_audio(&pool).await.is_err() {
+        close_pool(&pool, settings.server.shutdown_timeout).await;
+        return Err(RuntimeError::DatabaseMigration);
+    }
     let result = compose_and_serve(&settings, provider_client, pool.clone()).await;
     close_pool(&pool, settings.server.shutdown_timeout).await;
     result
@@ -197,6 +198,7 @@ async fn connect_database(settings: &Settings) -> Result<PgPool, RuntimeError> {
         .map_err(|_| RuntimeError::DatabaseConnection)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn compose_and_serve(
     settings: &Settings,
     provider_client: reqwest::Client,
@@ -211,11 +213,16 @@ async fn compose_and_serve(
     let configured_stt_providers = provider_chains.availability.stt_count();
     let provider_chains_configured = configured_tts_providers > 0 && configured_stt_providers > 0;
 
-    let iam: Arc<dyn IamPort> =
-        Arc::new(IamHttpAdapter::new(&settings.iam).map_err(|_| RuntimeError::IamConfiguration)?);
+    let iam: Arc<dyn IamPort> = Arc::new(
+        IamHttpAdapter::new(&settings.iam)
+            .map_err(|_| RuntimeError::IamConfiguration)?
+            .with_storage_audience(&settings.briefcase.audience),
+    );
     let briefcase: Arc<dyn BriefcasePort> = Arc::new(
         FailClosedBriefcaseStore::new(&settings.briefcase)
-            .map_err(|_| RuntimeError::BriefcaseConfiguration)?,
+            .map_err(|_| RuntimeError::BriefcaseConfiguration)?
+            .with_uploads(&settings.briefcase)
+            .with_reads(&settings.briefcase, iam.clone()),
     );
 
     let audio = Arc::new(FfmpegAudioNormalizer::new(AudioNormalizerConfig {
@@ -228,7 +235,7 @@ async fn compose_and_serve(
     let audio_port: Arc<dyn AudioNormalizer> = audio.clone();
 
     let idempotency = Arc::new(PostgresIdempotencyStore::new(
-        pool,
+        pool.clone(),
         settings.database.statement_timeout,
         settings.idempotency.retry_after,
         settings.idempotency.ttl,
@@ -251,10 +258,14 @@ async fn compose_and_serve(
     )
     .map_err(|_| RuntimeError::ServiceConfiguration)?;
 
+    let control = Arc::new(
+        crate::control::ControlState::new(pool.clone(), settings)
+            .map_err(|_| RuntimeError::ServiceConfiguration)?,
+    );
     let service = Arc::new(
         WaveformService::new(
-            iam,
-            briefcase,
+            iam.clone(),
+            briefcase.clone(),
             idempotency_port.clone(),
             audio_port.clone(),
             Arc::new(UuidLeaseIdGenerator),
@@ -262,7 +273,38 @@ async fn compose_and_serve(
             provider_chains.stt,
             policy,
         )
-        .map_err(|_| RuntimeError::ServiceConfiguration)?,
+        .map_err(|_| RuntimeError::ServiceConfiguration)?
+        .with_provider_keys(control.clone())
+        .with_voice_profiles(control.clone()),
+    );
+    // Test requests reuse orchestration and persistence. The router replaces
+    // storage ports with paired test IAM/Briefcase clients before execution;
+    // only billable speech generation uses deterministic fixtures.
+    let fixture_policy = ServicePolicy::new(
+        settings.idempotency.lease,
+        media_limit,
+        BriefcaseOrigin::new(settings.briefcase.permanent_origin.clone())
+            .map_err(|_| RuntimeError::ServiceConfiguration)?,
+        settings.limits.max_text_chars,
+        RequestDigestKey::new(settings.idempotency.digest_key.expose_secret().as_bytes())
+            .map_err(|_| RuntimeError::ServiceConfiguration)?,
+    )
+    .map_err(|_| RuntimeError::ServiceConfiguration)?;
+    let (fixture_tts, fixture_stt) =
+        crate::infrastructure::testing::database_provider_chains(pool.clone());
+    let fixture_service = Arc::new(
+        WaveformService::new(
+            iam,
+            briefcase,
+            idempotency_port.clone(),
+            audio_port.clone(),
+            Arc::new(UuidLeaseIdGenerator),
+            fixture_tts,
+            fixture_stt,
+            fixture_policy,
+        )
+        .map_err(|_| RuntimeError::ServiceConfiguration)?
+        .with_voice_profiles(control.clone()),
     );
     let readiness = ReadinessChecks::new(
         idempotency_port,
@@ -275,7 +317,9 @@ async fn compose_and_serve(
         readiness,
         settings.server.tts_deadline,
         settings.server.stt_deadline,
-    );
+    )
+    .with_control(control.clone())
+    .with_fixture_service(fixture_service);
     let application = crate::api::router(state, &settings.server);
     let listener = TcpListener::bind(settings.server.bind_addr)
         .await
@@ -288,15 +332,15 @@ async fn compose_and_serve(
         settings.idempotency.cleanup_interval,
         settings.idempotency.cleanup_batch.get(),
     );
+    let environment_cleanup_shutdown = CancellationToken::new();
+    let environment_cleanup_task =
+        spawn_environment_cleanup(control.clone(), environment_cleanup_shutdown.clone());
 
     tracing::info!(
         bind_address = %settings.server.bind_addr,
         configured_tts_providers,
         configured_stt_providers,
         "Waveform API is listening"
-    );
-    tracing::warn!(
-        "readiness is fail-closed while IAM delegation and Briefcase content contracts are unavailable"
     );
 
     serve_until_shutdown(
@@ -305,6 +349,8 @@ async fn compose_and_serve(
         settings.server.shutdown_timeout,
         cleanup_shutdown,
         cleanup_task,
+        environment_cleanup_shutdown,
+        environment_cleanup_task,
     )
     .await
 }
@@ -315,6 +361,8 @@ async fn serve_until_shutdown(
     shutdown_timeout: Duration,
     cleanup_shutdown: CancellationToken,
     cleanup_task: JoinHandle<()>,
+    environment_cleanup_shutdown: CancellationToken,
+    environment_cleanup_task: JoinHandle<()>,
 ) -> Result<(), RuntimeError> {
     let server_shutdown = CancellationToken::new();
     let graceful_shutdown = server_shutdown.clone();
@@ -329,6 +377,7 @@ async fn serve_until_shutdown(
             result = &mut server => result.map_err(|_| RuntimeError::Server),
             () = shutdown::signal() => {
                 cleanup_shutdown.cancel();
+                environment_cleanup_shutdown.cancel();
                 server_shutdown.cancel();
                 if let Ok(result) = tokio::time::timeout(shutdown_timeout, &mut server).await {
                     result.map_err(|_| RuntimeError::Server)
@@ -341,8 +390,31 @@ async fn serve_until_shutdown(
     };
 
     cleanup_shutdown.cancel();
+    environment_cleanup_shutdown.cancel();
     stop_cleanup(cleanup_task).await;
+    stop_cleanup(environment_cleanup_task).await;
     server_result
+}
+
+fn spawn_environment_cleanup(
+    control: Arc<crate::control::ControlState>,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(ENVIRONMENT_CLEANUP_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                _ = ticker.tick() => match control.cleanup_environments().await {
+                    Ok(changed) if changed > 0 => tracing::info!(changed, "test environments cleaned"),
+                    Ok(_) => {}
+                    Err(_) => tracing::warn!("test environment cleanup failed"),
+                },
+            }
+        }
+    })
 }
 
 fn spawn_cleanup(
@@ -449,10 +521,10 @@ fn build_gemini(
     settings: &GeminiSettings,
     max_audio_bytes: usize,
 ) -> (Arc<dyn TextToSpeechProvider>, Arc<dyn SpeechToTextProvider>) {
-    let Some(api_key) = settings.api_key.as_ref() else {
-        let provider = Arc::new(DisabledProvider::new(ProviderName::Gemini));
-        return (provider.clone(), provider);
-    };
+    let api_key = settings
+        .api_key
+        .clone()
+        .unwrap_or_else(|| secrecy::SecretString::from(String::new()));
     let provider = Arc::new(GeminiProvider::new(
         client.clone(),
         api_key.clone(),
@@ -482,9 +554,10 @@ fn build_elevenlabs(
     settings: &ElevenLabsSettings,
     max_audio_bytes: usize,
 ) -> Arc<dyn TextToSpeechProvider> {
-    let Some(api_key) = settings.api_key.as_ref() else {
-        return Arc::new(DisabledProvider::new(ProviderName::ElevenLabs));
-    };
+    let api_key = settings
+        .api_key
+        .clone()
+        .unwrap_or_else(|| secrecy::SecretString::from(String::new()));
     Arc::new(ElevenLabsProvider::new(
         client.clone(),
         api_key.clone(),
@@ -507,10 +580,10 @@ fn build_openai(
     settings: &OpenAiSettings,
     max_audio_bytes: usize,
 ) -> (Arc<dyn TextToSpeechProvider>, Arc<dyn SpeechToTextProvider>) {
-    let Some(api_key) = settings.api_key.as_ref() else {
-        let provider = Arc::new(DisabledProvider::new(ProviderName::OpenAi));
-        return (provider.clone(), provider);
-    };
+    let api_key = settings
+        .api_key
+        .clone()
+        .unwrap_or_else(|| secrecy::SecretString::from(String::new()));
     let provider = Arc::new(OpenAiProvider::new(
         client.clone(),
         api_key.clone(),
@@ -539,9 +612,10 @@ fn build_deepgram(
     client: &reqwest::Client,
     settings: &DeepgramSettings,
 ) -> Arc<dyn SpeechToTextProvider> {
-    let Some(api_key) = settings.api_key.as_ref() else {
-        return Arc::new(DisabledProvider::new(ProviderName::Deepgram));
-    };
+    let api_key = settings
+        .api_key
+        .clone()
+        .unwrap_or_else(|| secrecy::SecretString::from(String::new()));
     Arc::new(DeepgramProvider::new(
         client.clone(),
         api_key.clone(),
@@ -583,51 +657,6 @@ const fn encoded_audio_response_limit(max_audio_bytes: usize) -> usize {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct DisabledProvider {
-    name: ProviderName,
-}
-
-impl DisabledProvider {
-    const fn new(name: ProviderName) -> Self {
-        Self { name }
-    }
-
-    const fn error(self) -> ProviderError {
-        ProviderError::new(self.name, ProviderFailureKind::Authentication)
-    }
-}
-
-#[async_trait]
-impl TextToSpeechProvider for DisabledProvider {
-    fn name(&self) -> ProviderName {
-        self.name
-    }
-
-    async fn synthesize(
-        &self,
-        _request: TtsProviderRequest,
-        _request_id: RequestId,
-    ) -> Result<AudioArtifact, ProviderError> {
-        Err(self.error())
-    }
-}
-
-#[async_trait]
-impl SpeechToTextProvider for DisabledProvider {
-    fn name(&self) -> ProviderName {
-        self.name
-    }
-
-    async fn transcribe(
-        &self,
-        _request: SttProviderRequest,
-        _request_id: RequestId,
-    ) -> Result<SttProviderResult, ProviderError> {
-        Err(self.error())
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 struct UuidLeaseIdGenerator;
 
 impl LeaseIdGenerator for UuidLeaseIdGenerator {
@@ -647,20 +676,7 @@ fn lease_id_from(mut next: impl FnMut() -> Uuid) -> IdempotencyLeaseId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::provider::{STT_PROVIDER_CHAIN, TTS_PROVIDER_CHAIN};
-
-    #[test]
-    fn disabled_adapters_preserve_their_provider_identity() {
-        let gemini = DisabledProvider::new(ProviderName::Gemini);
-        let deepgram = DisabledProvider::new(ProviderName::Deepgram);
-
-        assert_eq!(TextToSpeechProvider::name(&gemini), ProviderName::Gemini);
-        assert_eq!(
-            SpeechToTextProvider::name(&deepgram),
-            ProviderName::Deepgram
-        );
-        assert_eq!(gemini.error().kind, ProviderFailureKind::Authentication);
-    }
+    use crate::domain::provider::{ProviderName, STT_PROVIDER_CHAIN, TTS_PROVIDER_CHAIN};
 
     #[test]
     fn readiness_requires_at_least_one_provider_for_each_operation() {

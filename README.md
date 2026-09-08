@@ -10,14 +10,24 @@ The product contract lives in [`UNDERSTANDING.md`](./UNDERSTANDING.md),
 implementation choices and contract interpretations are recorded in the
 append-only [`decisions.md`](./decisions.md).
 
+## Current implementation status
+
+Bearer TTS and test-plane TTS use official IAM proof exchange and Briefcase
+uploads. Personal provider keys are selected per account, and CLI sessions
+are isolated by server and test plane. STT source reads and TTS/STT replay
+access checks use the Briefcase 0.2 delegated API. Inbound OBO speech remains
+unavailable because IAM does not issue a downstream subject token from a
+consumed proof. See [the implementation checklist](./docs/IMPLEMENTATION.md) for
+remaining work and the distinction between local mocks and deployed tests.
+
 ## Public API
 
 The production base URL is
 `https://waveform.teamofsilicons.com/api/v1`.
 
 - `POST /tts` accepts text and an optional BCP 47 language hint, synthesizes
-  speech, normalizes it to MP3, stores it in Briefcase, and returns permanent
-  and temporary URLs.
+  speech, normalizes it to MP3, stores it in Briefcase, and returns a permanent
+  URL. `temporary_url` is nullable.
 - `POST /stt` accepts a permanent Briefcase file URL and optional BCP 47
   language hint, re-authorizes the file read, and returns a normalized
   transcript.
@@ -76,7 +86,8 @@ lifecycle state, completed STT results, and only the durable fields of a
 completed TTS result. It never persists an expiring TTS delivery URL. Every
 completed replay still performs online IAM authorization: STT rechecks current
 read access to the exact source before releasing the cached transcript, while
-TTS rechecks access to the generated file and obtains a fresh temporary URL.
+TTS rechecks access to the generated file and returns its permanent URL with
+`temporary_url: null`.
 Speech providers, audio normalization, and content mutations are not repeated.
 Content-free provider-attempt outcomes and latency are emitted as structured
 telemetry rather than transactional data. Waveform never persists request text,
@@ -130,8 +141,10 @@ cargo deny check
 
 Waveform intentionally fails closed where neighboring contracts are incomplete:
 
-- IAM publishes OBO verification but has no operation to exchange the verified
-  actor context for a new Briefcase-audience proof.
+- IAM's current OBO verifier binds proofs to the exact request method, path,
+  and body digest; the released Waveform adapter does not yet receive those
+  raw request bytes and therefore fails closed. IAM also has no operation to
+  exchange the verified actor context for a new Briefcase-audience proof.
 - Briefcase requires an upload `parent_id` but has no operation to resolve or
   create the represented actor's `apps/{app_id}` folder.
 - Briefcase metadata and delivery-URL operations require an entry ID, while

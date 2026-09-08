@@ -4,21 +4,33 @@ info:
   version: 0.1.0
   summary: Provider-independent text-to-speech and speech-to-text
   description: |
-    Synchronous speech operations for Carbons, Silicons, and IAM applications
-    using OBO Access. Provider selection and fallback are internal. TTS output
-    is normalized to MP3 and stored in the represented actor's Briefcase.
+    Synchronous speech operations for Carbons, Silicons, and IAM applications.
+    Provider selection and fallback are internal. TTS output is normalized to
+    MP3 and stored in the represented actor's Briefcase. OBO requests are
+    accepted only when the configured IAM and Briefcase request-bound contracts
+    are available. Test planes use deterministic speech with paired IAM and
+    Briefcase SDK uploads, delegated reads, and current replay access checks.
+    Inbound OBO speech is unavailable until IAM supports downstream delegation
+    from the initiating request. Bearer speech is implemented.
 servers:
   - url: https://waveform.teamofsilicons.com/api/v1
 security:
   - bearerAuth: []
-  - oboAccess: []
 tags:
   - name: Speech
   - name: Capabilities
+  - name: Authentication
+  - name: Jobs
+  - name: Testing environments
+  - name: Account
+  - name: Webhooks
 
 paths:
   /tts:
     post:
+      security:
+        - bearerAuth: []
+        - oboAccess: []
       tags: [Speech]
       operationId: synthesizeSpeech
       summary: Convert text to speech and store the MP3 in Briefcase
@@ -62,6 +74,9 @@ paths:
 
   /stt:
     post:
+      security:
+        - bearerAuth: []
+        - oboAccess: []
       tags: [Speech]
       operationId: transcribeSpeech
       summary: Transcribe an authorized Briefcase file
@@ -124,6 +139,456 @@ paths:
         '429': { $ref: '#/components/responses/TooManyRequests' }
         default: { $ref: '#/components/responses/Error' }
 
+  /auth/login:
+    post:
+      tags: [Authentication]
+      operationId: login
+      summary: Exchange an IAM SLT for Waveform session tokens
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: IAM access and refresh tokens
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthTokenResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /auth/refresh:
+    post:
+      tags: [Authentication]
+      operationId: refresh
+      summary: Exchange an IAM refresh token for a new token pair
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: Refreshed IAM access and refresh tokens
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthTokenResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /auth/logout:
+    post:
+      tags: [Authentication]
+      operationId: logout
+      summary: Revoke an IAM access or refresh token
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LogoutRequest' }
+      responses:
+        '204': { description: Token revoked successfully }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /auth/me:
+    get:
+      tags: [Authentication]
+      operationId: getCurrentActor
+      summary: Return the current actor's verified IAM authority
+      parameters:
+        - in: header
+          name: X-Org-ID
+          required: false
+          description: Optional organization assertion; otherwise derived from IAM.
+          schema: { type: string }
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      responses:
+        '200':
+          description: Verified actor and organization authority
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationAuthorization' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /jobs:
+    get:
+      tags: [Jobs]
+      operationId: listJobs
+      summary: List actor-scoped speech job history
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - in: query
+          name: operation
+          schema: { type: string, enum: [tts, stt] }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - in: query
+          name: cursor
+          description: Opaque keyset cursor returned as next_cursor.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Newest jobs first
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /jobs/{job_id}:
+    get:
+      tags: [Jobs]
+      operationId: getJob
+      summary: Get one actor-scoped speech job
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Speech job
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /preferences:
+    get:
+      tags: [Account]
+      operationId: getPreferences
+      summary: Get effective provider order and account voice profile
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      responses:
+        '200':
+          description: Effective account provider preferences
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Preferences' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Account]
+      operationId: updatePreferences
+      summary: Set account provider order and/or default voice profile
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PreferencesUpdate' }
+      responses:
+        '200':
+          description: Updated provider order preferences
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PreferencesUpdate' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /voice-profiles:
+    get:
+      tags: [Account]
+      operationId: listVoiceProfiles
+      summary: List profiles and provider mappings in the selected environment
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      responses:
+        '200':
+          description: Voice catalog; provisional mappings have auditioned=false
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/VoiceProfile' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /provider-keys:
+    get:
+      tags: [Account]
+      operationId: listProviderKeys
+      summary: List configured provider keys without revealing secrets
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      responses:
+        '200':
+          description: Configured provider metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProviderKeyInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /provider-keys/{provider}:
+    put:
+      tags: [Account]
+      operationId: setProviderKey
+      summary: Replace a personal provider API key
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - $ref: '#/components/parameters/Provider'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProviderKeyRequest' }
+      responses:
+        '204': { description: Provider key stored }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      tags: [Account]
+      operationId: deleteProviderKey
+      summary: Delete a personal provider API key
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - $ref: '#/components/parameters/Provider'
+      responses:
+        '204': { description: Provider key deleted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /testing-environment:
+    get:
+      tags: [Testing environments]
+      operationId: getCurrentTestingEnvironment
+      summary: Describe the selected isolated test plane
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      responses:
+        '200':
+          description: Selected testing environment metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestingEnvironment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /testing-environment/clean:
+    post:
+      tags: [Testing environments]
+      operationId: cleanTestingEnvironment
+      summary: Delete all disposable data in the selected test plane
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      responses:
+        '200':
+          description: Disposable test-plane data removed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cleaned]
+                properties: { cleaned: { type: boolean, const: true } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /testing-environments:
+    post:
+      tags: [Testing environments]
+      operationId: createTestingEnvironment
+      summary: Create an isolated test plane
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTestingEnvironment' }
+      responses:
+        '200':
+          description: Created plane and one-time root key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreatedTestingEnvironment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      tags: [Testing environments]
+      operationId: listTestingEnvironments
+      summary: List test planes in the current organization
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+      responses:
+        '200':
+          description: Plane metadata; root keys are never listed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/TestingEnvironment' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /testing-environments/{environment_id}:
+    get:
+      tags: [Testing environments]
+      operationId: getTestingEnvironment
+      summary: Get test-plane metadata
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/EnvironmentId'
+      responses:
+        '200':
+          description: Test-plane metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestingEnvironment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /testing-environments/{environment_id}/key:
+    get:
+      tags: [Testing environments]
+      operationId: getTestingEnvironmentKey
+      summary: Retrieve the current test-plane root key
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/EnvironmentId'
+      responses:
+        '200':
+          description: Current root key
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key]
+                properties: { key: { type: string, minLength: 32, maxLength: 32 } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /testing-environments/{environment_id}/rotate-key:
+    post:
+      tags: [Testing environments]
+      operationId: rotateTestingEnvironmentKey
+      summary: Rotate a test-plane root key
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/EnvironmentId'
+      responses:
+        '200':
+          description: New root key; previous key is immediately invalid
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key]
+                properties: { key: { type: string, minLength: 32, maxLength: 32 } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /testing-environments/{environment_id}/delete:
+    post:
+      tags: [Testing environments]
+      operationId: deleteTestingEnvironment
+      summary: Soft-delete a test plane
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/EnvironmentId'
+      responses:
+        '200':
+          description: Plane marked deleted and recoverable for 30 days
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted, recoverable_for_days]
+                properties:
+                  deleted: { type: boolean, const: true }
+                  recoverable_for_days: { type: integer, const: 30 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /testing-environments/{environment_id}/restore:
+    post:
+      tags: [Testing environments]
+      operationId: restoreTestingEnvironment
+      summary: Restore a soft-deleted test plane during its recovery window
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/EnvironmentId'
+      responses:
+        '200':
+          description: Plane restored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [restored]
+                properties: { restored: { type: boolean, const: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /webhooks/:
+    post:
+      tags: [Authentication]
+      operationId: receiveIamWebhook
+      summary: Receive a signed IAM event
+      description: Verifies exact request bytes and deduplicates by event ID. Payload content is never persisted.
+      servers:
+        - url: https://waveform.teamofsilicons.com
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { type: object } }
+      responses:
+        '204': { description: Event accepted or already processed }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -182,6 +647,27 @@ components:
         Waveform. A successful idempotent replay returns the stored canonical
         operation UUID instead.
       schema: { type: string, format: uuid }
+    TestingEnvironmentKey:
+      name: X-Testing-Environment-Key
+      in: header
+      required: false
+      description: Explicit Waveform root key selecting an isolated test plane.
+      schema: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    EnvironmentId:
+      name: environment_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Provider:
+      name: provider
+      in: path
+      required: true
+      schema: { type: string, enum: [gemini, elevenlabs, openai, deepgram] }
 
   headers:
     RequestId:
@@ -278,11 +764,48 @@ components:
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   schemas:
+    VoiceProfileRef:
+      type: object
+      required: [id, revision]
+      properties:
+        id: { type: string }
+        revision: { type: integer, minimum: 1 }
+    VoiceProfile:
+      type: object
+      required: [id, name, description, revision, auditioned, gemini_voice, openai_voice, elevenlabs]
+      properties:
+        id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+        name: { type: string }
+        description: { type: string }
+        revision: { type: integer, minimum: 1 }
+        auditioned: { type: boolean, description: Whether a listening review has confirmed the cross-provider mapping }
+        gemini_voice: { type: string }
+        openai_voice: { type: string, enum: [alloy, ash, coral, echo, fable, onyx, nova, sage, shimmer] }
+        elevenlabs:
+          type: object
+          required: [voice_id, model_id, voice_settings]
+          properties:
+            voice_id: { type: string }
+            model_id: { type: string, const: eleven_multilingual_v2 }
+            voice_settings:
+              type: object
+              required: [stability, similarity_boost, style, use_speaker_boost, speed]
+              properties:
+                stability: { type: number, minimum: 0, maximum: 1 }
+                similarity_boost: { type: number, minimum: 0, maximum: 1 }
+                style: { type: number, minimum: 0, maximum: 1 }
+                use_speaker_boost: { type: boolean }
+                speed: { type: number, minimum: 0.7, maximum: 1.2 }
+
     TTSRequest:
       type: object
       additionalProperties: false
       required: [text]
       properties:
+        voice_profile:
+          type: [string, 'null']
+          pattern: '^[a-z0-9-]{1,64}$'
+          description: Optional profile ID from voice-profiles. Omitted/null uses the account default. Applies to all fallback providers and never changes the saved default.
         text:
           type: string
           minLength: 1
@@ -293,6 +816,15 @@ components:
           minLength: 2
           maxLength: 64
           description: Optional canonicalizable BCP 47 hint; passed only to Gemini TTS.
+        provider_order:
+          type: array
+          minItems: 1
+          maxItems: 3
+          uniqueItems: true
+          description: Preferred provider prefix; omitted providers follow the account order.
+          items:
+            type: string
+            enum: [gemini, elevenlabs, openai]
 
     STTRequest:
       type: object
@@ -309,21 +841,34 @@ components:
           minLength: 2
           maxLength: 64
           description: Optional canonicalizable BCP 47 transcription hint.
+        provider_order:
+          type: array
+          minItems: 1
+          maxItems: 3
+          uniqueItems: true
+          description: Preferred provider prefix; omitted providers follow the account order.
+          items:
+            type: string
+            enum: [gemini, openai, deepgram]
 
     TTSResult:
       type: object
       additionalProperties: false
       required: [request_id, file_url, temporary_url, media_type, provider, duration_ms]
       properties:
+        voice_profile:
+          oneOf:
+            - $ref: '#/components/schemas/VoiceProfileRef'
+            - { type: 'null' }
         request_id:
           type: string
           format: uuid
           description: Canonical operation UUID, preserved on completed replay.
         file_url: { type: string, format: uri, description: Permanent authenticated Briefcase URL }
         temporary_url:
-          type: string
+          type: [string, 'null']
           format: uri
-          description: Freshly authorized expiring URL for immediate playback, including on replay.
+          description: Optional expiring delivery URL; null for published Briefcase one-shot uploads.
         media_type: { type: string, const: audio/mpeg }
         provider:
           type: string
@@ -347,6 +892,144 @@ components:
           enum: [gemini, openai, deepgram]
           description: Provider that completed transcription
         duration_ms: { type: [integer, 'null'], format: int64, minimum: 0 }
+
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [slt]
+      properties:
+        slt: { type: string, minLength: 5, maxLength: 16384, pattern: '^oac_[!-~]+$' }
+    RefreshRequest:
+      type: object
+      additionalProperties: false
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string, minLength: 5, maxLength: 16384, pattern: '^ort_[!-~]+$' }
+    LogoutRequest:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token: { type: string, minLength: 5, maxLength: 16384, pattern: '^o(at|rt)_[!-~]+$' }
+    OAuthTokenResponse:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in, refresh_expires_at, actor, session_id]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: {}
+        expires_in: { type: integer, format: int64 }
+        refresh_expires_at: { type: string, format: date-time }
+        actor: { $ref: '#/components/schemas/ActorRef' }
+        session_id: { type: string, format: uuid }
+    ActorRef:
+      type: object
+      required: [principal_id, type, public_id]
+      properties:
+        principal_id: { type: string, format: uuid }
+        type: { type: string }
+        public_id: { type: string }
+    ApplicationAuthorization:
+      type: object
+      required: [principal_id, actor_type, public_id, organization_id, org_id, membership_id, membership_version, authorization_epoch, audience, scopes]
+      properties:
+        principal_id: { type: string, format: uuid }
+        actor_type: { type: string }
+        public_id: { type: string }
+        organization_id: { type: string, format: uuid }
+        org_id: { type: string }
+        membership_id: { type: string, format: uuid }
+        membership_version: { type: integer, format: int64 }
+        authorization_epoch: { type: integer, format: int64 }
+        audience: { type: string }
+        testing_environment_id: { type: [string, 'null'], format: uuid }
+        scopes: { type: array, items: { type: string } }
+        org_role: { type: [string, 'null'] }
+        tags: { type: [array, 'null'], items: { type: object } }
+    Job:
+      type: object
+      required: [id, operation, status, first_line, created_at]
+      properties:
+        voice_profile:
+          oneOf:
+            - $ref: '#/components/schemas/VoiceProfileRef'
+            - { type: 'null' }
+        id: { type: string, format: uuid }
+        operation: { type: string, enum: [tts, stt] }
+        status: { type: string, enum: [running, failed, completed] }
+        first_line: { type: string }
+        duration_ms: { type: [integer, 'null'], format: int64, minimum: 0 }
+        provider: { type: [string, 'null'] }
+        error_code: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+    JobPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Job' } }
+        next_cursor: { type: [string, 'null'] }
+    Preferences:
+      type: object
+      required: [tts_order, stt_order, voice_profile, defaults]
+      properties:
+        voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
+        tts_order: { type: array, items: { type: string, enum: [gemini, elevenlabs, openai] } }
+        stt_order: { type: array, items: { type: string, enum: [gemini, openai, deepgram] } }
+        defaults:
+          type: object
+          required: [tts_order, stt_order, voice_profile]
+          properties:
+            voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
+            tts_order: { type: array, items: { type: string } }
+            stt_order: { type: array, items: { type: string } }
+    PreferencesUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
+        tts_order: { type: [array, 'null'], items: { type: string, enum: [gemini, elevenlabs, openai] } }
+        stt_order: { type: [array, 'null'], items: { type: string, enum: [gemini, openai, deepgram] } }
+    ProviderKeyRequest:
+      type: object
+      additionalProperties: false
+      required: [api_key]
+      properties:
+        api_key: { type: string, minLength: 1, maxLength: 16384 }
+    ProviderKeyInfo:
+      type: object
+      required: [provider, configured, updated_at]
+      properties:
+        provider: { type: string }
+        configured: { type: boolean, const: true }
+        updated_at: { type: string, format: date-time }
+    CreateTestingEnvironment:
+      type: object
+      additionalProperties: false
+      required: [name, iam_environment_id, iam_environment_key, app_secret, briefcase_environment_key]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 128 }
+        description: { type: [string, 'null'], maxLength: 4096 }
+        iam_environment_id: { type: string, format: uuid }
+        iam_environment_key: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
+        app_secret: { type: string, minLength: 1, maxLength: 512 }
+        briefcase_environment_key: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
+    CreatedTestingEnvironment:
+      allOf:
+        - $ref: '#/components/schemas/TestingEnvironment'
+        - type: object
+          required: [key]
+          properties:
+            key: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
+    TestingEnvironment:
+      type: object
+      required: [id, name, created_at, last_activity_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        last_activity_at: { type: string, format: date-time }
 
     Capabilities:
       type: object

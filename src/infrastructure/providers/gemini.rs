@@ -85,6 +85,7 @@ impl GeminiProvider {
         &self,
         text: &str,
         language: Option<&str>,
+        voice: Option<&str>,
     ) -> Result<AudioArtifact, ProviderError> {
         let _permit = self.tts_runtime.try_acquire()?;
         let url = self.tts_runtime.url("v1beta/interactions")?;
@@ -94,7 +95,7 @@ impl GeminiProvider {
             response_format: GeminiResponseFormat { kind: "audio" },
             generation_config: GeminiTtsGenerationConfig {
                 speech_config: [GeminiSpeechConfig {
-                    voice: &self.voice,
+                    voice: voice.unwrap_or(&self.voice),
                     language,
                 }],
             },
@@ -396,6 +397,16 @@ fn log_cleanup_failure(request_id: RequestId, kind: Option<ProviderErrorKind>) {
 
 #[async_trait]
 impl TextToSpeechProvider for GeminiProvider {
+    fn with_api_key(
+        &self,
+        key: secrecy::SecretString,
+    ) -> Option<std::sync::Arc<dyn TextToSpeechProvider>> {
+        let mut provider = self.clone();
+        provider.tts_runtime.api_key = key.clone();
+        provider.stt_runtime.api_key = key.clone();
+        Some(std::sync::Arc::new(provider))
+    }
+
     fn name(&self) -> ProviderName {
         ProviderName::Gemini
     }
@@ -411,6 +422,10 @@ impl TextToSpeechProvider for GeminiProvider {
                 .language
                 .as_ref()
                 .map(crate::domain::language::LanguageHint::as_str),
+            match &request.voice {
+                Some(crate::domain::voice::ProviderVoice::Gemini(voice)) => Some(voice.as_str()),
+                _ => None,
+            },
         )
         .await
         .map_err(|error| map_provider_error(ProviderName::Gemini, error))
@@ -419,6 +434,16 @@ impl TextToSpeechProvider for GeminiProvider {
 
 #[async_trait]
 impl SpeechToTextProvider for GeminiProvider {
+    fn with_api_key(
+        &self,
+        key: secrecy::SecretString,
+    ) -> Option<std::sync::Arc<dyn SpeechToTextProvider>> {
+        let mut provider = self.clone();
+        provider.tts_runtime.api_key = key.clone();
+        provider.stt_runtime.api_key = key.clone();
+        Some(std::sync::Arc::new(provider))
+    }
+
     fn name(&self) -> ProviderName {
         ProviderName::Gemini
     }
@@ -633,7 +658,7 @@ mod tests {
                 "input": "hello",
                 "response_format": {"type": "audio"},
                 "generation_config": {"speech_config": [{
-                    "voice": "Kore", "language": "en"
+                    "voice": "Puck", "language": "en"
                 }]}
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -652,7 +677,17 @@ mod tests {
             return;
         };
 
-        let result = provider.synthesize_audio("hello", Some("en")).await;
+        let result = TextToSpeechProvider::synthesize(
+            &provider,
+            TtsProviderRequest {
+                text: crate::domain::speech::SpeechText::new("hello".into())
+                    .unwrap_or_else(|e| panic!("{e}")),
+                language: Some("en".parse().unwrap_or_else(|e| panic!("{e}"))),
+                voice: Some(crate::domain::voice::ProviderVoice::Gemini("Puck".into())),
+            },
+            RequestId::new(uuid::Uuid::new_v4()).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .await;
 
         assert!(matches!(
             result,

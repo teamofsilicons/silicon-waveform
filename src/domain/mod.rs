@@ -12,3 +12,4 @@ pub mod language;
 pub mod media;
 pub mod provider;
 pub mod speech;
+pub mod voice;

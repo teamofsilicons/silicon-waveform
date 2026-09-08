@@ -13,12 +13,19 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
   "MPL-2.0",
   "Unicode-3.0",
   "Zlib",
 ]
+
+# Waveform is an unpublished internal service and intentionally uses the
+# repository's `Proprietary` package marker rather than an SPDX distribution
+# license. Dependencies still need an explicitly permitted license above.
+[licenses.private]
+ignore = true
 
 [sources]
 unknown-git = "deny"

@@ -10,6 +10,7 @@ use super::{
     language::LanguageHint,
     media::{BriefcaseFileUrl, MediaDuration, SourceMedia, StoredAudio},
     provider::ProviderName,
+    voice::{ProviderVoice, VoiceProfile},
 };
 
 /// Maximum TTS input length in Unicode scalar values.
@@ -66,12 +67,20 @@ impl fmt::Debug for SpeechText {
 }
 
 /// Validated public text-to-speech request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TtsRequest {
     /// Private source text.
     pub text: SpeechText,
+    /// Optional profile override; absent uses the account default.
+    pub voice_profile: Option<String>,
+    /// Mapping resolved internally after authorization and idempotency claim.
+    pub resolved_voice: Option<VoiceProfile>,
     /// Optional supported BCP 47 hint.
     pub language: Option<LanguageHint>,
+    /// Optional complete provider preference order. `None` uses the product
+    /// default chain; the API resolves account and request prefixes before
+    /// handing the request to the application service.
+    pub provider_order: Option<Vec<ProviderName>>,
 }
 
 impl TtsRequest {
@@ -91,15 +100,30 @@ impl TtsRequest {
         {
             return Err(SpeechValidationError::UnsupportedTtsLanguage);
         }
-        Ok(Self { text, language })
+        Ok(Self {
+            text,
+            voice_profile: None,
+            resolved_voice: None,
+            language,
+            provider_order: None,
+        })
+    }
+
+    /// Attaches a validated provider order to this request.
+    #[must_use]
+    pub fn with_provider_order(mut self, provider_order: Vec<ProviderName>) -> Self {
+        self.provider_order = Some(provider_order);
+        self
     }
 }
 
 /// Provider-ready TTS input with language policy already applied.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TtsProviderRequest {
     /// Private text to synthesize.
     pub text: SpeechText,
+    /// Mapping for this provider only.
+    pub voice: Option<ProviderVoice>,
     /// Hint present only for a provider allowed to receive it.
     pub language: Option<LanguageHint>,
 }
@@ -110,6 +134,10 @@ impl TtsProviderRequest {
     pub fn for_provider(request: &TtsRequest, provider: ProviderName) -> Self {
         Self {
             text: request.text.clone(),
+            voice: request
+                .resolved_voice
+                .as_ref()
+                .and_then(|v| v.for_provider(provider)),
             language: provider
                 .accepts_tts_language_hint()
                 .then(|| request.language.clone())
@@ -121,6 +149,8 @@ impl TtsProviderRequest {
 /// Stable normalized TTS response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TtsResult {
+    /// Resolved profile identity; absent for legacy records.
+    pub voice_profile: Option<super::voice::VoiceProfileRef>,
     /// Original request correlation ID.
     pub request_id: RequestId,
     /// Durable and temporary Briefcase references.
@@ -143,6 +173,7 @@ impl TtsResult {
         duration: MediaDuration,
     ) -> Self {
         Self {
+            voice_profile: None,
             request_id,
             audio,
             provider,
@@ -159,6 +190,8 @@ pub struct SttRequest {
     pub source_url: BriefcaseFileUrl,
     /// Optional supported BCP 47 hint.
     pub language: Option<LanguageHint>,
+    /// Optional complete provider preference order resolved by the API.
+    pub provider_order: Option<Vec<ProviderName>>,
 }
 
 impl SttRequest {
@@ -181,7 +214,15 @@ impl SttRequest {
         Ok(Self {
             source_url,
             language,
+            provider_order: None,
         })
+    }
+
+    /// Attaches a validated provider order to this request.
+    #[must_use]
+    pub fn with_provider_order(mut self, provider_order: Vec<ProviderName>) -> Self {
+        self.provider_order = Some(provider_order);
+        self
     }
 }
 

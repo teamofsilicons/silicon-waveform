@@ -1,4 +1,6 @@
 /target/
+**/target/
+rustc-ice-*.txt
 /.env
 /.env.*
 !/.env.example
@@ -6,3 +8,5 @@
 *.profraw
 coverage/
 .DS_Store
+/.local-test/
+/.local-deploy/

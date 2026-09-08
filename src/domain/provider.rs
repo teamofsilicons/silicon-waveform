@@ -62,6 +62,34 @@ pub const STT_PROVIDER_CHAIN: [ProviderName; 3] = [
     ProviderName::Deepgram,
 ];
 
+/// Completes a caller's preferred prefix against a configured provider order.
+///
+/// The preference may name one or more providers, but every name must be in
+/// the operation's chain and may occur only once.  This keeps request-level
+/// overrides bounded while allowing account defaults to supply the remainder.
+#[must_use]
+pub fn resolve_order(
+    requested: &[ProviderName],
+    base: &[ProviderName],
+) -> Option<Vec<ProviderName>> {
+    if requested.len() > base.len() {
+        return None;
+    }
+    let mut result = Vec::with_capacity(base.len());
+    for provider in requested {
+        if !base.contains(provider) || result.contains(provider) {
+            return None;
+        }
+        result.push(*provider);
+    }
+    for provider in base {
+        if !result.contains(provider) {
+            result.push(*provider);
+        }
+    }
+    Some(result)
+}
+
 /// Safe, provider-independent provider failure category.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ProviderFailureKind {
@@ -156,5 +184,26 @@ mod tests {
         let error = ProviderError::new(ProviderName::OpenAi, ProviderFailureKind::InvalidResponse);
         assert_eq!(error.to_string(), "openai InvalidResponse failure");
         assert_eq!(error.kind.as_str(), "invalid_response");
+    }
+
+    #[test]
+    fn preference_prefix_is_completed_against_account_order() {
+        let account = [
+            ProviderName::OpenAi,
+            ProviderName::Gemini,
+            ProviderName::ElevenLabs,
+        ];
+        assert_eq!(
+            super::resolve_order(&[ProviderName::ElevenLabs], &account),
+            Some(vec![
+                ProviderName::ElevenLabs,
+                ProviderName::OpenAi,
+                ProviderName::Gemini,
+            ])
+        );
+        assert_eq!(
+            super::resolve_order(&[ProviderName::OpenAi, ProviderName::OpenAi], &account),
+            None
+        );
     }
 }

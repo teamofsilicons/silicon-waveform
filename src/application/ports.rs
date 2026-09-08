@@ -24,6 +24,15 @@ pub trait TextToSpeechProvider: Send + Sync {
     /// Canonical identity used for ordering, telemetry, and normalized output.
     fn name(&self) -> ProviderName;
 
+    /// Clones this adapter with a request-local key, preserving shared limits.
+    /// Unsupported fixture adapters return `None`.
+    fn with_api_key(
+        &self,
+        _key: secrecy::SecretString,
+    ) -> Option<std::sync::Arc<dyn TextToSpeechProvider>> {
+        None
+    }
+
     /// Executes one bounded logical attempt. An adapter may perform the single
     /// documented transient retry within the same deadline and concurrency permit.
     async fn synthesize(
@@ -38,6 +47,15 @@ pub trait TextToSpeechProvider: Send + Sync {
 pub trait SpeechToTextProvider: Send + Sync {
     /// Canonical identity used for ordering, telemetry, and normalized output.
     fn name(&self) -> ProviderName;
+
+    /// Clones this adapter with a request-local key, preserving shared limits.
+    /// Unsupported fixture adapters return `None`.
+    fn with_api_key(
+        &self,
+        _key: secrecy::SecretString,
+    ) -> Option<std::sync::Arc<dyn SpeechToTextProvider>> {
+        None
+    }
 
     /// Executes one bounded logical attempt. An adapter may perform the single
     /// documented transient retry within the same deadline and concurrency permit.
@@ -57,6 +75,13 @@ pub trait AudioNormalizer: Send + Sync {
         artifact: AudioArtifact,
         request_id: RequestId,
     ) -> Result<NormalizedAudio, AudioNormalizationError>;
+
+    /// Measures decoded source audio before transcription; the bytes sent to providers stay unchanged.
+    async fn source_duration(
+        &self,
+        media: &SourceMedia,
+        request_id: RequestId,
+    ) -> Result<crate::domain::media::MediaDuration, AudioNormalizationError>;
 
     /// Verifies the local codec/inspector runtime without processing user data.
     async fn check_ready(&self) -> Result<(), AudioNormalizationError>;
@@ -130,8 +155,8 @@ pub struct ReadSourceMediaRequest {
     pub authorization: AuthorizedActor,
     /// Stable permanent URL to resolve inside Briefcase.
     pub source_url: BriefcaseFileUrl,
-    /// Newly minted Briefcase-audience credential.
-    pub delegated_authorization: DelegatedAuthorization,
+    /// Original request-local subject token used for fresh per-operation proofs.
+    pub subject_token: Option<crate::domain::auth::AccessToken>,
     /// Maximum response size enforced before and during streaming.
     pub size_limit: MediaSizeLimit,
     /// Correlation ID propagated to Briefcase.
@@ -143,8 +168,8 @@ pub struct ReadSourceMediaRequest {
 pub struct BriefcaseFileAccessRequest {
     /// Actor and organization already verified by IAM.
     pub authorization: AuthorizedActor,
-    /// Newly minted, read-purpose Briefcase credential.
-    pub delegated_authorization: DelegatedAuthorization,
+    /// Original request-local subject token used for fresh per-operation proofs.
+    pub subject_token: Option<crate::domain::auth::AccessToken>,
     /// Stable permanent file reference whose current access is checked.
     pub file_url: BriefcaseFileUrl,
     /// Current attempt correlation ID propagated to Briefcase.
@@ -237,7 +262,17 @@ pub trait IdempotencyStore: Send + Sync {
         claim: IdempotencyClaim,
     ) -> Result<IdempotencyDecision, IdempotencyStoreError>;
 
-    /// Atomically replaces a caller-owned lease with a retained success.
+    /// Persists running history under the canonical operation ID before work.
+    /// In-memory implementations may omit durable history.
+    async fn start_job(
+        &self,
+        _job: crate::domain::idempotency::SpeechJobStart,
+    ) -> Result<(), IdempotencyStoreError> {
+        Ok(())
+    }
+
+    /// Atomically replaces a caller-owned lease with a retained success and
+    /// completes the history row created by `start_job`.
     async fn complete(
         &self,
         completion: IdempotencyCompletion,
@@ -271,4 +306,35 @@ pub enum IdempotencyStoreError {
 pub trait LeaseIdGenerator: Send + Sync {
     /// Creates an unpredictable non-nil lease ownership ID.
     fn new_idempotency_lease_id(&self) -> IdempotencyLeaseId;
+}
+
+/// Account and environment scoped, decrypted provider credentials.
+pub type ProviderKeys = std::collections::HashMap<ProviderName, secrecy::SecretString>;
+
+/// Retrieves personal keys only after the caller has been authorized.
+#[async_trait]
+pub trait ProviderKeyStore: Send + Sync {
+    /// Returns keys for this exact principal, organization, and Waveform plane.
+    async fn load(
+        &self,
+        plane_id: uuid::Uuid,
+        actor: &AuthorizedActor,
+    ) -> Result<ProviderKeys, ProviderKeyStoreError>;
+}
+
+/// Redacted credential lookup failure; never falls back to deployment billing.
+#[derive(Debug, Error)]
+#[error("personal provider credentials are unavailable")]
+pub struct ProviderKeyStoreError;
+
+/// Resolves an authorized account's profile independently of provider order.
+#[async_trait]
+pub trait VoiceProfileStore: Send + Sync {
+    /// Reads one complete mapping; no provider calls or API secrets are involved.
+    async fn resolve(
+        &self,
+        plane_id: uuid::Uuid,
+        actor: &AuthorizedActor,
+        requested: Option<&str>,
+    ) -> Result<crate::domain::voice::VoiceProfile, crate::domain::error::WaveformError>;
 }

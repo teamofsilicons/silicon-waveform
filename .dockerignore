@@ -1,5 +1,12 @@
 .git
 .github
 .env
+.env.*
+!.env.example
 target
+**/target
+.local-test
+.local-deploy
 **/*.rs.bk
+**/node_modules
+**/dist

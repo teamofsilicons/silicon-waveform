@@ -8,7 +8,8 @@ use silicon_waveform::{
         idempotency::{
             CompletedSpeechOperation, CompletedTtsOperation, IdempotencyClaim,
             IdempotencyCompletion, IdempotencyDecision, IdempotencyKey, IdempotencyLeaseId,
-            IdempotencyRelease, IdempotencyScope, RequestDigest, RequestDigestKey, SpeechOperation,
+            IdempotencyRelease, IdempotencyScope, RequestDigest, RequestDigestKey, SpeechJobStart,
+            SpeechOperation,
         },
         identity::{Actor, ActorId, ActorKind, OrganizationId, RequestId},
         media::{BriefcaseFileUrl, MediaDuration},
@@ -21,6 +22,8 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use time::OffsetDateTime;
 use url::Url;
 use uuid::Uuid;
+
+type JobHistoryRow = (Uuid, String, String, Option<i64>, Option<String>);
 
 #[tokio::test]
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
@@ -116,6 +119,7 @@ async fn release_reclaim_preserves_identity_and_fences_stale_owner()
 
     store
         .release(IdempotencyRelease {
+            failure_code: None,
             scope: scope.clone(),
             lease_id: stale_lease_id,
         })
@@ -141,6 +145,15 @@ async fn release_reclaim_preserves_identity_and_fences_stale_owner()
             && request_id == original_request_id
             && operation_started_at == original_started_at
     ));
+
+    store
+        .start_job(SpeechJobStart {
+            voice_profile: None,
+            scope: scope.clone(),
+            lease_id: current_lease_id,
+            first_line: "hello".into(),
+        })
+        .await?;
 
     let response = CompletedSpeechOperation::Tts(completed_tts_operation(original_request_id)?);
     let stale_completion = store
@@ -219,6 +232,7 @@ async fn cleanup_never_deletes_an_expired_record_with_a_live_lease()
 
     store
         .release(IdempotencyRelease {
+            failure_code: None,
             scope: scope.clone(),
             lease_id: original_lease_id,
         })
@@ -351,6 +365,14 @@ async fn late_completion_wins_when_it_precedes_reclaim_in_the_lock_queue()
         ))
         .await?;
     assert!(matches!(first, IdempotencyDecision::Acquired { .. }));
+    store
+        .start_job(SpeechJobStart {
+            voice_profile: None,
+            scope: scope.clone(),
+            lease_id: completing_lease_id,
+            first_line: "hello".into(),
+        })
+        .await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let mut blocker = pool.begin().await?;
@@ -547,6 +569,7 @@ fn claim(
 
 fn scope() -> Result<IdempotencyScope, Box<dyn std::error::Error>> {
     Ok(IdempotencyScope {
+        plane_id: Uuid::nil(),
         actor: Actor::new(ActorKind::Carbon, ActorId::new(Uuid::new_v4())?),
         organization_id: OrganizationId::from_str("integration-test")?,
         operation: SpeechOperation::Tts,
@@ -572,6 +595,7 @@ fn completed_tts_operation(
     request_id: RequestId,
 ) -> Result<CompletedTtsOperation, Box<dyn std::error::Error>> {
     Ok(CompletedTtsOperation {
+        voice_profile: None,
         request_id,
         permanent_url: BriefcaseFileUrl::new(Url::parse(
             "https://briefcase.example.test/files/generated",
@@ -579,4 +603,202 @@ fn completed_tts_operation(
         provider: ProviderName::Gemini,
         duration: MediaDuration::from_millis(1_234),
     })
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario verifies retry fencing and atomic failure recovery"
+)]
+async fn jobs_retry_under_one_id_and_commit_with_idempotency()
+-> Result<(), Box<dyn std::error::Error>> {
+    use silicon_waveform::domain::error::ErrorCode;
+    let (pool, store) = test_store(Duration::from_hours(24)).await?;
+    let scope = scope()?;
+    let request = TtsRequest::new(SpeechText::new("first line\nsecond line".to_owned())?, None)?;
+    let digest = RequestDigest::for_tts(&request, &digest_key()?);
+    let canonical = request_id()?;
+    let old_lease = lease_id()?;
+    store
+        .claim(claim(
+            scope.clone(),
+            digest,
+            canonical,
+            old_lease,
+            Duration::from_secs(60),
+        ))
+        .await?;
+    store
+        .start_job(SpeechJobStart {
+            voice_profile: None,
+            scope: scope.clone(),
+            lease_id: old_lease,
+            first_line: "first line".into(),
+        })
+        .await?;
+    store
+        .release(IdempotencyRelease {
+            scope: scope.clone(),
+            lease_id: old_lease,
+            failure_code: Some(ErrorCode::ProvidersExhausted),
+        })
+        .await?;
+    let failure: (String, String) =
+        sqlx::query_as("SELECT status,error_code FROM waveform_jobs WHERE id=$1")
+            .bind(canonical.as_uuid())
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(failure, ("failed".into(), "providers_exhausted".into()));
+    let current = lease_id()?;
+    let reclaimed = store
+        .claim(claim(
+            scope.clone(),
+            digest,
+            request_id()?,
+            current,
+            Duration::from_secs(60),
+        ))
+        .await?;
+    assert!(
+        matches!(reclaimed, IdempotencyDecision::Acquired { request_id, .. } if request_id == canonical)
+    );
+    store
+        .start_job(SpeechJobStart {
+            voice_profile: None,
+            scope: scope.clone(),
+            lease_id: current,
+            first_line: "first line".into(),
+        })
+        .await?;
+    assert_eq!(
+        store
+            .release(IdempotencyRelease {
+                scope: scope.clone(),
+                lease_id: old_lease,
+                failure_code: None
+            })
+            .await,
+        Err(IdempotencyStoreError::LeaseLost)
+    );
+    let running: (String, Uuid, Option<String>) =
+        sqlx::query_as("SELECT status,lease_token,error_code FROM waveform_jobs WHERE id=$1")
+            .bind(canonical.as_uuid())
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(running, ("running".into(), current.as_uuid(), None));
+    // A real database failure in the history update must roll back the response cache too.
+    let constraint = format!("fail_job_{}", Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE waveform_jobs ADD CONSTRAINT {constraint} CHECK (id <> '{}' OR status <> 'completed') NOT VALID", canonical.as_uuid()))).execute(&pool).await?;
+    let completion = IdempotencyCompletion {
+        scope: scope.clone(),
+        lease_id: current,
+        response: CompletedSpeechOperation::Tts(completed_tts_operation(canonical)?),
+    };
+    assert!(store.complete(completion.clone()).await.is_err());
+    let state: String = sqlx::query_scalar(
+        "SELECT state::text FROM waveform_idempotency_records WHERE request_id=$1",
+    )
+    .bind(canonical.as_uuid())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(state, "pending");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE waveform_jobs DROP CONSTRAINT {constraint}"
+    )))
+    .execute(&pool)
+    .await?;
+    store.complete(completion).await?;
+    let history: Vec<JobHistoryRow> = sqlx::query_as(
+        "SELECT id,status,first_line,duration_ms,provider FROM waveform_jobs WHERE actor_id=$1",
+    )
+    .bind(scope.actor.id.as_uuid())
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        history,
+        vec![(
+            canonical.as_uuid(),
+            "completed".into(),
+            "first line".into(),
+            Some(1234),
+            Some("gemini".into())
+        )]
+    );
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn crashed_jobs_expire_and_retired_keys_can_start_new_jobs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (pool, store) = test_store(Duration::from_hours(24)).await?;
+    let scope = scope()?;
+    let request = TtsRequest::new(SpeechText::new("crash fixture".into())?, None)?;
+    let digest = RequestDigest::for_tts(&request, &digest_key()?);
+    let first_id = request_id()?;
+    let first_lease = lease_id()?;
+    store
+        .claim(claim(
+            scope.clone(),
+            digest,
+            first_id,
+            first_lease,
+            Duration::from_secs(60),
+        ))
+        .await?;
+    store
+        .start_job(SpeechJobStart {
+            voice_profile: None,
+            scope: scope.clone(),
+            lease_id: first_lease,
+            first_line: "crash fixture".into(),
+        })
+        .await?;
+    store.recover_abandoned_jobs().await?;
+    let before: String = sqlx::query_scalar("SELECT status FROM waveform_jobs WHERE id=$1")
+        .bind(first_id.as_uuid())
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(before, "running");
+    sqlx::query("UPDATE waveform_jobs SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1").bind(first_id.as_uuid()).execute(&pool).await?;
+    sqlx::query("UPDATE waveform_idempotency_records SET lease_expires_at=clock_timestamp()-interval '1 second',created_at=clock_timestamp()-interval '2 days',expires_at=clock_timestamp()-interval '1 second' WHERE request_id=$1").bind(first_id.as_uuid()).execute(&pool).await?;
+    store.recover_abandoned_jobs().await?;
+    let after: (String, String, bool) = sqlx::query_as(
+        "SELECT status,error_code,finished_at IS NOT NULL FROM waveform_jobs WHERE id=$1",
+    )
+    .bind(first_id.as_uuid())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(after, ("failed".into(), "request_interrupted".into(), true));
+    let new_id = request_id()?;
+    let new_lease = lease_id()?;
+    let new_claim = store
+        .claim(claim(
+            scope.clone(),
+            digest,
+            new_id,
+            new_lease,
+            Duration::from_secs(60),
+        ))
+        .await?;
+    assert!(
+        matches!(new_claim, IdempotencyDecision::Acquired { request_id, .. } if request_id == new_id)
+    );
+    store
+        .start_job(SpeechJobStart {
+            voice_profile: None,
+            scope: scope.clone(),
+            lease_id: new_lease,
+            first_line: "crash fixture".into(),
+        })
+        .await?;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM waveform_jobs WHERE actor_id=$1")
+        .bind(scope.actor.id.as_uuid())
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 2);
+    pool.close().await;
+    Ok(())
 }

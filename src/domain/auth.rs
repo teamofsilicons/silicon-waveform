@@ -7,6 +7,7 @@ use time::OffsetDateTime;
 use zeroize::Zeroize as _;
 
 use super::identity::{Actor, ApplicationId, OrganizationId, RequestId};
+use super::media::GeneratedAudioFileName;
 
 const MAX_CREDENTIAL_LENGTH: usize = 16_384;
 
@@ -39,7 +40,7 @@ pub enum DelegationPurpose {
     StoreGeneratedAudio,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct OpaqueCredential(Box<[u8]>);
 
 impl OpaqueCredential {
@@ -165,7 +166,7 @@ pub struct AuthorizationRequest {
 }
 
 /// Input to an actor-bound delegation exchange for Briefcase.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct DelegationRequest {
     /// Previously verified actor and organization.
     pub authorization: AuthorizedActor,
@@ -173,6 +174,32 @@ pub struct DelegationRequest {
     pub purpose: DelegationPurpose,
     /// Correlation ID propagated to IAM.
     pub request_id: RequestId,
+    /// Original bearer subject token, retained only for this exchange.
+    pub subject_token: Option<AccessToken>,
+    /// Exact file metadata and bytes to bind when storing generated audio.
+    pub upload: Option<DelegatedUploadBinding>,
+    /// Exact manifest of a delegated Briefcase list or read operation.
+    pub manifest: Option<DelegatedManifestBinding>,
+}
+
+/// Immutable request binding prepared by the official Briefcase client.
+#[derive(Clone, Debug)]
+pub struct DelegatedManifestBinding {
+    /// Registered endpoint identifier.
+    pub endpoint_id: String,
+    /// Registered versioned path.
+    pub path: String,
+    /// Exact serialized manifest digest.
+    pub body_sha256: String,
+}
+
+/// Exact downstream request fields bound into a Briefcase OBO proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegatedUploadBinding {
+    /// Generated destination filename.
+    pub filename: GeneratedAudioFileName,
+    /// Lowercase SHA-256 digest of the exact MP3 bytes.
+    pub body_sha256: String,
 }
 
 /// New credential minted specifically for a downstream audience.

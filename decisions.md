@@ -774,3 +774,67 @@ making startup time depend on row count. The decoder remains defensive against
 an extra legacy field in restored or manually supplied JSON, but the production
 schema never permits that field to be written. After the first schema release,
 all migration history is forward-only and immutable as established in D-049.
+
+## D-055 — Request-bound OBO verification remains fail-closed until wired
+
+**Status:** Accepted; supersedes the implementation claim in D-027 and the
+OBO validity details in D-048
+
+The current IAM verifier binds an inbound OBO proof to the exact HTTP method,
+path, and request-body digest, and rejects the legacy audience/action payload.
+Waveform's released adapter does not yet receive the raw request bytes and
+cannot safely reconstruct that proof binding. It therefore returns the
+dependency-contract error for OBO speech requests instead of sending a stale
+payload or forwarding the inbound proof. The same rule applies to downstream
+Briefcase delegation until IAM publishes an actor-context exchange and
+Briefcase publishes the delegated upload/read operations required by the
+workflow.
+
+
+## D-056 — Personal keys and paired test uploads
+
+Personal provider keys are decrypted only after the actor and Waveform plane
+are established. Each operation clones adapter configuration while sharing its
+existing connection pool and concurrency semaphore; secrets never mutate a
+shared adapter. Missing personal keys use the provider's deployment key. A key
+lookup/decryption failure fails the operation instead of changing billing.
+
+Test TTS keeps deterministic speech generation but uses the official IAM and
+Briefcase SDKs for real uploads, with both paired testing-environment headers.
+The earlier in-memory upload ledger is a unit-test fixture, not runtime storage.
+The published upload response supplies a permanent URL, so D-013's requirement
+that every successful upload include a temporary URL is superseded: that field
+is nullable. D-051's replay access checks still apply and remain unavailable
+until the upstream delegated read contract is connected.
+
+CLI sessions and environment-key caches are scoped by backend URL. Sessions
+are also scoped by the resolved test root key. State lives under
+`<home>/.waveform/dir`; old unscoped session files are not automatically imported.
+
+
+## D-057 — Canonical job lifecycle follows the idempotency lease
+
+Running history is created only after live authorization and an acquired lease,
+before provider work. The job ID is the canonical operation UUID from the
+idempotency record, not the current transport attempt ID. Retry attempts update
+that same job row and are fenced by their lease token. A retained history row
+does not prevent reuse of an idempotency key after cache retention ends.
+
+Success commits job metadata and the response cache in one transaction. Failure
+commits the terminal error and lease release together. Cancellation tries to
+release the owned attempt; history reads and scheduled cleanup recover attempts
+whose persisted lease expired after process death. A stale attempt cannot
+finalize a newer lease. A database failure creating history prevents provider
+work, and a completion-history failure rolls back the response cache update.
+
+Environment cleanup and job creation acquire compatible locks in plane,
+idempotency-record, then job order. The client can supply a speech request UUID
+before execution and poll it concurrently. Polling retries initial 404 responses
+and includes each HTTP exchange within the caller's overall timeout.
+
+- **D-058 — Published delegated reads and current replay checks:** Registry verification on 2026-09-08 found non-yanked IAM 1.3.0 and Briefcase 0.2.0. All three Waveform crates use IAM 1.3.0; the backend uses Briefcase 0.2.0. STT resolves organization-qualified permanent URLs through delegated parent listings, issuing a fresh proof for every page, then reads the exact entry with another proof. Request-local bearer authority remains inside the storage workflow. Replay checks resolve current identity and make a one-byte authorized read before returning cached results. TTS replay returns the permanent URL with a null temporary URL, superseding D-051's temporary-URL issuance while preserving its current resource-authorization requirement. Production STT measures decoded source duration before provider calls; malformed media never reaches a paid provider. IAM introspection now uses the official SDK with its fixed 4 MiB response bound and the configured deadline. Local tests cover both actor kinds and revoked reads, but do not claim deployed upstream validation. Inbound OBO remains unavailable because the released IAM verifier provides no downstream subject-token handoff.
+
+- **D-059 — Test-plane media fidelity:** Test speech now uses the same audio normalizer/inspector as production. The fixed database-backed TTS MP3 passes through normal validation, while STT measures and validates the uploaded source rather than reporting the TTS fixture duration for every file. The paired HTTP/CLI test supplies a one-second WAV for both Carbon and Silicon and checks a 1000 ms persisted duration with the prescribed fixed transcript. Unit-only codec fakes remain isolated from runtime composition. Removed the obsolete startup warning that all downstream contracts were unavailable.
+
+
+- **D-060 — Real paired-service compatibility:** Real IAM login serializes its short-lived application code as `oac_`, although the request field is `slt`. Waveform validates that prefix and the regression fixtures and OpenAPI schema use it. Default speech scope is `obo.issue`, an actual IAM-issued scope needed for downstream storage; actor, organization, audience, expiry and plane checks remain mandatory. Briefcase delegated reads use `download: false` to preserve the stored MIME type because download intent deliberately returns `application/octet-stream`. The real Carbon/Silicon TTS→storage→STT run verified these boundaries. CLI status commands now honor `--json`, including session and cleanup commands.

@@ -103,6 +103,8 @@ pub enum IdempotencyKeyError {
 /// Complete tenant and operation boundary for one idempotency key.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct IdempotencyScope {
+    /// Isolated Waveform plane; nil identifies production.
+    pub plane_id: uuid::Uuid,
     /// Represented actor, including actor kind.
     pub actor: Actor,
     /// Verified organization membership.
@@ -166,15 +168,28 @@ impl RequestDigest {
     /// Computes the canonical digest for a validated TTS request.
     #[must_use]
     pub fn for_tts(request: &TtsRequest, key: &RequestDigestKey) -> Self {
-        digest_fields(
+        let original = digest_fields(
             SpeechOperation::Tts,
             request.text.as_str(),
             request
                 .language
                 .as_ref()
                 .map(super::language::LanguageHint::as_str),
+            request.provider_order.as_deref(),
             key,
-        )
+        );
+        // Hash only caller intent. A default or mapping change must not alter
+        // replay of an already completed request with the same idempotency key.
+        if let Some(profile) = &request.voice_profile {
+            let mut hasher = Hmac::<Sha256>::new_from_slice(key.as_bytes())
+                .unwrap_or_else(|_| unreachable!("validated HMAC key"));
+            hasher.update(b"silicon-waveform:voice-profile:v1\0");
+            hasher.update(&original.0);
+            update_length_prefixed(&mut hasher, profile.as_bytes());
+            Self(hasher.finalize().into_bytes().into())
+        } else {
+            original
+        }
     }
 
     /// Computes the canonical digest for a validated STT request.
@@ -187,6 +202,7 @@ impl RequestDigest {
                 .language
                 .as_ref()
                 .map(super::language::LanguageHint::as_str),
+            request.provider_order.as_deref(),
             key,
         )
     }
@@ -278,6 +294,8 @@ pub struct IdempotencyClaim {
 /// Durable TTS fields retained without an expiring delivery capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletedTtsOperation {
+    /// Profile used for the original synthesis.
+    pub voice_profile: Option<super::voice::VoiceProfileRef>,
     /// Original operation correlation ID.
     pub request_id: RequestId,
     /// Stable authenticated Briefcase reference.
@@ -293,6 +311,7 @@ impl CompletedTtsOperation {
     #[must_use]
     pub fn from_result(result: &TtsResult) -> Self {
         Self {
+            voice_profile: result.voice_profile.clone(),
             request_id: result.request_id,
             permanent_url: result.audio.permanent_url.clone(),
             provider: result.provider,
@@ -303,15 +322,17 @@ impl CompletedTtsOperation {
     /// Materializes the public response with a newly authorized temporary URL.
     #[must_use]
     pub fn with_temporary_url(self, temporary_url: TemporaryMediaUrl) -> TtsResult {
-        TtsResult::new(
+        let mut result = TtsResult::new(
             self.request_id,
             StoredAudio {
                 permanent_url: self.permanent_url,
-                temporary_url,
+                temporary_url: Some(temporary_url),
             },
             self.provider,
             self.duration,
-        )
+        );
+        result.voice_profile = self.voice_profile;
+        result
     }
 }
 
@@ -373,16 +394,32 @@ pub struct IdempotencyCompletion {
 /// Atomic failed-work release input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdempotencyRelease {
+    /// Failure reported by this attempt; absent for interruption or cancellation.
+    pub failure_code: Option<super::error::ErrorCode>,
     /// Scope whose failed lease should be released.
     pub scope: IdempotencyScope,
     /// Lease ownership token.
     pub lease_id: IdempotencyLeaseId,
 }
 
+/// Content-limited job metadata associated with a successfully acquired lease.
+/// The input text is never included in diagnostic formatting.
+pub struct SpeechJobStart {
+    /// Profile selected for TTS; absent for STT and legacy callers.
+    pub voice_profile: Option<super::voice::VoiceProfileRef>,
+    /// Authoritative actor, organization, plane, operation and idempotency scope.
+    pub scope: IdempotencyScope,
+    /// Current attempt ownership token.
+    pub lease_id: IdempotencyLeaseId,
+    /// First input line for TTS; empty until STT produces a transcript.
+    pub first_line: String,
+}
+
 fn digest_fields(
     operation: SpeechOperation,
     primary: &str,
     language: Option<&str>,
+    provider_order: Option<&[super::provider::ProviderName]>,
     key: &RequestDigestKey,
 ) -> RequestDigest {
     let mut hasher = Hmac::<Sha256>::new_from_slice(key.as_bytes())
@@ -394,6 +431,17 @@ fn digest_fields(
         Some(value) => {
             hasher.update(&[1]);
             update_length_prefixed(&mut hasher, value.as_bytes());
+        }
+        None => hasher.update(&[0]),
+    }
+    match provider_order {
+        Some(order) => {
+            hasher.update(&[1]);
+            let count = u64::try_from(order.len()).unwrap_or(u64::MAX);
+            hasher.update(&count.to_be_bytes());
+            for provider in order {
+                update_length_prefixed(&mut hasher, provider.as_str().as_bytes());
+            }
         }
         None => hasher.update(&[0]),
     }
@@ -417,6 +465,24 @@ mod tests {
         language::LanguageHint,
         speech::{SpeechText, TtsRequest},
     };
+
+    #[test]
+    fn profile_override_changes_digest_but_resolved_defaults_do_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let key = RequestDigestKey::new(&[7; 32])?;
+        let mut request = TtsRequest::new(SpeechText::new("hello".into())?, None)?;
+        let original = RequestDigest::for_tts(&request, &key);
+        let profiles: Vec<crate::domain::voice::VoiceProfile> =
+            serde_json::from_str(include_str!("voice_profiles.json"))?;
+        request.resolved_voice = Some(profiles[0].clone());
+        assert_eq!(original, RequestDigest::for_tts(&request, &key));
+        request.voice_profile = Some("kore".into());
+        let kore = RequestDigest::for_tts(&request, &key);
+        assert_ne!(original, kore);
+        request.voice_profile = Some("puck".into());
+        assert_ne!(kore, RequestDigest::for_tts(&request, &key));
+        Ok(())
+    }
 
     #[test]
     fn idempotency_key_is_bounded_and_redacted() {
@@ -456,6 +522,18 @@ mod tests {
         assert!(matches!(
             &without_language,
             Ok(request) if RequestDigest::for_tts(request, &key) == RequestDigest::for_tts(request, &key)
+        ));
+        let reordered = without_language.as_ref().map(|request| {
+            request.clone().with_provider_order(vec![
+                crate::domain::provider::ProviderName::OpenAi,
+                crate::domain::provider::ProviderName::Gemini,
+                crate::domain::provider::ProviderName::ElevenLabs,
+            ])
+        });
+        assert!(matches!(
+            (&without_language, &reordered),
+            (Ok(default), Ok(custom))
+                if RequestDigest::for_tts(default, &key) != RequestDigest::for_tts(custom, &key)
         ));
     }
 

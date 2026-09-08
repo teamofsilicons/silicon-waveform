@@ -18,7 +18,7 @@ use crate::{
         idempotency::{
             CompletedSpeechOperation, CompletedTtsOperation, IdempotencyClaim,
             IdempotencyCompletion, IdempotencyDecision, IdempotencyLease, IdempotencyLeaseId,
-            IdempotencyRelease, IdempotencyScope,
+            IdempotencyRelease, IdempotencyScope, SpeechJobStart,
         },
         identity::{ActorKind, RequestId},
         language::LanguageHint,
@@ -64,6 +64,7 @@ impl PostgresIdempotencyStore {
     /// bounded cleanup statement cannot complete.
     pub async fn delete_expired(&self, batch_size: u32) -> Result<u64, IdempotencyStoreError> {
         self.with_timeout(async {
+            recover_expired_jobs(&self.pool).await?;
             sqlx::query(
                 r"
                 WITH database_time AS MATERIALIZED (
@@ -112,6 +113,7 @@ impl PostgresIdempotencyStore {
         let lease_duration = postgres_interval(claim.lease_duration)?;
         let record_ttl = postgres_interval(self.record_ttl)?;
         let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
+        lock_plane(&mut transaction, claim.scope.plane_id).await?;
         let (stored, database_now) = loop {
             if insert_claim(&mut transaction, &claim, lease_duration, record_ttl).await? {
                 let inserted =
@@ -193,6 +195,57 @@ impl PostgresIdempotencyStore {
         }
     }
 
+    async fn start_job_inner(&self, job: SpeechJobStart) -> Result<(), IdempotencyStoreError> {
+        use sha2::Digest as _;
+        let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
+        lock_plane(&mut transaction, job.scope.plane_id).await?;
+        let stored = load_claim(&mut transaction, &job.scope)
+            .await?
+            .ok_or(IdempotencyStoreError::LeaseLost)?;
+        ensure_current_lease(&stored, job.lease_id, None)?;
+        let now = load_database_time(&mut transaction).await?;
+        if stored.lease_expires_at.is_none_or(|expiry| expiry <= now) {
+            return Err(IdempotencyStoreError::LeaseLost);
+        }
+        let mut hash = sha2::Sha256::new();
+        hash.update(job.scope.operation.as_str().as_bytes());
+        hash.update([0]);
+        hash.update(job.scope.key.as_str().as_bytes());
+        // The same key may start a new operation after idempotency retention.
+        hash.update(stored.request_id.as_uuid().as_bytes());
+        let updated = sqlx::query(r"
+            INSERT INTO waveform_jobs(id,plane_id,org_id,actor_id,actor_kind,operation,status,first_line,
+                request_digest,idempotency_key_hash,created_at,lease_token,lease_expires_at,voice_profile)
+            VALUES($1,$2,$3,$4,$5,$6,'running',$7,$8,$9,$10,$11,$12,$13)
+            ON CONFLICT(id) DO UPDATE SET status='running', voice_profile=EXCLUDED.voice_profile, first_line=EXCLUDED.first_line,
+                duration_ms=NULL,provider=NULL,error_code=NULL,finished_at=NULL,
+                lease_token=EXCLUDED.lease_token,lease_expires_at=EXCLUDED.lease_expires_at
+            WHERE waveform_jobs.plane_id=EXCLUDED.plane_id AND waveform_jobs.org_id=EXCLUDED.org_id
+                AND waveform_jobs.actor_id=EXCLUDED.actor_id AND waveform_jobs.actor_kind=EXCLUDED.actor_kind
+                AND waveform_jobs.operation=EXCLUDED.operation AND waveform_jobs.status<>'completed'
+                AND waveform_jobs.request_digest=EXCLUDED.request_digest
+                AND waveform_jobs.idempotency_key_hash=EXCLUDED.idempotency_key_hash
+        ").bind(stored.request_id.as_uuid()).bind(job.scope.plane_id)
+            .bind(job.scope.organization_id.as_str()).bind(job.scope.actor.id.as_uuid())
+            .bind(actor_kind(job.scope.actor.kind)).bind(job.scope.operation.as_str())
+            .bind(job.first_line.chars().take(512).collect::<String>()).bind(stored.digest)
+            .bind(hash.finalize().to_vec()).bind(stored.created_at).bind(job.lease_id.as_uuid())
+            .bind(stored.lease_expires_at).bind(job.voice_profile.map(sqlx::types::Json)).execute(&mut *transaction).await.map_err(map_sqlx_error)?.rows_affected();
+        if updated != 1 {
+            return Err(IdempotencyStoreError::LeaseLost);
+        }
+        transaction.commit().await.map_err(map_sqlx_error)
+    }
+
+    /// Marks crashed attempts failed after their database-authoritative lease expires.
+    /// Active attempts and finalized rows are never changed.
+    ///
+    /// # Errors
+    /// Returns a bounded database error when recovery cannot be persisted.
+    pub async fn recover_abandoned_jobs(&self) -> Result<u64, IdempotencyStoreError> {
+        self.with_timeout(recover_expired_jobs(&self.pool)).await
+    }
+
     async fn complete_inner(
         &self,
         completion: IdempotencyCompletion,
@@ -228,6 +281,7 @@ impl PostgresIdempotencyStore {
               AND org_id = $3
               AND operation = $4::waveform_operation
               AND idempotency_key = $5
+              AND plane_id = $11
               AND state = 'pending'
               AND lease_token = $6
               AND request_id = $8
@@ -243,11 +297,13 @@ impl PostgresIdempotencyStore {
         .bind(response_request_id(&completion.response).as_uuid())
         .bind(database_now)
         .bind(record_ttl)
+        .bind(completion.scope.plane_id)
         .execute(&mut *transaction)
         .await
         .map_err(map_sqlx_error)?
         .rows_affected();
         if updated == 1 {
+            finish_completed_job(&mut transaction, &completion).await?;
             transaction.commit().await.map_err(map_sqlx_error)
         } else {
             Err(IdempotencyStoreError::LeaseLost)
@@ -274,6 +330,7 @@ impl PostgresIdempotencyStore {
               AND org_id = $3
               AND operation = $4::waveform_operation
               AND idempotency_key = $5
+              AND plane_id = $8
               AND state = 'pending'
               AND lease_token = $6
             ",
@@ -285,16 +342,77 @@ impl PostgresIdempotencyStore {
         .bind(release.scope.key.as_str())
         .bind(release.lease_id.as_uuid())
         .bind(database_now)
+        .bind(release.scope.plane_id)
         .execute(&mut *transaction)
         .await
         .map_err(map_sqlx_error)?
         .rows_affected();
         if released == 1 {
+            sqlx::query("UPDATE waveform_jobs SET status='failed',error_code=$3,finished_at=clock_timestamp(),lease_expires_at=$4 WHERE id=$1 AND lease_token=$2 AND status='running'")
+                .bind(stored.request_id.as_uuid()).bind(release.lease_id.as_uuid())
+                .bind(release.failure_code.map_or("request_interrupted", crate::domain::error::ErrorCode::as_str))
+                .bind(database_now).execute(&mut *transaction).await.map_err(map_sqlx_error)?;
             transaction.commit().await.map_err(map_sqlx_error)
         } else {
             Err(IdempotencyStoreError::LeaseLost)
         }
     }
+}
+
+async fn lock_plane(
+    transaction: &mut Transaction<'_, Postgres>,
+    plane: Uuid,
+) -> Result<(), IdempotencyStoreError> {
+    sqlx::query(
+        "SELECT id FROM waveform_environments WHERE id=$1 AND deleted_at IS NULL FOR KEY SHARE",
+    )
+    .bind(plane)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(map_sqlx_error)?
+    .ok_or(IdempotencyStoreError::LeaseLost)?;
+    Ok(())
+}
+
+async fn finish_completed_job(
+    transaction: &mut Transaction<'_, Postgres>,
+    completion: &IdempotencyCompletion,
+) -> Result<(), IdempotencyStoreError> {
+    let (first_line, duration, provider) = match &completion.response {
+        CompletedSpeechOperation::Tts(result) => (None, Some(result.duration), result.provider),
+        CompletedSpeechOperation::Stt(result) => (
+            Some(
+                result
+                    .transcript
+                    .as_str()
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(512)
+                    .collect::<String>(),
+            ),
+            result.duration,
+            result.provider,
+        ),
+    };
+    let duration = duration
+        .map(|value| i64::try_from(value.as_millis()))
+        .transpose()
+        .map_err(|_| IdempotencyStoreError::InvalidRecord)?;
+    let updated = sqlx::query("UPDATE waveform_jobs SET status='completed',first_line=COALESCE($3,first_line),duration_ms=$4,provider=$5,error_code=NULL,finished_at=clock_timestamp(),lease_token=NULL,lease_expires_at=NULL WHERE id=$1 AND lease_token=$2")
+        .bind(response_request_id(&completion.response).as_uuid()).bind(completion.lease_id.as_uuid())
+        .bind(first_line).bind(duration).bind(provider.as_str()).execute(&mut **transaction).await.map_err(map_sqlx_error)?.rows_affected();
+    if updated != 1 {
+        return Err(IdempotencyStoreError::InvalidRecord);
+    }
+    Ok(())
+}
+
+/// Recovery also handles history rows from releases which did not persist leases.
+pub(crate) async fn recover_expired_jobs(pool: &PgPool) -> Result<u64, IdempotencyStoreError> {
+    sqlx::query("UPDATE waveform_jobs SET status='failed',error_code='request_interrupted',finished_at=clock_timestamp() WHERE status='running' AND (lease_expires_at <= clock_timestamp() OR (lease_token IS NULL AND created_at < clock_timestamp() - interval '1 day'))")
+        .execute(pool).await.map(|result| result.rows_affected()).map_err(map_sqlx_error)
 }
 
 struct StoredClaimRecord {
@@ -325,19 +443,19 @@ async fn insert_claim(
             SELECT clock_timestamp() AS now
         )
         INSERT INTO waveform_idempotency_records (
-            actor_type, actor_id, org_id, operation, idempotency_key,
+            actor_type, actor_id, org_id, operation, idempotency_key, plane_id,
             request_digest, request_id, state, lease_token,
             lease_expires_at, created_at, updated_at, expires_at
         )
         SELECT
-            $1::waveform_actor_type, $2, $3, $4::waveform_operation, $5,
+            $1::waveform_actor_type, $2, $3, $4::waveform_operation, $5, $11,
             $6, $7, 'pending', $8,
             database_time.now + $9,
             database_time.now, database_time.now,
             database_time.now + $10
         FROM database_time
         ON CONFLICT (
-            actor_type, actor_id, org_id, operation, idempotency_key
+            actor_type, actor_id, org_id, operation, idempotency_key, plane_id
         ) DO NOTHING
         RETURNING 1 AS inserted
         ",
@@ -352,6 +470,7 @@ async fn insert_claim(
     .bind(claim.lease_id.as_uuid())
     .bind(lease_duration)
     .bind(record_ttl)
+    .bind(claim.scope.plane_id)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(map_sqlx_error)?;
@@ -384,6 +503,7 @@ async fn initialize_inserted_claim(
           AND records.org_id = $3
           AND records.operation = $4::waveform_operation
           AND records.idempotency_key = $5
+          AND records.plane_id = $9
           AND records.state = 'pending'
           AND records.lease_token = $6
         RETURNING records.created_at, records.lease_expires_at
@@ -397,6 +517,7 @@ async fn initialize_inserted_claim(
     .bind(claim.lease_id.as_uuid())
     .bind(lease_duration)
     .bind(record_ttl)
+    .bind(claim.scope.plane_id)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(map_sqlx_error)?
@@ -426,6 +547,7 @@ async fn load_claim(
           AND org_id = $3
           AND operation = $4::waveform_operation
           AND idempotency_key = $5
+          AND plane_id = $6
         FOR UPDATE
         ",
     )
@@ -434,6 +556,7 @@ async fn load_claim(
     .bind(scope.organization_id.as_str())
     .bind(scope.operation.as_str())
     .bind(scope.key.as_str())
+    .bind(scope.plane_id)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(map_sqlx_error)?;
@@ -508,6 +631,7 @@ async fn delete_locked_claim(
           AND org_id = $3
           AND operation = $4::waveform_operation
           AND idempotency_key = $5
+          AND plane_id = $6
         ",
     )
     .bind(actor_kind(scope.actor.kind))
@@ -515,6 +639,7 @@ async fn delete_locked_claim(
     .bind(scope.organization_id.as_str())
     .bind(scope.operation.as_str())
     .bind(scope.key.as_str())
+    .bind(scope.plane_id)
     .execute(&mut **transaction)
     .await
     .map_err(map_sqlx_error)?
@@ -571,6 +696,7 @@ async fn reclaim_claim(
           AND records.org_id = $3
           AND records.operation = $4::waveform_operation
           AND records.idempotency_key = $5
+          AND records.plane_id = $8
           AND records.state = 'pending'
           AND records.lease_expires_at <= database_time.now
         RETURNING records.lease_expires_at
@@ -583,6 +709,7 @@ async fn reclaim_claim(
     .bind(claim.scope.key.as_str())
     .bind(claim.lease_id.as_uuid())
     .bind(lease_duration)
+    .bind(claim.scope.plane_id)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(map_sqlx_error)?
@@ -599,6 +726,10 @@ impl IdempotencyStore for PostgresIdempotencyStore {
         claim: IdempotencyClaim,
     ) -> Result<IdempotencyDecision, IdempotencyStoreError> {
         self.with_timeout(self.claim_inner(claim)).await
+    }
+
+    async fn start_job(&self, job: SpeechJobStart) -> Result<(), IdempotencyStoreError> {
+        self.with_timeout(self.start_job_inner(job)).await
     }
 
     async fn complete(
@@ -628,6 +759,8 @@ impl IdempotencyStore for PostgresIdempotencyStore {
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum StoredResponse {
     Tts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice_profile: Option<crate::domain::voice::VoiceProfileRef>,
         request_id: RequestId,
         file_url: String,
         provider: ProviderName,
@@ -648,6 +781,7 @@ fn encode_response(
     let stored = match response {
         CompletedSpeechOperation::Tts(result) if TTS_PROVIDER_CHAIN.contains(&result.provider) => {
             StoredResponse::Tts {
+                voice_profile: result.voice_profile.clone(),
                 request_id: result.request_id,
                 file_url: result.permanent_url.to_string(),
                 provider: result.provider,
@@ -675,6 +809,7 @@ fn decode_response(value: JsonValue) -> Result<CompletedSpeechOperation, Idempot
         .map_err(|_| IdempotencyStoreError::InvalidRecord)?;
     match stored {
         StoredResponse::Tts {
+            voice_profile,
             request_id,
             file_url,
             provider,
@@ -687,6 +822,7 @@ fn decode_response(value: JsonValue) -> Result<CompletedSpeechOperation, Idempot
                 .map_err(|_| IdempotencyStoreError::InvalidRecord)?;
             let duration = MediaDuration::from_millis(duration_ms);
             Ok(CompletedSpeechOperation::Tts(CompletedTtsOperation {
+                voice_profile,
                 request_id,
                 permanent_url,
                 provider,
@@ -1012,6 +1148,7 @@ mod tests {
 
     fn completed_tts_response() -> Result<CompletedSpeechOperation, Box<dyn StdError>> {
         Ok(CompletedSpeechOperation::Tts(CompletedTtsOperation {
+            voice_profile: None,
             request_id: RequestId::new(Uuid::from_u128(42))?,
             permanent_url: BriefcaseFileUrl::new(Url::parse(
                 "https://briefcase.example.test/files/generated",

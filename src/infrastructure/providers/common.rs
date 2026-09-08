@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret as _, SecretString};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
@@ -185,6 +185,9 @@ impl ProviderRuntime {
     }
 
     pub(crate) fn try_acquire(&self) -> Result<OwnedSemaphorePermit, ProviderError> {
+        if self.api_key.expose_secret().is_empty() {
+            return Err(ProviderError::new(ProviderErrorKind::Configuration));
+        }
         Arc::clone(&self.semaphore)
             .try_acquire_owned()
             .map_err(|_| ProviderError::new(ProviderErrorKind::Saturated))

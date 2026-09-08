@@ -136,7 +136,25 @@ impl FromStr for ApplicationId {
     type Err = IdentityError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        normalize_scoped_identifier(value, "application ID", MAX_APPLICATION_ID_LENGTH).map(Self)
+        if let Some((organization, handle)) = value.split_once('>') {
+            if organization.is_empty() || handle.is_empty() || handle.contains('>') {
+                return Err(IdentityError::InvalidCharacters {
+                    field: "application ID",
+                });
+            }
+            normalize_scoped_identifier(organization, "application ID", MAX_APPLICATION_ID_LENGTH)?;
+            normalize_scoped_identifier(handle, "application ID", MAX_APPLICATION_ID_LENGTH).map(
+                |normalized| {
+                    Self(format!(
+                        "{}>{normalized}",
+                        organization.to_ascii_lowercase()
+                    ))
+                },
+            )
+        } else {
+            normalize_scoped_identifier(value, "application ID", MAX_APPLICATION_ID_LENGTH)
+                .map(Self)
+        }
     }
 }
 
@@ -310,6 +328,15 @@ mod tests {
                 field: "organization ID"
             })
         );
+    }
+
+    #[test]
+    fn application_ids_accept_canonical_organization_qualified_handles() {
+        assert_eq!(
+            ApplicationId::from_str("TOS>Waveform").map(|value| value.to_string()),
+            Ok("tos>waveform".to_owned())
+        );
+        assert!(ApplicationId::from_str("tos>waveform>extra").is_err());
     }
 
     #[test]

@@ -1,0 +1,13 @@
+{
+  "BackupBucket": "silicon-waveform-standalone-backups-c9ap0zqahvyr",
+  "InstanceId": "i-0a20224cc619a1bc9",
+  "PublicIp": "100.51.64.51",
+  "SecurityGroupId": "sg-04684a7d29ac87521",
+  "BaseUrl": "https://backend.waveform.teamofsilicons.com",
+  "Profile": "silicon-production",
+  "Region": "us-east-1",
+  "Stack": "silicon-waveform-standalone",
+  "InstanceType": "t4g.small",
+  "ImageUri": "234951665042.dkr.ecr.us-east-1.amazonaws.com/silicon-waveform-production:worktree-391760a46fe13c63",
+  "SecretArn": "arn:aws:secretsmanager:us-east-1:234951665042:secret:silicon-waveform/production-y9pmR3"
+}

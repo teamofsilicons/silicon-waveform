@@ -565,7 +565,7 @@ pub struct StoredAudio {
     /// Durable authenticated reference.
     pub permanent_url: BriefcaseFileUrl,
     /// Expiring immediate-playback reference.
-    pub temporary_url: TemporaryMediaUrl,
+    pub temporary_url: Option<TemporaryMediaUrl>,
 }
 
 /// Media validation failure.

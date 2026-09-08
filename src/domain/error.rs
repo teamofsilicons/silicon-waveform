@@ -60,6 +60,10 @@ impl ErrorCode {
 /// External dependency named in safe operational errors.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Dependency {
+    /// Account voice profiles and provider mappings.
+    VoiceProfiles,
+    /// Encrypted account provider credentials.
+    ProviderKeys,
     /// Silicon IAM.
     Iam,
     /// Silicon Briefcase.

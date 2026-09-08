@@ -196,7 +196,14 @@ fn fixed_ffmpeg_command(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-protocol_whitelist",
+            "pipe",
+        ]);
     if let Some(pcm) = raw_pcm_specification(media_type)? {
         command
             .args(["-f", "s16le", "-ar"])
@@ -255,6 +262,100 @@ impl AudioNormalizer for FfmpegAudioNormalizer {
             .map_err(map_audio_error)
     }
 
+    async fn source_duration(
+        &self,
+        media: &crate::domain::media::SourceMedia,
+        _request_id: RequestId,
+    ) -> Result<MediaDuration, AudioNormalizationError> {
+        self.validate_input_size(media.bytes())
+            .map_err(map_audio_error)?;
+        let mut child = Command::new(&self.config.ffmpeg_path)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-protocol_whitelist",
+                "pipe",
+                "-i",
+                "pipe:0",
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-f",
+                "s16le",
+                "pipe:1",
+            ])
+            .spawn()
+            .map_err(|_| AudioNormalizationError::Unavailable)?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or(AudioNormalizationError::Unavailable)?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or(AudioNormalizationError::Unavailable)?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or(AudioNormalizationError::Unavailable)?;
+        let operation = async {
+            let write = async move {
+                stdin.write_all(media.bytes()).await?;
+                stdin.shutdown().await
+            };
+            let count = async {
+                let mut buffer = [0_u8; 8192];
+                let mut length = 0_u64;
+                loop {
+                    let read = stdout
+                        .read(&mut buffer)
+                        .await
+                        .map_err(|_| AudioNormalizationError::Failed)?;
+                    if read == 0 {
+                        break;
+                    }
+                    length = length
+                        .checked_add(
+                            u64::try_from(read).map_err(|_| AudioNormalizationError::Failed)?,
+                        )
+                        .ok_or(AudioNormalizationError::Failed)?;
+                }
+                Ok::<_, AudioNormalizationError>(length)
+            };
+            let (write, length, _stderr, status) = tokio::join!(
+                write,
+                count,
+                read_bounded(stderr, STDERR_LIMIT),
+                child.wait()
+            );
+            write.map_err(|_| AudioNormalizationError::InvalidAudio)?;
+            if !status
+                .map_err(|_| AudioNormalizationError::Failed)?
+                .success()
+            {
+                return Err(AudioNormalizationError::InvalidAudio);
+            }
+            let length = length?;
+            if length == 0 || length % 2 != 0 {
+                return Err(AudioNormalizationError::InvalidAudio);
+            }
+            Ok(MediaDuration::from_millis(length.div_ceil(32)))
+        };
+        tokio::time::timeout(self.config.timeout, operation)
+            .await
+            .map_err(|_| AudioNormalizationError::Timeout)?
+    }
+
     async fn check_ready(&self) -> Result<(), AudioNormalizationError> {
         if !(32..=320).contains(&self.config.bitrate_kbps) {
             return Err(AudioNormalizationError::Unavailable);
@@ -284,6 +385,9 @@ impl AudioNormalizer for FfmpegAudioNormalizer {
                 .shutdown()
                 .await
                 .map_err(|_| AudioNormalizationError::Unavailable)?;
+            // ChildStdin::shutdown does not close the pipe. FFmpeg must see EOF
+            // before it can finish encoding this finite readiness sample.
+            drop(stdin);
             let status = child
                 .wait()
                 .await
@@ -730,5 +834,58 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(AudioError::OutputTooLarge)));
+    }
+    #[tokio::test]
+    async fn readiness_finishes_encoding_its_finite_sample() {
+        use crate::application::ports::AudioNormalizer as _;
+        let mut config = AudioNormalizerConfig::new("ffmpeg");
+        config.timeout = Duration::from_secs(3);
+        let normalizer = FfmpegAudioNormalizer::new(config);
+
+        assert_eq!(normalizer.check_ready().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn measures_decoded_wav_and_rejects_non_audio() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::{
+            application::ports::AudioNormalizer as _,
+            domain::media::{MediaSizeLimit, SourceMedia, SourceMediaType},
+        };
+        let normalizer = FfmpegAudioNormalizer::new(AudioNormalizerConfig::new("ffmpeg"));
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&16036_u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&8000_u32.to_le_bytes());
+        wav.extend_from_slice(&16000_u32.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&16000_u32.to_le_bytes());
+        wav.resize(16044, 0);
+        let media = SourceMedia::new(
+            SourceMediaType::Wav,
+            Bytes::from(wav),
+            MediaSizeLimit::default(),
+        )?;
+        let id = RequestId::new(uuid::Uuid::new_v4())?;
+        assert_eq!(
+            normalizer.source_duration(&media, id).await?,
+            MediaDuration::from_millis(1000)
+        );
+        let invalid = SourceMedia::new(
+            SourceMediaType::Mpeg,
+            Bytes::from_static(b"this is not audio"),
+            MediaSizeLimit::default(),
+        )?;
+        assert_eq!(
+            normalizer.source_duration(&invalid, id).await,
+            Err(AudioNormalizationError::InvalidAudio)
+        );
+        Ok(())
     }
 }
