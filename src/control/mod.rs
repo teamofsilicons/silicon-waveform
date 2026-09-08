@@ -159,13 +159,26 @@ impl ControlState {
         org.map(str::parse::<crate::domain::identity::OrganizationId>)
             .transpose()
             .map_err(|_| ControlError::bad_request("invalid_organization"))?;
-        let authority = plane
-            .iam
-            .oauth()
-            .authorization(token, org)
-            .await
-            .map_err(ControlError::iam)?
-            .ok_or_else(ControlError::unauthorized)?;
+        let authority = if let Some(org) = org {
+            plane
+                .iam
+                .oauth()
+                .authorization(token, Some(org))
+                .await
+                .map_err(ControlError::iam)?
+        } else {
+            // Unscoped application tokens have a list of current organization
+            // snapshots. IAM returns them in handle order; use the first as the
+            // initial workspace instead of assuming the application's owning org.
+            plane
+                .iam
+                .oauth()
+                .authorizations(token)
+                .await
+                .map_err(ControlError::iam)?
+                .and_then(|items| items.into_iter().next())
+        }
+        .ok_or_else(ControlError::unauthorized)?;
         if org.is_some_and(|org| authority.org_id != org)
             || authority.audience != self.app_id
             || authority.testing_environment_id != plane.iam_environment_id

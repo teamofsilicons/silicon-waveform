@@ -103,14 +103,20 @@ export function createGateway({
   async function login(slot, slt) {
     if (typeof slt !== "string" || !/^oac_[!-~]{1,16380}$/.test(slt))
       return failure("invalid_token", "Enter a valid short-lived IAM code.");
-    const response = await upstream("/api/v1/auth/login", slot, "POST", {
-      slt,
-    });
+    const response = await upstream(
+      "/api/v1/auth/login",
+      { ...slot, org: undefined },
+      "POST",
+      {
+        slt,
+      },
+    );
     if (!response.ok) return response;
     await tokens(slot, await response.json());
     const me = await upstream("/api/v1/auth/me", slot);
     if (!me.ok) return me;
     slot.user = await me.json();
+    slot.org = slot.user.org_id;
     return null;
   }
   const snapshot = (s) => ({
@@ -248,13 +254,8 @@ export function createGateway({
         return finish(json(snapshot(session)));
       }
       if (path === "/auth/start" && request.method === "GET") {
-        const org = url.searchParams.get("org") || "tos";
-        if (!/^[a-zA-Z0-9_-]{1,128}$/.test(org))
-          return finish(
-            failure("invalid_organization", "Enter an organization handle."),
-          );
         const state = id();
-        session.pending = { state, org, until: Date.now() + 600_000 };
+        session.pending = { state, until: Date.now() + 600_000 };
         const callback = new URL("/auth/callback", origin);
         callback.searchParams.set("state", state);
         const destination = new URL(
@@ -262,8 +263,7 @@ export function createGateway({
           iam,
         );
         destination.searchParams.set("app_id", appId);
-        // IAM owns organization consent. Keep the requested workspace only in
-        // this server-side pending session; IAM rejects app-selected org scopes.
+        // Login is unscoped; discover the workspace from verified IAM authority.
         destination.searchParams.set("redirect_uri", callback.href);
         return finish(Response.redirect(destination, 303));
       }
@@ -278,7 +278,7 @@ export function createGateway({
         )
           error = "Sign-in expired. Please start again.";
         else {
-          const slot = { org: pending.org };
+          const slot = {};
           const failed = await login(slot, url.searchParams.get("slt"));
           if (failed)
             error = "IAM could not finish sign-in. Please try a fresh code.";

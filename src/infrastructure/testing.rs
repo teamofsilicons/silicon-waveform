@@ -32,6 +32,7 @@ use crate::{
         },
         provider::{ProviderError, ProviderFailureKind, ProviderName},
         speech::{SttProviderRequest, SttProviderResult, Transcript, TtsProviderRequest},
+        voice::ProviderVoice,
     },
 };
 
@@ -47,9 +48,9 @@ pub const TEST_FIXTURE_PROVIDER: ProviderName = ProviderName::Gemini;
 /// Fixed decoded duration reported by the fixture audio.
 ///
 /// This is the duration of the checked-in spoken fixture, measured from its
-/// 16 kHz MP3 stream. Keeping the value stable means the testing plane does
+/// 44.1 kHz MP3 stream. Keeping the value stable means the testing plane does
 /// not need to invoke a codec at request time.
-pub const TEST_TTS_DURATION: MediaDuration = MediaDuration::from_millis(13_471);
+pub const TEST_TTS_DURATION: MediaDuration = MediaDuration::from_millis(15_230);
 
 /// The checked-in spoken fixture used for test-plane TTS uploads.
 ///
@@ -57,8 +58,62 @@ pub const TEST_TTS_DURATION: MediaDuration = MediaDuration::from_millis(13_471);
 /// bytes are a real MP3 recording of [`TEST_TTS_TEXT`], so consumers can
 /// decode and play the same deterministic audio that a successful TTS call
 /// would store in Briefcase.
+const TEST_TTS_CLIPS: &[(&str, &[u8])] = &[
+    ("Zephyr", include_bytes!("test-audio/zephyr.mp3")),
+    ("Puck", include_bytes!("test-audio/puck.mp3")),
+    ("Charon", include_bytes!("test-audio/charon.mp3")),
+    ("Kore", include_bytes!("test-audio/kore.mp3")),
+    ("Fenrir", include_bytes!("test-audio/fenrir.mp3")),
+    ("Leda", include_bytes!("test-audio/leda.mp3")),
+    ("Orus", include_bytes!("test-audio/orus.mp3")),
+    ("Aoede", include_bytes!("test-audio/aoede.mp3")),
+    ("Callirrhoe", include_bytes!("test-audio/callirrhoe.mp3")),
+    ("Autonoe", include_bytes!("test-audio/autonoe.mp3")),
+    ("Enceladus", include_bytes!("test-audio/enceladus.mp3")),
+    ("Iapetus", include_bytes!("test-audio/iapetus.mp3")),
+    ("Umbriel", include_bytes!("test-audio/umbriel.mp3")),
+    ("Algieba", include_bytes!("test-audio/algieba.mp3")),
+    ("Despina", include_bytes!("test-audio/despina.mp3")),
+    ("Erinome", include_bytes!("test-audio/erinome.mp3")),
+    ("Algenib", include_bytes!("test-audio/algenib.mp3")),
+    ("Rasalgethi", include_bytes!("test-audio/rasalgethi.mp3")),
+    ("Laomedeia", include_bytes!("test-audio/laomedeia.mp3")),
+    ("Achernar", include_bytes!("test-audio/achernar.mp3")),
+    ("Alnilam", include_bytes!("test-audio/alnilam.mp3")),
+    ("Schedar", include_bytes!("test-audio/schedar.mp3")),
+    ("Gacrux", include_bytes!("test-audio/gacrux.mp3")),
+    ("Pulcherrima", include_bytes!("test-audio/pulcherrima.mp3")),
+    ("Achird", include_bytes!("test-audio/achird.mp3")),
+    (
+        "Zubenelgenubi",
+        include_bytes!("test-audio/zubenelgenubi.mp3"),
+    ),
+    (
+        "Vindemiatrix",
+        include_bytes!("test-audio/vindemiatrix.mp3"),
+    ),
+    ("Sadachbia", include_bytes!("test-audio/sadachbia.mp3")),
+    ("Sadaltager", include_bytes!("test-audio/sadaltager.mp3")),
+    ("Sulafat", include_bytes!("test-audio/sulafat.mp3")),
+];
+
 fn fixture_mp3() -> Bytes {
-    Bytes::from_static(include_bytes!("test-fixture.mp3"))
+    Bytes::from_static(include_bytes!("test-audio/kore.mp3"))
+}
+
+fn fixture_voice(request: &TtsProviderRequest) -> Result<&str, ProviderError> {
+    match &request.voice {
+        None => Ok("Kore"),
+        Some(ProviderVoice::Gemini(voice))
+            if TEST_TTS_CLIPS.iter().any(|(name, _)| name == voice) =>
+        {
+            Ok(voice)
+        }
+        _ => Err(ProviderError::new(
+            TEST_FIXTURE_PROVIDER,
+            ProviderFailureKind::InvalidResponse,
+        )),
+    }
 }
 
 /// Deterministic TTS provider. Gemini succeeds; the other chain positions are
@@ -85,7 +140,7 @@ impl TextToSpeechProvider for FixtureTtsProvider {
 
     async fn synthesize(
         &self,
-        _request: TtsProviderRequest,
+        request: TtsProviderRequest,
         _request_id: RequestId,
     ) -> Result<AudioArtifact, ProviderError> {
         if self.provider != TEST_FIXTURE_PROVIDER {
@@ -94,7 +149,14 @@ impl TextToSpeechProvider for FixtureTtsProvider {
                 ProviderFailureKind::Unavailable,
             ));
         }
-        AudioArtifact::new(ProviderAudioFormat::Mp3, fixture_mp3())
+        let voice = fixture_voice(&request)?;
+        let (_, bytes) = TEST_TTS_CLIPS
+            .iter()
+            .find(|(name, _)| *name == voice)
+            .ok_or_else(|| {
+                ProviderError::new(self.provider, ProviderFailureKind::InvalidResponse)
+            })?;
+        AudioArtifact::new(ProviderAudioFormat::Mp3, Bytes::from_static(bytes))
             .map_err(|_| ProviderError::new(self.provider, ProviderFailureKind::InvalidResponse))
     }
 }
@@ -161,7 +223,9 @@ impl AudioNormalizer for FixtureAudioNormalizer {
         artifact: AudioArtifact,
         _request_id: RequestId,
     ) -> Result<NormalizedAudio, AudioNormalizationError> {
-        NormalizedAudio::new(artifact.into_bytes(), TEST_TTS_DURATION)
+        let duration = super::audio::mp3_duration_ms(artifact.bytes())
+            .map_err(|_| AudioNormalizationError::InvalidAudio)?;
+        NormalizedAudio::new(artifact.into_bytes(), MediaDuration::from_millis(duration))
             .map_err(|_| AudioNormalizationError::InvalidAudio)
     }
 
@@ -198,6 +262,13 @@ pub fn provider_chains() -> FixtureProviderChains {
 pub(crate) async fn seed_audio(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO waveform_speech_fixtures(name,mp3) VALUES('tts-v1',$1) ON CONFLICT(name) DO UPDATE SET mp3=EXCLUDED.mp3 WHERE waveform_speech_fixtures.mp3 IS DISTINCT FROM EXCLUDED.mp3")
         .bind(fixture_mp3().as_ref()).execute(pool).await?;
+    let mut transaction = pool.begin().await?;
+    for (voice, bytes) in TEST_TTS_CLIPS {
+        sqlx::query("INSERT INTO waveform_speech_fixtures(name,mp3) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET mp3=EXCLUDED.mp3 WHERE waveform_speech_fixtures.mp3 IS DISTINCT FROM EXCLUDED.mp3")
+            .bind(format!("tts-v2:{voice}"))
+            .bind(*bytes).execute(&mut *transaction).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -211,11 +282,13 @@ impl TextToSpeechProvider for DatabaseFixtureTtsProvider {
 
     async fn synthesize(
         &self,
-        _request: TtsProviderRequest,
+        request: TtsProviderRequest,
         _request_id: RequestId,
     ) -> Result<AudioArtifact, ProviderError> {
+        let voice = fixture_voice(&request)?;
         let bytes: Vec<u8> =
-            sqlx::query_scalar("SELECT mp3 FROM waveform_speech_fixtures WHERE name='tts-v1'")
+            sqlx::query_scalar("SELECT mp3 FROM waveform_speech_fixtures WHERE name=$1")
+                .bind(format!("tts-v2:{voice}"))
                 .fetch_one(&self.0)
                 .await
                 .map_err(|_| {
@@ -605,6 +678,57 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn demo_catalog_matches_every_voice_and_validates_all_mp3s()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let profiles: Vec<crate::domain::voice::VoiceProfile> =
+            serde_json::from_str(include_str!("../domain/voice_profiles.json"))?;
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("test-audio/manifest.json"))?;
+        assert_eq!(manifest["text"], TEST_TTS_TEXT);
+        assert_eq!(TEST_TTS_CLIPS.len(), profiles.len());
+        assert_eq!(
+            manifest["clips"].as_object().ok_or("clips")?.len(),
+            profiles.len()
+        );
+        let provider = FixtureTtsProvider::new(ProviderName::Gemini);
+        let mut hashes = std::collections::HashSet::new();
+        for profile in profiles {
+            let mut request =
+                TtsRequest::new(SpeechText::new("ignored test input".to_owned())?, None)?;
+            request.resolved_voice = Some(profile.clone());
+            let artifact = provider
+                .synthesize(
+                    TtsProviderRequest::for_provider(&request, ProviderName::Gemini),
+                    request_id(),
+                )
+                .await?;
+            let entry = &manifest["clips"][&profile.id];
+            let hash = silicon_iam_client::api::obo::body_sha256(artifact.bytes());
+            assert_eq!(entry["sha256"], hash);
+            assert!(hashes.insert(hash));
+            assert_eq!(entry["voice"], profile.gemini_voice);
+            let duration = super::super::audio::mp3_duration_ms(artifact.bytes())?;
+            assert!(duration > 8000 && duration < 45000);
+            assert_eq!(entry["duration_ms"], duration);
+            let normalized = FixtureAudioNormalizer
+                .normalize_to_mp3(artifact, request_id())
+                .await?;
+            assert_eq!(normalized.duration(), MediaDuration::from_millis(duration));
+        }
+        assert_eq!(
+            super::super::audio::mp3_duration_ms(&fixture_mp3())?,
+            TEST_TTS_DURATION.as_millis()
+        );
+        let mut request = TtsProviderRequest::for_provider(
+            &TtsRequest::new(SpeechText::new("x".to_owned())?, None)?,
+            ProviderName::Gemini,
+        );
+        request.voice = Some(ProviderVoice::Gemini("UnknownVoice".to_owned()));
+        assert!(provider.synthesize(request, request_id()).await.is_err());
+        Ok(())
     }
 
     #[tokio::test]

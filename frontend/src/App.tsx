@@ -83,7 +83,7 @@ export default function App() {
     setBusy(true);
     setError();
     try {
-      await sessionAction("login", { slt: slt().trim(), org: org().trim() });
+      await sessionAction("login", { slt: slt().trim() });
       setSlt("");
       setLogin(false);
     } catch (err) {
@@ -407,55 +407,34 @@ export default function App() {
             <p class="muted">
               {session()?.plane === "test"
                 ? "Use a short-lived code issued to Waveform in the linked IAM test environment."
-                : "Your identity is managed by Silicon IAM. Continue there, or use a short-lived sign-in code."}
+                : "Sign in or create your account securely with Silicon IAM."}
             </p>
-            <label>
-              Organization handle
-              <input
-                value={org()}
-                onInput={(e) => setOrg(e.currentTarget.value)}
-                pattern="[A-Za-z0-9_-]{1,128}"
-                required
-                placeholder="tos"
-              />
-            </label>
-            <Show when={session()?.plane !== "test"}>
-              <a
-                class="button primary"
-                href={`/auth/start?org=${encodeURIComponent(org())}`}
-              >
-                Continue with Silicon IAM <Icon name="arrow" />
+            <Show
+              when={session()?.plane !== "test"}
+              fallback={
+                <form class="stack" onSubmit={signIn}>
+                  <label>
+                    Short-lived IAM code
+                    <input
+                      required
+                      type="password"
+                      autocomplete="off"
+                      placeholder="oac_…"
+                      value={slt()}
+                      onInput={(e) => setSlt(e.currentTarget.value)}
+                    />
+                  </label>
+                  <button class="button" disabled={busy() || !slt().trim()}>
+                    {busy() ? "Signing in…" : "Sign in with code"}
+                  </button>
+                </form>
+              }
+            >
+              <a class="button primary" href="/auth/start">
+                Continue with IAM <Icon name="arrow" />
               </a>
-              <p class="hint">
-                New here?{" "}
-                <a
-                  href={`/auth/start?intent=signup&org=${encodeURIComponent(org())}`}
-                >
-                  Create your account in IAM
-                </a>
-              </p>
-              <div class="divider">OR USE A SIGN-IN CODE</div>
             </Show>
-            <form class="stack" onSubmit={signIn}>
-              <label>
-                Short-lived IAM code
-                <input
-                  required
-                  type="password"
-                  autocomplete="off"
-                  placeholder="oac_…"
-                  value={slt()}
-                  onInput={(e) => setSlt(e.currentTarget.value)}
-                />
-              </label>
-              <Notice error={error()} />
-              <button
-                class="button"
-                disabled={busy() || !slt().trim() || !org().trim()}
-              >
-                {busy() ? "Signing in…" : "Sign in with code"}
-              </button>
-            </form>
+            <Notice error={error()} />
             <p class="hint">
               Access tokens stay on the frontend server. Waveform never asks for
               your IAM password.

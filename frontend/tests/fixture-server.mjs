@@ -4,6 +4,22 @@ import { fixture } from "./fixture.mjs";
 import { startServer } from "../server/node.mjs";
 const fake = fixture();
 const backend = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://127.0.0.1:4340");
+  if (["/login", "/signup"].includes(url.pathname)) {
+    const callback = new URL(url.searchParams.get("redirect_uri"));
+    if (
+      callback.origin !== "http://localhost:4341" ||
+      callback.pathname !== "/auth/callback"
+    ) {
+      res.writeHead(400);
+      res.end("Invalid fixture callback");
+      return;
+    }
+    callback.searchParams.set("slt", "oac_waveform_ui_fixture");
+    res.writeHead(303, { location: callback.href });
+    res.end();
+    return;
+  }
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const response = await fake.fetcher(
@@ -22,6 +38,7 @@ const server = startServer({
   port: 4341,
   origin: "http://localhost:4341",
   backend: "http://127.0.0.1:4340",
+  iam: "http://127.0.0.1:4340",
 });
 console.log(
   "Disposable UI fixture: sign-in code oac_waveform_ui_fixture; environment key " +

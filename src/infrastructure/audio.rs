@@ -522,7 +522,7 @@ fn is_mp3_media_type(media_type: &str) -> bool {
 }
 
 /// Validates MPEG audio framing and derives duration from frame sample counts.
-fn mp3_duration_ms(bytes: &[u8]) -> Result<u64, AudioError> {
+pub(crate) fn mp3_duration_ms(bytes: &[u8]) -> Result<u64, AudioError> {
     let mut offset = id3v2_end(bytes)?;
     let mut frame_count = 0_u64;
     let mut total_samples = 0_u128;

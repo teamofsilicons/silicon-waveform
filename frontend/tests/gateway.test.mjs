@@ -233,7 +233,7 @@ test("clean uses only the selected root and rejects production", async () => {
 });
 test("IAM handoff validates state and scrubs the code from the final URL", async () => {
   const s = setup();
-  const start = await s.call("/auth/start?org=tos");
+  const start = await s.call("/auth/start");
   const destination = new URL(start.headers.get("location"));
   assert.equal(destination.origin, "https://auth.iam.teamofsilicons.com");
   assert.equal(destination.searchParams.get("app_id"), "tos>waveform");
@@ -244,6 +244,9 @@ test("IAM handoff validates state and scrubs the code from the final URL", async
   const done = await s.call(callback.pathname + callback.search);
   assert.equal(done.status, 303);
   assert.equal(done.headers.get("location"), origin + "/");
+  assert.equal(s.fake.requests.at(-1).headers.get("x-org-id"), null);
+  assert.equal((await (await s.call("/api/session")).json()).org, "tos");
+  await s.call("/api/v1/preferences");
   assert.equal(s.fake.requests.at(-1).headers.get("x-org-id"), "tos");
   const replay = await s.call(callback.pathname + callback.search);
   assert.match(replay.headers.get("location"), /auth_error=/);

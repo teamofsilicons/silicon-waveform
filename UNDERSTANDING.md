@@ -99,6 +99,8 @@ For each testing enviorment they would be sharing a shared test database, this w
 In waveform test enviorment instead of doing TTS or STT each time, we would have a stored TTS of the text [(Hey, this is the test enviorment of silicon waveform, if you are listenting to this, TTS worked. We didn't actually run the TTS but in prod the TTS would work as intented. Let's go broo! To agents and humans.)] and for STT for whatever audio file it is just the text:
 ([Hey, this is the test enviorment of silicon waveform, if you are reading this, STT worked. We didn't actually run the STT but in prod the STT would work as intented. Let's go mate! To agents and humans!)]. And return this for the requests they send for TTS and STT only in the test enviorments.
 
+Each voice profile has a prerecorded Gemini demo of the same test message. The resolved account default or per-request voice profile selects the clip; no paid TTS call runs during a test request.
+
 For the audio file we would have it locally in our db, but we would upload it in the test briefcase everytime with a different name to show that this is how you would actually get the said links.
 
 

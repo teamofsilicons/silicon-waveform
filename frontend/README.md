@@ -18,15 +18,17 @@ connects to the already deployed AWS backend. Use `localhost` consistently:
 mutations validate the browser origin, which defaults to `http://localhost:4325`.
 No production API keys or IAM application secrets belong in this frontend.
 
-`Continue with Silicon IAM` uses the live IAM authentication frontend. It sends
-the Waveform app ID and a callback containing a session-bound, ten-minute nonce.
-The callback exchanges the single-use code through the Waveform backend, then
-redirects to a clean URL. Signup is delegated to IAM too. A short-lived `oac_`
-code can also be entered manually, including for a paired testing environment.
-The server validates the actor with `/api/v1/auth/me` before accepting login.
-IAM owns organization consent; the redirect supplies only the application and
-callback. Waveform keeps the requested workspace in its server-side session and
-checks access to that workspace after login.
+The production sign-in screen contains one **Continue with IAM** button. It
+opens the live IAM authentication frontend with the Waveform app ID and a
+callback containing a session-bound, ten-minute nonce. It does not send an
+organization selection or ask for a code. The callback exchanges the single-use
+code through the backend, discovers the first available workspace from IAM's
+verified unscoped authorization snapshots, and redirects to a clean URL.
+
+Paired testing environments keep their separate test-only short-lived code
+entry so production IAM credentials cannot cross into a test plane. No
+organization field is shown in either login screen. Organization headers on
+subsequent API requests identify the active workspace; they do not scope login.
 
 ## Features
 

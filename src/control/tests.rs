@@ -688,3 +688,51 @@ async fn voice_profiles_isolate_accounts_organizations_and_test_catalogs() -> Te
     pool.close().await;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn unscoped_identity_uses_iam_workspace_and_rejects_wrong_audience() -> TestResult {
+    let (pool, schema) = database().await?;
+    let iam = MockServer::start().await;
+    let state = fixture(pool.clone(), &iam)?;
+    let app = router(state);
+    let mut authority = snapshot(Uuid::new_v4())["authorization"].clone();
+    authority["org_id"] = json!("workspace");
+    for (token, audience, expected) in [
+        ("oat_unscoped", "tos>waveform", StatusCode::OK),
+        ("oat_wrong", "tos>other", StatusCode::FORBIDDEN),
+    ] {
+        authority["audience"] = json!(audience);
+        Mock::given(method("POST"))
+            .and(path("/api/v1/oauth/introspect"))
+            .and(body_string_contains(format!("token={token}")))
+            .and(|request: &wiremock::Request| !request.headers.contains_key("x-org-id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"active":true,"authorizations":[authority.clone()]})),
+            )
+            .expect(1)
+            .mount(&iam)
+            .await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::OK {
+            let value: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
+            assert_eq!(value["org_id"], "workspace");
+        }
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
+}

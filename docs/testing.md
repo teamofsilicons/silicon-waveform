@@ -56,8 +56,12 @@ that retention window its row and all scoped data are permanently purged.
 
 ## Deterministic speech fixtures
 
-At startup Waveform seeds the packaged spoken MP3 from `UNDERSTANDING.md`
-into `waveform_speech_fixtures`. Test TTS loads that audio from PostgreSQL.
+At startup Waveform seeds 30 packaged spoken MP3 clips, one for each Gemini
+voice profile, into `waveform_speech_fixtures`. Every clip speaks the same
+prescribed test message from `UNDERSTANDING.md`. Test TTS selects the clip using
+the resolved profile’s Gemini voice, so account defaults and request overrides
+are audible in the testing environment. No profile defaults to another voice
+when its clip is missing. Test TTS loads the selected audio from PostgreSQL.
 Waveform hashes the final bytes, exchanges the caller's
 test-plane access token for a Briefcase upload proof using the paired IAM SDK
 client, and uploads those bytes through the official Briefcase SDK with the
@@ -94,6 +98,12 @@ as real isolated local services; internet deployment is not required. On
 2026-09-08, the compiled CLI passed real paired-service checks for both actor
 kinds, storage, sessions, preferences, webhooks, and lifecycle operations. See
 [test-report-2026-09-08.md](test-report-2026-09-08.md).
+
+The assets and generation/transcription QA manifest live in
+`src/infrastructure/test-audio/`. Regenerate explicitly with
+`python3 scripts/generate_test_audio.py --voice all --aws-secret --verify`; this
+one-time authoring command contacts providers, while test requests never do.
+Existing verified assets are reused. The legacy default fixture remains Kore.
 
 Gemini is the successful fixture provider. The other fixture providers return
 bounded unavailable errors, allowing account and per-request ordering to exercise

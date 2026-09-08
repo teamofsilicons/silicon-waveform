@@ -55,16 +55,19 @@ fn speech_app(state: Arc<ControlState>) -> Result<Router, Box<dyn std::error::Er
         crate::domain::speech::MAX_TTS_TEXT_CHARACTERS,
         RequestDigestKey::new(b"test-key-123456789012345678901234567890")?,
     )?;
-    let service = Arc::new(WaveformService::new(
-        iam,
-        briefcase,
-        store.clone(),
-        audio.clone(),
-        Arc::new(Leases),
-        tts,
-        stt,
-        policy,
-    )?);
+    let service = Arc::new(
+        WaveformService::new(
+            iam,
+            briefcase,
+            store.clone(),
+            audio.clone(),
+            Arc::new(Leases),
+            tts,
+            stt,
+            policy,
+        )?
+        .with_voice_profiles(state.clone()),
+    );
     let readiness = ReadinessChecks::new(store, audio, true, false);
     let api = ApiState::new(service.clone(), readiness, duration, duration)
         .with_control(state)
@@ -128,7 +131,10 @@ async fn test_tts_uploads_exact_fixture_with_both_paired_keys() -> TestResult {
     let minted_reads = read_ledger.clone();
     let uploads = Arc::new(Mutex::new(Vec::<String>::new()));
     let exchange_names = uploads.clone();
-    let expected_bytes = include_bytes!("../infrastructure/test-fixture.mp3");
+    let expected_clips: [&[u8]; 2] = [
+        include_bytes!("../infrastructure/test-audio/kore.mp3"),
+        include_bytes!("../infrastructure/test-audio/puck.mp3"),
+    ];
     Mock::given(method("POST")).and(path("/api/v1/obo-access/exchanges"))
         .and(header("x-testing-environment-key", "I".repeat(32)))
         .respond_with(move |request: &wiremock::Request| {
@@ -142,7 +148,8 @@ async fn test_tts_uploads_exact_fixture_with_both_paired_keys() -> TestResult {
                 minted_reads.lock().unwrap_or_else(|_| panic!("ledger")).proofs.insert(proof.clone(), (endpoint.to_owned(), digest.to_owned()));
                 return ResponseTemplate::new(201).set_body_json(json!({"access_proof":proof,"proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}));
             }
-            assert_eq!(body["request"]["body_sha256"], silicon_iam_client::api::obo::body_sha256(expected_bytes));
+            let clip_index = exchange_names.lock().unwrap_or_else(|_| panic!("exchange lock")).len();
+            assert_eq!(body["request"]["body_sha256"], silicon_iam_client::api::obo::body_sha256(expected_clips[clip_index]));
             assert!(request.headers.contains_key("x-obo-signature"));
             exchange_names.lock().unwrap_or_else(|_| panic!("exchange lock")).push(body["metadata"]["name"].as_str().unwrap_or_else(|| panic!("upload name")).to_owned());
             ResponseTemplate::new(201).set_body_json(json!({"access_proof":"obo_paired_upload","proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
@@ -162,8 +169,8 @@ async fn test_tts_uploads_exact_fixture_with_both_paired_keys() -> TestResult {
         .and(header("x-app-id", "tos>waveform"))
         .respond_with(move |request: &wiremock::Request| {
             assert!(!request.headers.contains_key("authorization"));
-            assert_eq!(request.body, expected_bytes);
             let names = stored_names.lock().unwrap_or_else(|_| panic!("upload lock"));
+            assert_eq!(request.body, expected_clips[names.len() - 1]);
             let name = names.last().unwrap_or_else(|| panic!("upload must follow exchange"));
             ResponseTemplate::new(201).set_body_json(json!({
                 "id":Uuid::new_v4(), "org_id":"tos", "type":"file", "visibility":"full", "name":name,
@@ -221,13 +228,21 @@ async fn test_tts_uploads_exact_fixture_with_both_paired_keys() -> TestResult {
             .header("x-testing-environment-key", root)
             .header("idempotency-key", key)
             .body(Body::from(
-                json!({"text":"use the deterministic fixture"}).to_string(),
+                json!({"text":"use the deterministic fixture", "voice_profile": if index == 1 { Some("puck") } else { None }}).to_string(),
             ))?;
         let response = app.clone().oneshot(request).await?;
         let status = response.status();
         let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["temporary_url"].is_null());
+        assert_eq!(
+            body["voice_profile"]["id"],
+            if index == 1 { "puck" } else { "kore" }
+        );
+        assert_eq!(
+            body["duration_ms"],
+            crate::infrastructure::audio::mp3_duration_ms(expected_clips[usize::from(index == 1)])?
+        );
         if index == 0 {
             first_result = body.clone();
         }
