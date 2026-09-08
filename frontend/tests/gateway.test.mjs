@@ -237,11 +237,14 @@ test("IAM handoff validates state and scrubs the code from the final URL", async
   const destination = new URL(start.headers.get("location"));
   assert.equal(destination.origin, "https://auth.iam.teamofsilicons.com");
   assert.equal(destination.searchParams.get("app_id"), "tos>waveform");
+  assert.equal(destination.searchParams.has("org_id"), false);
+  assert.equal(destination.searchParams.has("org_ids"), false);
   const callback = new URL(destination.searchParams.get("redirect_uri"));
   callback.searchParams.set("slt", "oac_waveform_ui_fixture");
   const done = await s.call(callback.pathname + callback.search);
   assert.equal(done.status, 303);
   assert.equal(done.headers.get("location"), origin + "/");
+  assert.equal(s.fake.requests.at(-1).headers.get("x-org-id"), "tos");
   const replay = await s.call(callback.pathname + callback.search);
   assert.match(replay.headers.get("location"), /auth_error=/);
 });

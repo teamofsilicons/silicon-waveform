@@ -24,6 +24,9 @@ The callback exchanges the single-use code through the Waveform backend, then
 redirects to a clean URL. Signup is delegated to IAM too. A short-lived `oac_`
 code can also be entered manually, including for a paired testing environment.
 The server validates the actor with `/api/v1/auth/me` before accepting login.
+IAM owns organization consent; the redirect supplies only the application and
+callback. Waveform keeps the requested workspace in its server-side session and
+checks access to that workspace after login.
 
 ## Features
 

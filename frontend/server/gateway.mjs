@@ -262,7 +262,8 @@ export function createGateway({
           iam,
         );
         destination.searchParams.set("app_id", appId);
-        destination.searchParams.set("org_id", org);
+        // IAM owns organization consent. Keep the requested workspace only in
+        // this server-side pending session; IAM rejects app-selected org scopes.
         destination.searchParams.set("redirect_uri", callback.href);
         return finish(Response.redirect(destination, 303));
       }
