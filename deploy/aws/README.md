@@ -30,6 +30,13 @@ The CloudFormation definition is `standalone.json`.
 
 ## First deployment status
 
+The backend voice-profile release and frontend were published on 2026-09-08.
+Production IAM sign-in, the 30-profile selector, live Gemini generation with
+Puck, Briefcase storage, and profile revision history are verified. Transcription
+currently awaits two delegated-read registrations in Briefcase's IAM catalog;
+see the [publication report](../../docs/deployment-verification-2026-09-08.md).
+The following notes describe the initial server activation before that release.
+
 Infrastructure, DNS, a trusted HTTPS certificate, PostgreSQL, and all four
 user-supplied provider keys were installed on 2026-09-08. Production IAM accepts the existing `tos>waveform` application credentials
 after correcting a deployment import that retained dotenv quotation marks.

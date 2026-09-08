@@ -8,6 +8,13 @@
   "Region": "us-east-1",
   "Stack": "silicon-waveform-standalone",
   "InstanceType": "t4g.small",
-  "ImageUri": "234951665042.dkr.ecr.us-east-1.amazonaws.com/silicon-waveform-production:worktree-391760a46fe13c63",
-  "SecretArn": "arn:aws:secretsmanager:us-east-1:234951665042:secret:silicon-waveform/production-y9pmR3"
+  "ImageUri": "234951665042.dkr.ecr.us-east-1.amazonaws.com/silicon-waveform-production@sha256:5ff9083f744d78ea443e9f59d965eea3c034dc2c2f2719354c31c6fffcb0d206",
+  "SecretArn": "arn:aws:secretsmanager:us-east-1:234951665042:secret:silicon-waveform/production-y9pmR3",
+  "PreviousImageUri": "234951665042.dkr.ecr.us-east-1.amazonaws.com/silicon-waveform-production:worktree-391760a46fe13c63",
+  "FrontendImageUri": "234951665042.dkr.ecr.us-east-1.amazonaws.com/silicon-waveform-production@sha256:298a7e06edaf7a9173c3869587ff6f42a586122b8d2115532d91c0ab72f2838c",
+  "FrontendBaseUrl": "https://waveform.teamofsilicons.com",
+  "ReleaseCommit": "53e8da180d125546a22be9c79ee56f372e2d9b36",
+  "PreviousFrontendImageUri": "234951665042.dkr.ecr.us-east-1.amazonaws.com/silicon-waveform-production@sha256:ce5f9ce3f2fd1e5e55e5a0c2e8f2d96b27c05eb7b92826053bd6474f107f7d2f",
+  "FrontendReleaseCommit": "3074d7d4dc0c6f5ad664e4195f322e5ac937b125",
+  "DeployedAt": "2026-09-08T13:07:21Z"
 }
