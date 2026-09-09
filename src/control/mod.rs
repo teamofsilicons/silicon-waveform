@@ -338,6 +338,7 @@ struct Identity {
 /// Routes merged before the main API's admission, deadlines and logging layers.
 pub fn router(state: Arc<ControlState>) -> Router {
     Router::new()
+        .route("/api/v1/iam", get(sessions::iam))
         .route("/api/v1/auth/login", post(sessions::login))
         .route("/api/v1/auth/refresh", post(sessions::refresh))
         .route("/api/v1/auth/logout", post(sessions::logout))

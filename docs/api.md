@@ -8,6 +8,11 @@ accepts `{text,lang?,voice_profile?,provider_order?}` and `POST /stt` accepts
 provider prefix; omitted providers follow the caller's account preference.
 Both routes are synchronous and return normalized provider-independent results.
 
+`GET /iam` is public discovery: it returns the configured `app_id`,
+`iam_base_url`, and `testing_environment_id` (the IAM sandbox UUID, or null in
+production). It never exposes application secrets or environment keys, sends
+`Cache-Control: no-store`, and validates any supplied test selector.
+
 Control routes include `POST /auth/login` (an IAm SLT only),
 `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/me`, provider preference and
 write-only personal-key routes, and `GET /jobs`. The signed IAM receiver is

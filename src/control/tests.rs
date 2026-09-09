@@ -116,6 +116,34 @@ fn snapshot(actor: Uuid) -> Value {
 }
 
 #[tokio::test]
+async fn iam_discovery_is_public_and_exposes_only_public_configuration() -> TestResult {
+    // Discovery in production needs neither a database connection nor an IAM call.
+    let pool = PgPoolOptions::new().connect_lazy("postgres://localhost/unused")?;
+    let iam = MockServer::start().await;
+    let app = router(fixture(pool, &iam)?);
+    let response = app
+        .oneshot(Request::builder().uri("/api/v1/iam").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[http::header::CACHE_CONTROL], "no-store");
+    let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
+    assert_eq!(
+        body,
+        json!({
+            "app_id":"tos>waveform", "iam_base_url":format!("{}/", iam.uri()),
+            "testing_environment_id":null
+        })
+    );
+    assert!(
+        iam.received_requests()
+            .await
+            .ok_or("requests unavailable")?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
 #[allow(clippy::too_many_lines)]
 async fn login_settings_secrets_webhooks_and_online_revocation() -> TestResult {
@@ -433,13 +461,14 @@ async fn sandbox_creation_and_atomic_clean_preserve_the_environment() -> TestRes
         .respond_with(ResponseTemplate::new(200).set_body_json(snapshot(Uuid::new_v4())))
         .mount(&iam)
         .await;
+    let iam_environment_id = Uuid::new_v4();
     let (status, created) = call(
         &app,
         "POST",
         "/api/v1/testing-environments",
         Some("oat_fixture"),
         json!({
-            "name":"local-sandbox", "iam_environment_id":Uuid::new_v4(),
+            "name":"local-sandbox", "iam_environment_id":iam_environment_id,
             "iam_environment_key":"I".repeat(32), "app_secret":"test-environment-app-secret", "briefcase_environment_key":"B".repeat(32)
         }),
     )
@@ -447,6 +476,29 @@ async fn sandbox_creation_and_atomic_clean_preserve_the_environment() -> TestRes
     assert_eq!(status, StatusCode::OK);
     let key = created["key"].as_str().ok_or("environment key missing")?;
     assert_eq!(key.len(), 32);
+    for (root, expected) in [
+        (key.to_owned(), StatusCode::OK),
+        ("A".repeat(32), StatusCode::UNAUTHORIZED),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/iam")
+                    .header("x-testing-environment-key", &root)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::OK {
+            let value: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
+            assert_eq!(
+                value,
+                json!({"app_id":"tos>waveform", "iam_base_url":format!("{}/", iam.uri()), "testing_environment_id":iam_environment_id})
+            );
+        }
+    }
     let id: Uuid = created["id"]
         .as_str()
         .ok_or("environment id missing")?

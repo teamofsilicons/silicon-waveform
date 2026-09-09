@@ -139,6 +139,26 @@ paths:
         '429': { $ref: '#/components/responses/TooManyRequests' }
         default: { $ref: '#/components/responses/Error' }
 
+  /iam:
+    get:
+      tags: [Authentication]
+      operationId: getIamInfo
+      summary: Discover public IAM application metadata
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      responses:
+        '200':
+          description: Public configuration for the selected environment, without secrets
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IamInfo' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
   /auth/login:
     post:
       tags: [Authentication]
@@ -929,6 +949,17 @@ components:
         principal_id: { type: string, format: uuid }
         type: { type: string }
         public_id: { type: string }
+    IamInfo:
+      type: object
+      additionalProperties: false
+      required: [app_id, iam_base_url, testing_environment_id]
+      properties:
+        app_id: { type: string }
+        iam_base_url: { type: string, format: uri }
+        testing_environment_id:
+          type: [string, 'null']
+          format: uuid
+          description: Upstream IAM test environment UUID, or null for production.
     ApplicationAuthorization:
       type: object
       required: [principal_id, actor_type, public_id, organization_id, org_id, membership_id, membership_version, authorization_epoch, audience, scopes]

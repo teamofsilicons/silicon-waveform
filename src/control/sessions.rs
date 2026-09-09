@@ -38,6 +38,28 @@ fn validate_token(token: &str, prefix: &str) -> Result<(), ControlError> {
     Ok(())
 }
 
+pub(super) async fn iam(
+    State(state): State<Arc<ControlState>>,
+    headers: HeaderMap,
+) -> Result<Response, ControlError> {
+    // Discovery is public, but an explicit sandbox must still be valid.
+    let testing_environment_id =
+        if super::single_header(&headers, "x-testing-environment-key")?.is_some() {
+            state.plane(&headers).await?.iam_environment_id
+        } else {
+            None
+        };
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "app_id": state.app_id,
+            "iam_base_url": state.iam.base_url(),
+            "testing_environment_id": testing_environment_id,
+        })),
+    )
+        .into_response())
+}
+
 pub(super) async fn login(
     State(state): State<Arc<ControlState>>,
     headers: HeaderMap,

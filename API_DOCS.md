@@ -33,6 +33,15 @@ IAM and Briefcase SDKs. STT delegated source reads and replay access checks use
 Briefcase 0.2.0. Local protocol tests use mocked upstreams; deployed paired
 environment verification remains outstanding.
 
+## IAM discovery
+
+Public IAM discovery is available at `GET /iam`. It returns `app_id`,
+`iam_base_url`, and `testing_environment_id` (the selected upstream IAM test UUID,
+or null for production) with `Cache-Control: no-store`. No login is required;
+any supplied `X-Testing-Environment-Key` must select a valid Waveform sandbox.
+Application secrets and environment keys are never returned. The Rust client
+exposes `iam()` and the CLI exposes `waveform iam --json`.
+
 ## Text to speech
 
 ### `POST /tts`

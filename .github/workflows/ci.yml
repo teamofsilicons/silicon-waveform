@@ -43,6 +43,14 @@ jobs:
         run: cargo test --all-targets --all-features
       - name: Run PostgreSQL transaction tests
         run: cargo test --test postgres_idempotency -- --ignored --test-threads=1
+      - name: Check Rust client and CLI
+        run: |
+          cargo fmt --manifest-path client/Cargo.toml -- --check
+          cargo fmt --manifest-path cli/Cargo.toml -- --check
+          cargo clippy --manifest-path client/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path cli/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path client/Cargo.toml
+          cargo test --manifest-path cli/Cargo.toml
       - name: Enforce dependency policy
         uses: EmbarkStudios/cargo-deny-action@v2
 

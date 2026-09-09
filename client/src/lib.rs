@@ -32,6 +32,41 @@ pub enum Error {
 /// Result alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Public IAM configuration for the selected Waveform server and environment.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IamInfo {
+    /// Application ID to use when obtaining a short-lived IAM token.
+    pub app_id: String,
+    /// IAM API base URL configured by the Waveform server.
+    pub iam_base_url: String,
+    /// Upstream IAM test environment ID, or null for production.
+    pub testing_environment_id: Option<String>,
+}
+
+/// Verified identity of the carbon or silicon using Waveform.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LoginActor {
+    /// IAM principal UUID.
+    pub principal_id: String,
+    /// Carbon or silicon identity type.
+    pub actor_type: silicon_iam_client::models::ApplicationAuthorizationActorType,
+    /// Public carbon or silicon identifier.
+    pub public_id: String,
+}
+
+/// Current authentication status, without access or refresh tokens.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LoginStatus {
+    /// True only after the server verifies the selected bearer token.
+    pub authenticated: bool,
+    /// Verified identity, absent when unauthenticated.
+    pub actor: Option<LoginActor>,
+    /// Organization selected by IAM, absent when unauthenticated.
+    pub org_id: Option<String>,
+    /// Upstream IAM test environment ID, or null for production.
+    pub testing_environment_id: Option<String>,
+}
+
 /// Full, versioned mapping resolved once per synthesis attempt.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -548,6 +583,41 @@ impl Client {
     pub async fn me(&self) -> Result<serde_json::Value> {
         self.request(Method::GET, "auth/me", None::<&()>, None)
             .await
+    }
+
+    /// Reads public IAM metadata without requiring a login.
+    pub async fn iam(&self) -> Result<IamInfo> {
+        self.request(Method::GET, "iam", None::<&()>, None).await
+    }
+
+    /// Verifies the bearer token online and returns its carbon or silicon identity.
+    /// Anonymous clients return unauthenticated without a request. Rejected tokens
+    /// (401/403) return unauthenticated; transport, server and decoding failures
+    /// remain errors. This method never refreshes or persists session tokens.
+    pub async fn login_status(&self) -> Result<LoginStatus> {
+        if matches!(self.credential, Auth::Anonymous) {
+            return Ok(LoginStatus::default());
+        }
+        let authority: silicon_iam_client::models::ApplicationAuthorization = match self
+            .request(Method::GET, "auth/me", None::<&()>, None)
+            .await
+        {
+            Ok(authority) => authority,
+            Err(Error::Api {
+                status: 401 | 403, ..
+            }) => return Ok(LoginStatus::default()),
+            Err(error) => return Err(error),
+        };
+        Ok(LoginStatus {
+            authenticated: true,
+            actor: Some(LoginActor {
+                principal_id: authority.principal_id.to_string(),
+                actor_type: authority.actor_type,
+                public_id: authority.public_id,
+            }),
+            org_id: Some(authority.org_id),
+            testing_environment_id: authority.testing_environment_id.map(|id| id.to_string()),
+        })
     }
 
     /// Reads stable service capabilities without authentication.

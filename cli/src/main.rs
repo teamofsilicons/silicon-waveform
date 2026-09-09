@@ -16,13 +16,19 @@ use std::{
 #[command(
     name = "waveform",
     version,
-    about = "Synchronous Silicon Waveform speech client"
+    about = "Synchronous Silicon Waveform speech client",
+    after_long_help = include_str!("../README.md")
 )]
 struct Args {
     /// Execute against a test environment root key or UUID. UUIDs are resolved through IAM.
     #[arg(long, value_name = "ROOT_KEY_OR_ID", global = true)]
     test: Option<String>,
-    #[arg(long, env = "WAVEFORM_URL", default_value = "http://127.0.0.1:8080")]
+    /// Waveform backend origin; defaults to the production service.
+    #[arg(
+        long,
+        env = "WAVEFORM_URL",
+        default_value = "https://backend.waveform.teamofsilicons.com"
+    )]
     url: String,
     #[arg(long, global = true)]
     json: bool,
@@ -34,8 +40,13 @@ struct Args {
 }
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Exchange one short-lived IAm token.
+    /// Show public IAM application metadata, including the app_id used to obtain an SLT.
+    Iam,
+    /// Exchange one short-lived IAm token, or inspect the current login with `login status`.
+    #[command(args_conflicts_with_subcommands = true)]
     Login {
+        #[command(subcommand)]
+        command: Option<LoginCommand>,
         /// Optional SLT. When omitted, read it without echoing in an interactive terminal.
         #[arg(value_name = "SLT")]
         slt: Option<String>,
@@ -174,6 +185,12 @@ enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+enum LoginCommand {
+    /// Verify the saved session online and show its carbon or silicon identity.
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
 enum ConfigCommand {
     /// Enable or disable hourly checks after commands complete.
     AutoUpdate {
@@ -252,7 +269,8 @@ enum TestEnvironmentCommand {
     },
 }
 fn default_home_dir() -> PathBuf {
-    std::env::var_os("HOME")
+    std::env::var_os("SILICON_HOME")
+        .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
 }
@@ -555,7 +573,40 @@ async fn run(args: Args) -> Result<(), String> {
         client = client.with_test_environment(root_key);
     }
     match args.command {
-        Command::Login { slt, slt_flag } => {
+        Command::Iam => print_json(&client.iam().await.map_err(|e| e.to_string())?)?,
+        Command::Login {
+            command: Some(LoginCommand::Status),
+            ..
+        } => {
+            let selected = match read_session(&session_file) {
+                Some(session) => client.with_bearer(session.access_token),
+                None => client,
+            };
+            let status = selected.login_status().await.map_err(|e| e.to_string())?;
+            if args.json {
+                print_json(&status)?;
+            } else if let Some(actor) = status.actor {
+                println!(
+                    "Authenticated as {} {} (principal {}), organization {}",
+                    serde_json::to_value(actor.actor_type)
+                        .map_err(|e| e.to_string())?
+                        .as_str()
+                        .ok_or("invalid actor type")?,
+                    actor.public_id,
+                    actor.principal_id,
+                    status.org_id.as_deref().unwrap_or("unknown")
+                );
+            } else {
+                println!(
+                    "Not authenticated; run waveform login with the same --url and --test options."
+                );
+            }
+        }
+        Command::Login {
+            slt,
+            slt_flag,
+            command: None,
+        } => {
             let tokens = client
                 .login(&read_slt(slt.or(slt_flag))?)
                 .await
