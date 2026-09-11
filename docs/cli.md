@@ -26,7 +26,10 @@ It rejects missing paths and files with `not a directory`; the selected
 directory is created only when a later command needs to write session or test
 environment state.
 
-Use `--test <32-character-root-key>` on any command to select a sandbox. A
+Use `--test <32-character-root-key>` on any command to select a sandbox, or set
+`WAVEFORM_TEST` as the default for all commands. An explicit `--test` overrides
+the environment value. The value is hidden from CLI help. Unset `WAVEFORM_TEST`
+for production control-plane commands. A
 Waveform test-environment UUID is also accepted; the CLI resolves it through
 the authenticated production management API, using `--org <id>` on the
 subcommand (or `--organization`/`WAVEFORM_ORG`), then sends only the root key
