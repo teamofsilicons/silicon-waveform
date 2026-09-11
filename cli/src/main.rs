@@ -15,13 +15,20 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(
     name = "waveform",
+    bin_name = "waveform",
     version,
     about = "Synchronous Silicon Waveform speech client",
     after_long_help = include_str!("../README.md")
 )]
 struct Args {
     /// Execute against a test environment root key or UUID. UUIDs are resolved through IAM.
-    #[arg(long, value_name = "ROOT_KEY_OR_ID", global = true)]
+    #[arg(
+        long,
+        value_name = "ROOT_KEY_OR_ID",
+        global = true,
+        env = "WAVEFORM_TEST",
+        hide_env_values = true
+    )]
     test: Option<String>,
     /// Waveform backend origin; defaults to the production service.
     #[arg(

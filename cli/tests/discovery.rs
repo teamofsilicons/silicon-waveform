@@ -23,6 +23,7 @@ impl Home {
         command
             .env("SILICON_HOME", &self.0)
             .env("WAVEFORM_AUTO_UPDATE", "false")
+            .env_remove("WAVEFORM_TEST")
             .args(["--url", url])
             .args(args);
         tokio::task::spawn_blocking(move || command.output().unwrap())
@@ -251,4 +252,40 @@ fn missing_silicon_home_uses_the_os_home() {
         .unwrap();
     output_json(result);
     assert!(home.0.join(".waveform/dir/auto-update.json").is_file());
+}
+
+#[tokio::test]
+async fn environment_selects_test_requests_and_explicit_flag_overrides_it() {
+    let home = Home::new();
+    let server = MockServer::start().await;
+    let env_key = "abcdefghijklmnopqrstuvwxyz123456";
+    let explicit_key = "123456abcdefghijklmnopqrstuvwxyz";
+    for explicit in [false, true] {
+        Mock::given(method("GET")).and(path("/api/v1/iam"))
+            .and(header("x-testing-environment-key", if explicit { explicit_key } else { env_key }))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "app_id":"tos>waveform", "iam_base_url":"https://iam.example/", "testing_environment_id":null
+            }))).expect(1).mount(&server).await;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_waveform"));
+        command
+            .env("SILICON_HOME", &home.0)
+            .env("WAVEFORM_AUTO_UPDATE", "false")
+            .env("WAVEFORM_TEST", env_key)
+            .args(["--url", &server.uri()]);
+        if explicit {
+            command.args(["--test", explicit_key]);
+        }
+        command.args(["iam", "--json"]);
+        let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(output_json(output)["app_id"], "tos>waveform");
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_waveform"))
+        .env("WAVEFORM_TEST", env_key)
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(env_key));
 }
