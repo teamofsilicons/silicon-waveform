@@ -4,6 +4,7 @@ mod accounts;
 mod environments;
 mod jobs;
 mod sessions;
+mod source_target;
 #[cfg(test)]
 mod tests;
 mod vault;
@@ -40,6 +41,7 @@ pub struct ControlState {
     app_id: String,
     briefcase_settings: crate::config::BriefcaseSettings,
     iam_timeout: std::time::Duration,
+    source_stt_action: String,
     vault: Option<Vault>,
     verifier: Option<WebhookVerifier>,
 }
@@ -82,6 +84,7 @@ impl ControlState {
             app_id: settings.iam.app_id.clone(),
             briefcase_settings: settings.briefcase.clone(),
             iam_timeout: settings.iam.timeout,
+            source_stt_action: settings.iam.stt_action.clone(),
             vault,
             verifier,
         })
@@ -343,6 +346,7 @@ pub fn router(state: Arc<ControlState>) -> Router {
         .route("/api/v1/auth/refresh", post(sessions::refresh))
         .route("/api/v1/auth/logout", post(sessions::logout))
         .route("/api/v1/auth/me", get(sessions::me))
+        .route("/api/v1/stt/source-target", post(source_target::prepare))
         .route("/api/v1/jobs", get(jobs::list))
         .route("/api/v1/jobs/{job_id}", get(jobs::get))
         .route("/api/v1/testing-environments", post(environments::create))

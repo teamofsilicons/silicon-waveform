@@ -72,6 +72,56 @@ paths:
         '504': { $ref: '#/components/responses/GatewayTimeout' }
         default: { $ref: '#/components/responses/Error' }
 
+  /stt/source-target:
+    post:
+      security:
+        - bearerAuth: []
+      tags: [Speech]
+      operationId: prepareTranscriptionSourceTarget
+      summary: Resolve the current actor's private Waveform source folder
+      description: |
+        Requires current selected-organization STT and self.identity.read scopes.
+        Uses fresh, exact Briefcase entries.list proofs to materialize and verify
+        the caller's own reserved apps/<waveform-app>/private/<public-id> folder.
+        Returns no credentials and invokes no speech provider. Repeating the
+        request reauthorizes and verifies the same native folder; no authority
+        or successful response is cached. Upload a same-actor copy through the
+        normal Briefcase uploads endpoint, then transcribe the copied permanent
+        URL. The original file and Briefcase's application namespace fence remain.
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: Verified current actor's private folder, not an upload or transcription receipt
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [org_id, app_id, actor_id, folder_id, folder_path, testing_environment_id]
+                properties:
+                  org_id: { type: string }
+                  app_id: { type: string }
+                  actor_id: { type: string, description: Current IAM public actor identifier }
+                  folder_id: { type: string, format: uuid }
+                  folder_path: { type: string }
+                  testing_environment_id: { type: [string, 'null'], format: uuid }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/SourceNotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/Error' }
   /stt:
     post:
       security:
@@ -81,6 +131,8 @@ paths:
       operationId: transcribeSpeech
       summary: Transcribe an authorized Briefcase file
       description: |
+        The source must be within the originating Waveform application namespace.
+        Use /stt/source-target to prepare an owner-authorized copy when necessary.
         Re-authorizes the permanent Briefcase reference as the represented
         actor, then attempts Gemini 3.5 Transcribe, OpenAI gpt-transcribe, and
         Deepgram Nova-3 Multilingual. Waveform never fetches the supplied URL

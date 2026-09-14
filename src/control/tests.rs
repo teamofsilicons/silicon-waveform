@@ -67,6 +67,7 @@ fn fixture(
             max_download_bytes: 1_000_000,
         },
         iam_timeout: std::time::Duration::from_secs(5),
+        source_stt_action: "waveform.stt".to_owned(),
         vault: Some(Vault::new(&SecretString::from("19".repeat(32)))?),
         verifier: Some(WebhookVerifier::new(WebhookSecretKeyring::new(
             1,
@@ -963,3 +964,6 @@ async fn unscoped_identity_uses_iam_workspace_and_rejects_wrong_audience() -> Te
     pool.close().await;
     Ok(())
 }
+
+#[path = "source_target_tests.rs"]
+mod source_target_tests;

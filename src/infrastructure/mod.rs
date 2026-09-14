@@ -9,4 +9,4 @@ pub mod providers;
 pub mod runtime;
 pub mod testing;
 
-mod briefcase_reader;
+pub(crate) mod briefcase_reader;
