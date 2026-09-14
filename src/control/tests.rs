@@ -1139,7 +1139,7 @@ async fn discovered_identity_reports_permissions_and_webhooks_are_isolated() -> 
             &secret,
             "/api/v1/auth/login",
             json!({"slt":"test-carbon"}),
-            "login"
+            "discovered-identity-login"
         )
         .await?
         .0,
@@ -1151,7 +1151,7 @@ async fn discovered_identity_reports_permissions_and_webhooks_are_isolated() -> 
             &secret,
             "/api/v1/auth/login",
             json!({"slt":"inactive"}),
-            "login"
+            "inactive-identity-login"
         )
         .await?
         .0
