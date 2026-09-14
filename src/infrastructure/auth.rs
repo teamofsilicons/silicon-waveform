@@ -328,8 +328,11 @@ async fn delegate_storage(
         .endpoints(audience)
         .await
         .map_err(|_| IamError::Unavailable)?;
+    // The catalog owner identifies the recipient application, not the member's
+    // storage organization. IAM authorizes the selected data org in the exchange.
+    let recipient_owner = audience.split_once('>').map(|(owner, _)| owner);
     if catalog.application.app_id != audience
-        || catalog.application.org_id != request.authorization.organization_id.as_str()
+        || recipient_owner != Some(catalog.application.org_id.as_str())
     {
         return Err(IamError::OrganizationMismatch);
     }
@@ -705,14 +708,14 @@ mod tests {
                 "endpoints":[{"critical":false,"endpoint_id":"briefcase.files.create","path":"/api/v1/obo/files","metadata":{"path":{"type":"string"},"name":{"type":"string"},"content_type":{"type":"string"}}}]
             }))).expect(1).mount(&server).await;
         Mock::given(method("POST")).and(path("/api/v1/obo-access/exchanges"))
-            .and(body_partial_json(json!({"subject_token":"oat_request_subject", "audience":"acme>storage", "endpoint_id":"briefcase.files.create", "request":{"method":"POST","body_sha256":digest}, "metadata":{"name":filename.as_str(),"path":"","content_type":"audio/mpeg"}})))
+            .and(body_partial_json(json!({"org_id":"client-workspace", "subject_token":"oat_request_subject", "audience":"acme>storage", "endpoint_id":"briefcase.files.create", "request":{"method":"POST","body_sha256":digest}, "metadata":{"name":filename.as_str(),"path":"","content_type":"audio/mpeg"}})))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({"access_proof":"obo_exact_upload","proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"})))
             .expect(1).mount(&server).await;
         let proof = adapter
             .delegate(DelegationRequest {
                 authorization: AuthorizedActor {
                     actor: Actor::new(ActorKind::Carbon, ActorId::new(Uuid::new_v4())?),
-                    organization_id: organization()?,
+                    organization_id: "client-workspace".parse()?,
                     originating_application: None,
                     expires_at: None,
                 },
@@ -739,6 +742,76 @@ mod tests {
             .find(|r| r.url.path().ends_with("exchanges"))
             .ok_or("missing exchange")?;
         assert!(exchange.headers.contains_key("x-obo-signature"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delegated_reads_reject_wrong_catalog_and_exact_request_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::domain::{
+            auth::{AuthorizedActor, DelegatedManifestBinding},
+            identity::{Actor, ActorId, ActorKind},
+        };
+        for (catalog_app, catalog_owner, catalog_path, expected) in [
+            (
+                "other>storage",
+                "other",
+                "/api/v1/obo/entries/list",
+                IamError::OrganizationMismatch,
+            ),
+            (
+                "acme>storage",
+                "other",
+                "/api/v1/obo/entries/list",
+                IamError::OrganizationMismatch,
+            ),
+            (
+                "acme>storage",
+                "acme",
+                "/api/v1/obo/files/read",
+                IamError::ContractUnavailable,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let mut config = settings(&server)?;
+            config.app_id = "acme>waveform".to_owned();
+            config.audience = config.app_id.clone();
+            let adapter = IamHttpAdapter::new(&config)?.with_storage_audience("acme>storage");
+            Mock::given(method("GET"))
+                .and(path("/api/v1/obo-access/applications/acme%3Estorage/endpoints"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "application":{"app_id":catalog_app,"org_id":catalog_owner},
+                    "endpoints":[{"critical":false,"endpoint_id":"briefcase.entries.list","path":catalog_path,"metadata":{}}]
+                }))).expect(1).mount(&server).await;
+            let result = adapter
+                .delegate(DelegationRequest {
+                    authorization: AuthorizedActor {
+                        actor: Actor::new(ActorKind::Carbon, ActorId::new(Uuid::new_v4())?),
+                        organization_id: "client-workspace".parse()?,
+                        originating_application: None,
+                        expires_at: None,
+                    },
+                    purpose: DelegationPurpose::ReadBriefcaseFile,
+                    request_id: request_id()?,
+                    subject_token: Some(AccessToken::new("oat_request_subject".to_owned())?),
+                    manifest: Some(DelegatedManifestBinding {
+                        endpoint_id: "briefcase.entries.list".to_owned(),
+                        path: "/api/v1/obo/entries/list".to_owned(),
+                        body_sha256: silicon_iam_client::api::obo::body_sha256(b"{}"),
+                    }),
+                    upload: None,
+                })
+                .await;
+            assert_eq!(result.err(), Some(expected));
+            assert_eq!(
+                server
+                    .received_requests()
+                    .await
+                    .ok_or("requests missing")?
+                    .len(),
+                1
+            );
+        }
         Ok(())
     }
     #[tokio::test]

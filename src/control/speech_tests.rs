@@ -480,9 +480,15 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
     assert_eq!(status, StatusCode::OK, "{created}");
     let root = created["key"].as_str().ok_or("missing root")?;
     actor_snapshot["authorization"]["testing_environment_id"] = json!(iam_plane);
+    actor_snapshot["authorization"]["org_id"] = json!("client-workspace");
+    let selected_snapshot = Arc::new(Mutex::new(actor_snapshot.clone()));
+    let live_snapshot = selected_snapshot.clone();
     Mock::given(path("/api/v1/oauth/introspect"))
         .and(header("x-testing-environment-key", "I".repeat(32)))
-        .respond_with(ResponseTemplate::new(200).set_body_json(actor_snapshot))
+        .respond_with(move |_: &wiremock::Request| {
+            ResponseTemplate::new(200)
+                .set_body_json(live_snapshot.lock().expect("IAM snapshot").clone())
+        })
         .with_priority(1)
         .mount(&iam)
         .await;
@@ -501,6 +507,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
         .respond_with(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).expect("exchange JSON");
             assert_eq!(body["subject_token"], "oat_fixture");
+            assert_eq!(body["org_id"], "client-workspace");
             assert_eq!(body["metadata"], json!({}));
             assert_eq!(body["request"]["method"], "POST");
             assert_eq!(body["audience"], "tos>briefcase");
@@ -512,18 +519,21 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             ));
             ResponseTemplate::new(201).set_body_json(json!({"testing_context":{"app_id":"tos>briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)},"access_proof":proof,"proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
         }).mount(&iam).await;
-    let operations: Vec<_> = briefcase_client::OPERATIONS
-        .iter()
-        .map(|o| json!({"id":o.id,"version":o.version,"method":o.method,"path":o.path}))
-        .collect();
     Mock::given(path("/api/version"))
-        .and(header("x-briefcase-app-secret", format!("ask_{}","B".repeat(43))))
-        .respond_with(ResponseTemplate::new(200).insert_header("briefcase-api-version", "v1")
-            .set_body_json(json!({"service":"silicon-briefcase","selected_api_version":"v1","supported_api_versions":["v1"],"contract_version":"1.0.0","build":"local-test","operations":operations})))
-        .mount(&storage).await;
+        .and(header(
+            "x-briefcase-app-secret",
+            format!("ask_{}", "B".repeat(43)),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("briefcase-api-version", "v1")
+                .set_body_string(include_str!("../../tests/fixtures/briefcase-v1.1.0.json")),
+        )
+        .mount(&storage)
+        .await;
     let entry_id = Uuid::new_v4();
-    let source_url = "https://briefcase.example.test/org/tos/private/actor/source.wav";
-    let entry = json!({"id":entry_id,"org_id":"tos","type":"file","visibility":"full","name":"source.wav","path":"private/actor/source.wav","root_type":"private","content_type":"audio/wav","size":16044,"permanent_url":source_url,"effective_access":["read"],"created_at":null,"updated_at":null,"deleted_at":null});
+    let source_url = "https://briefcase.example.test/org/client-workspace/private/actor/source.wav";
+    let entry = json!({"id":entry_id,"org_id":"client-workspace","type":"file","visibility":"full","name":"source.wav","path":"private/actor/source.wav","root_type":"private","content_type":"audio/wav","size":16044,"permanent_url":source_url,"effective_access":["read"],"created_at":null,"updated_at":null,"deleted_at":null});
     let listing = ledger.clone();
     Mock::given(method("POST"))
         .and(path("/api/v1/obo/entries/list"))
@@ -594,7 +604,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             .uri("/api/v1/stt")
             .header("content-type", "application/json")
             .header("authorization", "Bearer oat_fixture")
-            .header("x-org-id", "tos")
+            .header("x-org-id", "client-workspace")
             .header("x-testing-environment-key", root)
             .header("idempotency-key", request_key)
             .body(Body::from(json!({"file_url":source_url}).to_string()))
@@ -620,7 +630,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
         .and(header("x-testing-environment-key", "I".repeat(32)))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token":"oat_fixture","refresh_token":"ort_fixture","token_type":"Bearer","expires_in":1800,
-            "scope":"roles.read memberships.read","actor":{"principal_id":actor,"type":kind,"public_id":"12345678"},"org_id":"tos"
+            "scope":"roles.read memberships.read","actor":{"principal_id":actor,"type":kind,"public_id":"12345678"},"org_id":"client-workspace"
         }))).expect(1).mount(&iam).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -637,7 +647,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             root,
             "preferences",
             "--org",
-            "tos",
+            "client-workspace",
             "--actor",
             &actor_text,
         ],
@@ -646,7 +656,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             root,
             "provider-key-set",
             "--org",
-            "tos",
+            "client-workspace",
             "--actor",
             &actor_text,
             "gemini",
@@ -657,7 +667,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             root,
             "provider-keys",
             "--org",
-            "tos",
+            "client-workspace",
             "--actor",
             &actor_text,
         ],
@@ -666,7 +676,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             root,
             "provider-key-delete",
             "--org",
-            "tos",
+            "client-workspace",
             "--actor",
             &actor_text,
             "gemini",
@@ -677,7 +687,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             "stt",
             source_url,
             "--org",
-            "tos",
+            "client-workspace",
             "--actor",
             &actor_text,
             "--idempotency",
@@ -688,7 +698,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             root,
             "jobs",
             "--org",
-            "tos",
+            "client-workspace",
             "--actor",
             &actor_text,
             "--job-id",
@@ -772,6 +782,41 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             ]
         );
     }
+    // A matching app owner never substitutes for fresh actor/org/world authority.
+    let storage_count = storage
+        .received_requests()
+        .await
+        .ok_or("storage requests missing")?
+        .len();
+    for (field, value) in [
+        ("testing_environment_id", json!(Uuid::new_v4())),
+        ("org_id", json!("other-workspace")),
+        ("audience", json!("tos>other-app")),
+        ("actor_type", Value::Null),
+    ] {
+        let mut invalid = actor_snapshot.clone();
+        invalid["authorization"][field] = value;
+        *selected_snapshot.lock().expect("IAM snapshot") = invalid;
+        let response = app
+            .clone()
+            .oneshot(send(&Uuid::new_v4().to_string())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{field}");
+    }
+    *selected_snapshot.lock().expect("IAM snapshot") = json!({"active":false});
+    let response = app
+        .clone()
+        .oneshot(send(&Uuid::new_v4().to_string())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        storage
+            .received_requests()
+            .await
+            .ok_or("storage requests missing")?
+            .len(),
+        storage_count
+    );
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&pool)
         .await?;

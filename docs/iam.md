@@ -22,7 +22,7 @@ but generates a new key per request and cannot recover a prior request's receipt
 
 The backend, Rust client and CLI use `silicon-iam-client` 1.8.0. Production
 introspection, test-plane authorization, login, webhooks and storage proof
-exchanges use the official SDK. Storage uses `briefcase-client` 1.0.3.
+exchanges use the official SDK. Storage uses `briefcase-client` 1.1.0.
 For bearer speech, Waveform mints a separate proof for every delegated listing
 page, file read and upload. Proofs bind the SDK's exact request bytes and are
 never persisted in jobs or idempotency responses. See `testing.md` for the
