@@ -289,6 +289,34 @@ impl IamPort for TestStorageDelegator {
     }
 }
 
+/// Delegates storage for an identity already verified by the source-target route.
+/// The selected SDK client retains its production or testing plane credentials.
+pub(crate) struct SourceStorageDelegator {
+    pub(crate) sdk: silicon_iam_client::Client,
+    pub(crate) application_id: ApplicationId,
+    pub(crate) audience: String,
+    pub(crate) testing: bool,
+}
+
+#[async_trait]
+impl IamPort for SourceStorageDelegator {
+    async fn authorize(&self, _request: AuthorizationRequest) -> Result<AuthorizedActor, IamError> {
+        Err(IamError::InvalidCredential)
+    }
+
+    async fn delegate(
+        &self,
+        request: DelegationRequest,
+    ) -> Result<DelegatedAuthorization, IamError> {
+        let delegated =
+            delegate_storage(&self.sdk, &self.application_id, &self.audience, request).await?;
+        if delegated.testing_secret.is_some() != self.testing {
+            return Err(IamError::InvalidResponse);
+        }
+        Ok(delegated)
+    }
+}
+
 async fn delegate_storage(
     sdk: &silicon_iam_client::Client,
     application_id: &ApplicationId,

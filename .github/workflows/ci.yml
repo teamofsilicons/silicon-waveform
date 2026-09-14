@@ -47,6 +47,7 @@ jobs:
           cargo test --test postgres_idempotency -- --ignored --test-threads=1
           cargo test --lib control::tests::session_retries_preserve_the_iam_receipt_in_both_planes -- --ignored
           cargo test --lib control::tests::speech_tests -- --ignored --test-threads=1
+          cargo test --lib control::tests::source_target_tests -- --ignored --test-threads=1
       - name: Check Rust client and CLI
         run: |
           cargo fmt --manifest-path client/Cargo.toml -- --check

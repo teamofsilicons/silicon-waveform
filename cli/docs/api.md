@@ -63,3 +63,27 @@ Voice profiles: `GET /voice-profiles` lists mappings; `PATCH /preferences` with
 `POST /reports` accepts `{message,pr?,client_version?}` with a bearer and `Idempotency-Key`. It returns 202 with the report ID and `notification` (`queued`, `sent`, or `simulated`). Retry identical content with the same key; changed content returns 409. The limit is ten reports per actor per hour. Sandbox delivery is always simulated.
 
 `PATCH /preferences` accepts `telemetry_enabled: false` for account opt-out. `GET /preferences` reports the effective boolean, which defaults to true. Backend diagnostics honor it; the CLI also has a local opt-out.
+## Preparing an uploaded transcription source
+
+`POST /stt/source-target` with `{}` accepts a bearer, selected `X-Org-ID`,
+`Idempotency-Key`, and the same optional test selector as speech. It requires
+current STT and `self.identity.read` scope, and IAM must approve the exact
+Briefcase `briefcase.entries.list` delegation. It invokes no speech provider.
+The response is `{org_id, app_id, actor_id, folder_id, folder_path,
+testing_environment_id}`; `actor_id` is the IAM public identifier and the
+world is null in production. Only an actual, writable, private folder owned by
+that actor inside Waveform's configured app namespace is returned.
+
+Briefcase intentionally hides files outside `apps/<originating-app>/…` from
+OBO callers, even when the represented actor owns the original. For a normal
+private upload, first read the original using that actor's ordinary Briefcase
+session, prepare the target, and copy the bounded bytes with normal Briefcase
+`POST /uploads` using `parent_id`. Preserve the original and transcribe the
+copy's returned permanent URL. Verify all returned actor, organization, world,
+folder and file identities. Use stable copy name/idempotency key/body across
+uncertain responses and recheck the original access on retries. This endpoint
+neither broadens the namespace fence nor grants another actor access.
+
+This is an additive v1 operation; existing speech schemas and published client
+operations remain unchanged. The authoritative operation catalog is OpenAPI;
+there is no separate Waveform operation-version negotiation endpoint.
