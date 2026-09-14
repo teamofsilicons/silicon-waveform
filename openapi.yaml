@@ -26,6 +26,57 @@ tags:
   - name: Webhooks
 
 paths:
+  /api/v1/telemetry:
+    post:
+      operationId: recordBrowserEvent
+      summary: Record an authenticated browser diagnostic
+      description: Test events and opted-out account events are discarded. No credentials or user content are accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [event]
+              properties:
+                event: { type: string, enum: [speech_completed, speech_failed, settings_saved, page_view] }
+                elapsed_ms: { type: integer, minimum: 0, maximum: 86400000, default: 0 }
+      responses:
+        '204': { description: Event handled }
+  /api/v1/reports:
+    post:
+      operationId: submitBugReport
+      summary: Submit a bug report with optional pull request
+      description: Authenticated, idempotent, ten reports per actor per hour. Testing simulates delivery.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              additionalProperties: false
+              properties:
+                message: { type: string, minLength: 1, maxLength: 60000 }
+                pr: { type: [string, 'null'], format: uri }
+                client_version: { type: string, maxLength: 100 }
+      responses:
+        '202':
+          description: Persisted report with queued, sent, or simulated notification status
+        '400': { description: Invalid report or credential content }
+        '401': { description: Missing or invalid authentication }
+        '409': { description: Idempotency key reused with different content }
+        '429': { description: Hourly report limit exceeded }
+        '503': { description: Postmark not configured }
+
   /tts:
     post:
       security:
@@ -671,8 +722,8 @@ components:
       name: X-Testing-Environment-Key
       in: header
       required: false
-      description: Explicit Waveform root key selecting an isolated test plane.
-      schema: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
+      description: IAM test app_secret selecting the Waveform sandbox. Validated live; no paired Briefcase key needed. Legacy root selectors remain accepted.
+      schema: { type: string, pattern: '^(ask_[A-Za-z0-9_-]{43}|[A-Za-z0-9]{32})$' }
     JobId:
       name: job_id
       in: path
@@ -918,7 +969,7 @@ components:
       additionalProperties: false
       required: [slt]
       properties:
-        slt: { type: string, minLength: 5, maxLength: 16384, pattern: '^oac_[!-~]+$' }
+        slt: { type: string, minLength: 1, maxLength: 16384, description: 'Production requires an IAM SLT. A selected sandbox also accepts an existing active identity public ID.' }
     RefreshRequest:
       type: object
       additionalProperties: false
@@ -1004,6 +1055,7 @@ components:
       type: object
       required: [tts_order, stt_order, voice_profile, defaults]
       properties:
+        telemetry_enabled: { type: boolean, default: true }
         voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
         tts_order: { type: array, items: { type: string, enum: [gemini, elevenlabs, openai] } }
         stt_order: { type: array, items: { type: string, enum: [gemini, openai, deepgram] } }
@@ -1018,6 +1070,7 @@ components:
       type: object
       additionalProperties: false
       properties:
+        telemetry_enabled: { type: boolean, default: true }
         voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
         tts_order: { type: [array, 'null'], items: { type: string, enum: [gemini, elevenlabs, openai] } }
         stt_order: { type: [array, 'null'], items: { type: string, enum: [gemini, openai, deepgram] } }
@@ -1044,7 +1097,7 @@ components:
         iam_environment_id: { type: string, format: uuid }
         iam_environment_key: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
         app_secret: { type: string, minLength: 1, maxLength: 512 }
-        briefcase_environment_key: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
+        briefcase_environment_key: { type: string, minLength: 47, maxLength: 47, pattern: '^ask_[A-Za-z0-9_-]{43}$' }
     CreatedTestingEnvironment:
       allOf:
         - $ref: '#/components/schemas/TestingEnvironment'

@@ -75,7 +75,17 @@ impl BriefcaseSdkUploader {
             .with_auto_update(false)
             .with_request_timeout(self.settings.timeout)
             .with_transfer_timeout(self.settings.download_timeout);
-        if let Some(environment) = request.environment {
+        let environment = request
+            .delegated_authorization
+            .testing_secret
+            .as_ref()
+            .map(|secret| {
+                EnvironmentKey::new(secrecy::ExposeSecret::expose_secret(secret))
+                    .map_err(|_| UploadError::Configuration)
+            })
+            .transpose()?
+            .or(request.environment);
+        if let Some(environment) = environment {
             config = config.with_environment(environment);
         }
         // Check published API compatibility before presenting the proof.
@@ -134,6 +144,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let storage = MockServer::start().await;
         let delegated = crate::domain::auth::DelegatedAuthorization {
+            testing_secret: None,
             application_id: "tos>waveform".parse()?,
             proof: crate::domain::auth::OboProof::new("obo_test_proof".to_owned())?,
             purpose: crate::domain::auth::DelegationPurpose::StoreGeneratedAudio,

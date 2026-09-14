@@ -1126,6 +1126,7 @@ mod tests {
         ) -> Result<DelegatedAuthorization, IamError> {
             lock(&self.delegated_request_ids).push(request.request_id);
             Ok(DelegatedAuthorization {
+                testing_secret: None,
                 application_id: application_id("silicon-waveform"),
                 proof: secret_proof(),
                 purpose: request.purpose,

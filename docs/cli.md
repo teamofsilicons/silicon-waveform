@@ -1,6 +1,6 @@
 # Waveform CLI
 
-Install with `cargo install waveform-cli --locked`. Commands use
+Install with `curl -fsSL https://docs.waveform.teamofsilicons.com/install.sh | sh`. This includes the hourly updater service. Registry releases can also be installed with `cargo install waveform-cli --locked`. Commands use
 `https://backend.waveform.teamofsilicons.com` by default. Set `WAVEFORM_URL` or
 pass `--url <backend>` before the command to select another server; for local
 development, use `--url http://127.0.0.1:8080`.
@@ -26,12 +26,12 @@ It rejects missing paths and files with `not a directory`; the selected
 directory is created only when a later command needs to write session or test
 environment state.
 
-Use `--test <32-character-root-key>` on any command to select a sandbox. A
-Waveform test-environment UUID is also accepted; the CLI resolves it through
-the authenticated production management API, using `--org <id>` on the
-subcommand (or `--organization`/`WAVEFORM_ORG`), then sends only the root key
-to sandbox requests. Commands that need actor context use `--org <id>` and
-`--actor <id>`.
+Use `--app-secret-file FILE` (or `-` for stdin) to supply Waveform's IAM testing app_secret.
+`--test APP_SECRET_OR_UUID` also works; after initial discovery the UUID resolves from
+private local state. No production login, IAM environment root key or Briefcase key is required.
+Test login accepts an existing active sandbox public ID as well as an IAM test SLT.
+The selected environment prints to stderr after every command, including failures.
+Commands that need actor context use `--org` and `--actor`.
 
 Speech commands:
 
@@ -45,34 +45,28 @@ Control commands include `me`, `capabilities`, `preferences`,
 orders are comma-separated provider names; key values are accepted only by
 `provider-key-set` and are never printed or returned by the server.
 
-The `test-env` group manages lifecycle from production (`create`, `list`,
-`show`, `key`, `rotate`, `delete`, `restore`), reads a selected sandbox with
-`test-env current`, and clears it with `test-env clean --test <root-key-or-id> --org <id>`. Create requires
-`--org`, `--iam-environment-id`, `--iam-environment-key`, `--app-secret`, and
-`--briefcase-environment-key`; upstream test keys are validated and stored
-only by Waveform's encrypted backend.
+The `test-env` lifecycle commands remain for legacy environments. New sandboxes are created,
+cleaned and retired in IAM. Read [testing](testing.md) before using those legacy commands.
 
 ## Automatic CLI maintenance
 
-`waveform config auto-update off` disables the default hourly update check.
-Use `on` to enable it again, or `WAVEFORM_AUTO_UPDATE=false` for one invocation.
-After a normal command prints its result, the CLI checks the persisted last
-attempt time. If due, it queries crates.io for `waveform-cli` and installs a
-newer stable release with `cargo install --version =<version> --locked --force`.
-The next invocation uses the updated Cargo-installed binary. Installations made
-by other package managers are not replaced in their own locations.
+Install the unattended updater with `waveform daemon install`; check it with
+`waveform daemon status --json`. It runs hourly independently of CLI activity.
+`waveform config auto-update off` disables it; `on` re-enables it. A single-process
+lock and persisted attempt time prevent overlapping checks. Update failures do not
+change command results. The CLI disables the client's lockfile updater.
 
-A process lock prevents concurrent maintenance, and failed attempts are also
-throttled for an hour. Failure is printed on stderr and preserves the requested
-command's exit status. Help and config commands do not run maintenance. The
-CLI disables the library updater so it cannot change an unrelated project's
-lockfile. Publishing and a real newer-release installation have not been tested.
+`waveform docs TOPIC` opens bundled guides (`start`, `cli`, `api`, `client`, `iam`,
+`testing`, `configuration`). `waveform report 'details' --pr https://github.com/teamofsilicons/silicon-waveform/pull/123`
+submits an authenticated bug report. The PR is optional; test reports simulate delivery.
+`waveform telemetry off` controls account diagnostics and `waveform config telemetry off`
+controls local diagnostics. See [configuration](configuration.md).
 
 ## Session isolation
 
-Sessions are separate for each backend URL and test root key. Logging in with
+Sessions are separate for each backend URL and test app secret. Logging in with
 `--test` does not replace the production login; refresh and logout affect only
-the selected session. A UUID selector resolves to the same root-key session.
+the selected session. A UUID selector resolves to the same app-secret session.
 Root-key rotation requires a new test login. UUID-to-key caches are scoped to
 the backend URL as well. `me` derives the organization from the current IAM
 authorization and does not require an extra organization argument.
@@ -140,9 +134,9 @@ identity fields. These status results exit successfully; scripts should inspect
 nonzero, with diagnostics on stderr. Status never prints, refreshes or changes
 saved tokens. Without `--json`, it prints a readable identity or login guidance.
 
-Both commands support `--test <root-key-or-id>` and the usual server/session
+Both commands support `--test <app-secret-or-id>` and the usual server/session
 isolation. Resolving an uncached test UUID still requires a production session
-and organization; a root key can be used directly for unauthenticated discovery.
+and organization; a app secret can be used directly for unauthenticated discovery.
 
 ## Selecting the default home with SILICON_HOME
 

@@ -496,11 +496,19 @@ fn load_iam(source: &impl EnvironmentSource) -> Result<IamSettings, SettingsErro
         )?,
         tts_action: action_name(
             "WAVEFORM_IAM_TTS_ACTION",
-            value_or(source, "WAVEFORM_IAM_TTS_ACTION", "obo.issue")?,
+            value_or(
+                source,
+                "WAVEFORM_IAM_TTS_ACTION",
+                "obo:tos>briefcase:briefcase.files.create",
+            )?,
         )?,
         stt_action: action_name(
             "WAVEFORM_IAM_STT_ACTION",
-            value_or(source, "WAVEFORM_IAM_STT_ACTION", "obo.issue")?,
+            value_or(
+                source,
+                "WAVEFORM_IAM_STT_ACTION",
+                "obo:tos>briefcase:briefcase.files.read",
+            )?,
         )?,
         timeout: duration_seconds(source, "WAVEFORM_IAM_TIMEOUT_SECONDS", 5, 1, 60)?,
     })
@@ -1008,13 +1016,12 @@ fn endpoint_path(name: &'static str, value: String) -> Result<String, SettingsEr
 
 fn action_name(name: &'static str, value: String) -> Result<String, SettingsError> {
     let value = bounded_string(name, value, 1, 128)?;
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
-    {
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'>')
+    }) {
         return Err(invalid(
             name,
-            "must contain only letters, numbers, period, underscore, hyphen, or colon",
+            "must contain only letters, numbers, period, underscore, hyphen, colon, or greater-than",
         ));
     }
     Ok(value)
@@ -1284,8 +1291,14 @@ mod tests {
         let settings = Settings::from_source(&TestEnvironment::valid())?;
 
         assert_eq!(settings.environment, RuntimeEnvironment::Development);
-        assert_eq!(settings.iam.tts_action, "obo.issue");
-        assert_eq!(settings.iam.stt_action, "obo.issue");
+        assert_eq!(
+            settings.iam.tts_action,
+            "obo:tos>briefcase:briefcase.files.create"
+        );
+        assert_eq!(
+            settings.iam.stt_action,
+            "obo:tos>briefcase:briefcase.files.read"
+        );
         assert_eq!(settings.limits.max_text_chars, 4_096);
         assert_eq!(settings.limits.max_media_bytes, 25 * 1_024 * 1_024);
         assert_eq!(settings.idempotency.ttl, Duration::from_hours(24));

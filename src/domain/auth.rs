@@ -205,6 +205,8 @@ pub struct DelegatedUploadBinding {
 /// New credential minted specifically for a downstream audience.
 #[derive(Clone, Debug)]
 pub struct DelegatedAuthorization {
+    /// Request-local downstream testing secret from IAM; never persisted.
+    pub testing_secret: Option<secrecy::SecretString>,
     /// Application identity Briefcase expects alongside the proof.
     pub application_id: ApplicationId,
     /// Short-lived proof that must never be replaced by the inbound proof.

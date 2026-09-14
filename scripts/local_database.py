@@ -16,7 +16,7 @@ if not PG.is_dir():
     if not found:
         raise SystemExit('Install PostgreSQL 16+ and add its bin directory to PATH.')
     PG = Path(found).parent
-PORT = '55439'
+PORT = os.environ.get('WAVEFORM_TEST_POSTGRES_PORT', '55439')
 PASSWORD = STATE / 'password'
 if not PASSWORD.exists():
     PASSWORD.write_text(secrets.token_hex(32))

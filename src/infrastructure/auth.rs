@@ -246,7 +246,7 @@ impl IamPort for IamHttpAdapter {
         &self,
         request: DelegationRequest,
     ) -> Result<DelegatedAuthorization, IamError> {
-        delegate_storage(
+        let delegated = delegate_storage(
             &self.sdk,
             &self.application_id,
             self.storage_audience
@@ -254,7 +254,11 @@ impl IamPort for IamHttpAdapter {
                 .ok_or(IamError::ContractUnavailable)?,
             request,
         )
-        .await
+        .await?;
+        if delegated.testing_secret.is_some() {
+            return Err(IamError::InvalidResponse);
+        }
+        Ok(delegated)
     }
 }
 
@@ -276,7 +280,12 @@ impl IamPort for TestStorageDelegator {
         &self,
         request: DelegationRequest,
     ) -> Result<DelegatedAuthorization, IamError> {
-        delegate_storage(&self.sdk, &self.application_id, &self.audience, request).await
+        let delegated =
+            delegate_storage(&self.sdk, &self.application_id, &self.audience, request).await?;
+        if delegated.testing_secret.is_none() {
+            return Err(IamError::InvalidResponse);
+        }
+        Ok(delegated)
     }
 }
 
@@ -333,6 +342,7 @@ async fn delegate_storage(
         return Err(IamError::ContractUnavailable);
     }
     let exchange = silicon_iam_client::models::OboExchangeRequest {
+        org_id: Some(request.authorization.organization_id.as_str().to_owned()),
         subject_token: token.expose_secret().to_owned(),
         audience: audience.to_owned(),
         endpoint_id,
@@ -351,6 +361,17 @@ async fn delegate_storage(
         return Err(IamError::InvalidResponse);
     }
     Ok(DelegatedAuthorization {
+        testing_secret: response
+            .testing_context
+            .map(|context| {
+                if context.app_id != audience {
+                    return Err(IamError::InvalidResponse);
+                }
+                briefcase_client::EnvironmentKey::new(&context.app_secret)
+                    .map_err(|_| IamError::InvalidResponse)?;
+                Ok(secrecy::SecretString::from(context.app_secret))
+            })
+            .transpose()?,
         application_id: application_id.clone(),
         proof: crate::domain::auth::OboProof::new(response.access_proof)
             .map_err(|_| IamError::InvalidResponse)?,
@@ -410,7 +431,7 @@ fn valid_action(value: &str) -> bool {
             .next()
             .is_some_and(|byte| byte.is_ascii_lowercase())
         && value.bytes().skip(1).all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.:-".contains(&byte)
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.:->".contains(&byte)
         })
 }
 
@@ -681,7 +702,7 @@ mod tests {
         Mock::given(method("GET")).and(path("/api/v1/obo-access/applications/acme%3Estorage/endpoints"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "application":{"app_id":"acme>storage","org_id":"acme"},
-                "endpoints":[{"endpoint_id":"briefcase.files.create","path":"/api/v1/obo/files","metadata":{"path":{"type":"string"},"name":{"type":"string"},"content_type":{"type":"string"}}}]
+                "endpoints":[{"critical":false,"endpoint_id":"briefcase.files.create","path":"/api/v1/obo/files","metadata":{"path":{"type":"string"},"name":{"type":"string"},"content_type":{"type":"string"}}}]
             }))).expect(1).mount(&server).await;
         Mock::given(method("POST")).and(path("/api/v1/obo-access/exchanges"))
             .and(body_partial_json(json!({"subject_token":"oat_request_subject", "audience":"acme>storage", "endpoint_id":"briefcase.files.create", "request":{"method":"POST","body_sha256":digest}, "metadata":{"name":filename.as_str(),"path":"","content_type":"audio/mpeg"}})))

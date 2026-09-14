@@ -93,6 +93,12 @@ async fn help_is_complete_and_login_status_is_a_subcommand() {
 async fn discovery_is_public_and_preserves_test_selection() {
     let home = Home::new();
     let server = MockServer::start().await;
+    Mock::given(path("/api/v1/testing-environment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"id":"00000000-0000-0000-0000-000000000099","name":"CLI sandbox"}),
+        ))
+        .mount(&server)
+        .await;
     let key = "A".repeat(32);
     Mock::given(method("GET"))
         .and(path("/api/v1/iam"))
@@ -130,6 +136,12 @@ async fn status_verifies_both_actor_types_and_hides_session_tokens() {
     for kind in ["carbon", "silicon"] {
         let home = Home::new();
         let server = MockServer::start().await;
+        Mock::given(path("/api/v1/testing-environment"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"id":"00000000-0000-0000-0000-000000000099","name":"CLI sandbox"}),
+            ))
+            .mount(&server)
+            .await;
         login(&home, &server, &[]).await;
         assert!(home.0.join(".waveform/dir").is_dir());
         Mock::given(method("GET"))
@@ -163,6 +175,12 @@ async fn status_distinguishes_rejected_tokens_from_server_failure() {
     for code in [401, 403, 503] {
         let home = Home::new();
         let server = MockServer::start().await;
+        Mock::given(path("/api/v1/testing-environment"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"id":"00000000-0000-0000-0000-000000000099","name":"CLI sandbox"}),
+            ))
+            .mount(&server)
+            .await;
         login(&home, &server, &[]).await;
         Mock::given(method("GET"))
             .and(path("/api/v1/auth/me"))
@@ -189,6 +207,12 @@ async fn status_distinguishes_rejected_tokens_from_server_failure() {
 async fn status_keeps_production_and_test_sessions_separate() {
     let home = Home::new();
     let server = MockServer::start().await;
+    Mock::given(path("/api/v1/testing-environment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"id":"00000000-0000-0000-0000-000000000099","name":"CLI sandbox"}),
+        ))
+        .mount(&server)
+        .await;
     let key = "A".repeat(32);
     login(&home, &server, &["--test", &key]).await;
     let mut identity = authority("silicon");
@@ -227,6 +251,12 @@ async fn explicit_home_overrides_silicon_default_and_pointer_stays_under_silicon
     let home = Home::new();
     let selected = Home::new();
     let server = MockServer::start().await;
+    Mock::given(path("/api/v1/testing-environment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"id":"00000000-0000-0000-0000-000000000099","name":"CLI sandbox"}),
+        ))
+        .mount(&server)
+        .await;
     output_json(
         home.run(
             &server.uri(),

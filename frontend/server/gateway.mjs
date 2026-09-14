@@ -20,6 +20,7 @@ const routes = [
     "POST",
     /^\/api\/v1\/testing-environments(?:\/[a-f0-9-]{36}\/(rotate-key|delete|restore))?$/,
   ],
+  ["POST", /^\/api\/v1\/telemetry$/],
   ["GET", /^\/api\/v1\/testing-environment$/],
   ["POST", /^\/api\/v1\/testing-environment\/clean$/],
 ];
@@ -101,7 +102,7 @@ export function createGateway({
     return response;
   }
   async function login(slot, slt) {
-    if (typeof slt !== "string" || !/^oac_[!-~]{1,16380}$/.test(slt))
+    if (typeof slt !== "string" || !(slot.key ? /^[!-~]{1,256}$/.test(slt) || /^oac_[!-~]{1,16380}$/.test(slt) : /^oac_[!-~]{1,16380}$/.test(slt)))
       return failure("invalid_token", "Enter a valid short-lived IAM code.");
     const response = await upstream(
       "/api/v1/auth/login",
@@ -309,11 +310,11 @@ export function createGateway({
         return finish(json(snapshot(session)));
       }
       if (path === "/api/session/environment" && request.method === "POST") {
-        if (!/^[A-Za-z0-9]{32}$/.test(body.key || ""))
+        if (!/^(?:ask_[A-Za-z0-9_-]{43}|[A-Za-z0-9]{32})$/.test(body.key || ""))
           return finish(
             failure(
               "invalid_environment_key",
-              "Enter the 32-character Waveform environment key.",
+              "Enter the IAM testing app_secret for Waveform (ask_…).",
             ),
           );
         const slot = { key: body.key, org: body.org || "tos" };
@@ -379,8 +380,8 @@ export function createGateway({
       const isPublic =
         path.startsWith("/health/") || path === "/api/v1/capabilities";
       const rootOnly =
-        path === "/api/v1/testing-environment" ||
-        path === "/api/v1/testing-environment/clean";
+        path === "/api/v1/testing-environment";
+      if (path === "/api/v1/testing-environment/clean" && !slot?.key) return finish(failure("test_environment_required","Select a sandbox first.",400));
       if (!isPublic && !rootOnly && !slot?.access)
         return finish(
           failure(

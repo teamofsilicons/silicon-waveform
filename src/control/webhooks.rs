@@ -4,9 +4,11 @@ use super::{ControlError, ControlState};
 use axum::{body::Bytes, extract::State};
 use http::{HeaderMap, StatusCode};
 use secrecy::ExposeSecret as _;
+use sha2::{Digest as _, Sha256};
 use silicon_iam_client::EnvironmentKey;
 use sqlx::Row as _;
 use std::sync::Arc;
+use subtle::ConstantTimeEq as _;
 use uuid::Uuid;
 
 pub(super) async fn receive(
@@ -24,12 +26,32 @@ pub(super) async fn receive(
     let mut plane_id = Uuid::nil();
     if delivery.is_testing() {
         // Never persist or log an unmatched test delivery, or its embedded key.
-        let rows = sqlx::query("SELECT id, iam_key_cipher FROM waveform_environments WHERE id<>$1 AND deleted_at IS NULL")
+        let rows = sqlx::query("SELECT id, iam_key_cipher, webhook_key_digest FROM waveform_environments WHERE id<>$1 AND deleted_at IS NULL")
             .bind(Uuid::nil()).fetch_all(&state.pool).await?;
         let mut matched = None;
+        // Parse only after complete raw-body signature verification. Never persist the envelope.
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| ControlError::unauthorized())?;
+        let received = envelope
+            .pointer("/test/testing_key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(ControlError::unauthorized)?;
+        let digest = format!("{:x}", Sha256::digest(received.as_bytes()));
         for row in rows {
             let id: Uuid = row.try_get("id")?;
             let cipher: Vec<u8> = row.try_get("iam_key_cipher")?;
+            let discovered: Option<String> = row.try_get("webhook_key_digest")?;
+            if let Some(expected) = discovered {
+                if bool::from(expected.as_bytes().ct_eq(digest.as_bytes()))
+                    && matched.replace(id).is_some()
+                {
+                    return Err(ControlError::unavailable("ambiguous_environment_binding"));
+                }
+                continue;
+            }
+            if cipher.is_empty() {
+                continue;
+            }
             let key = state
                 .vault()?
                 .open(&cipher, &format!("{id}/iam-key"))

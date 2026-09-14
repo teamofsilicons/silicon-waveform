@@ -401,16 +401,22 @@ fn spawn_environment_cleanup(
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(ENVIRONMENT_CLEANUP_INTERVAL);
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        let mut last_cleanup = tokio::time::Instant::now() - ENVIRONMENT_CLEANUP_INTERVAL;
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
-                _ = ticker.tick() => match control.cleanup_environments().await {
+                _ = ticker.tick() => {
+                    if control.deliver_report().await.is_err() { tracing::warn!("report delivery will retry"); }
+                    if last_cleanup.elapsed() < ENVIRONMENT_CLEANUP_INTERVAL { continue; }
+                    last_cleanup = tokio::time::Instant::now();
+                    match control.cleanup_environments().await {
                     Ok(changed) if changed > 0 => tracing::info!(changed, "test environments cleaned"),
                     Ok(_) => {}
                     Err(_) => tracing::warn!("test environment cleanup failed"),
+                    }
                 },
             }
         }

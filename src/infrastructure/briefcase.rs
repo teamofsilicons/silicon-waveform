@@ -268,6 +268,7 @@ mod tests {
         purpose: DelegationPurpose,
     ) -> Result<DelegatedAuthorization, Box<dyn std::error::Error>> {
         Ok(DelegatedAuthorization {
+            testing_secret: None,
             application_id: ApplicationId::from_str("waveform")?,
             proof: OboProof::new("obo_downstream-proof".to_owned())?,
             purpose,

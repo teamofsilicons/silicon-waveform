@@ -57,7 +57,7 @@ Cleaning a test environment clears account choices; the next authenticated use
 assigns that environment's default again. Catalog configuration survives cleaning.
 Deletion and retention cleanup remove the catalog with the environment.
 
-Test speech still uses the prescribed prerecorded fixture and paired Briefcase
+Test speech still uses the prescribed prerecorded fixture and IAM-discovered Briefcase
 storage; profile selection and metadata are real, but the fixture cannot validate
 how a selected voice sounds. Provider HTTP contract tests verify the mapped
 parameters independently.

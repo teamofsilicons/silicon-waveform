@@ -355,6 +355,7 @@ impl IamPort for FixtureIam {
         let proof = crate::domain::auth::OboProof::new("test-plane-fixture-proof".to_owned())
             .map_err(|_| IamError::InvalidResponse)?;
         Ok(DelegatedAuthorization {
+            testing_secret: None,
             application_id: self.briefcase_application.clone(),
             proof,
             purpose: request.purpose,

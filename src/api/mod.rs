@@ -240,7 +240,7 @@ async fn synthesize(
         let Some(fixture_service) = &state.fixture_service else {
             return ApiError::not_ready(request_id).into_response();
         };
-        let selected = match control.authorize_test_speech(&raw_headers).await {
+        let selected = match control.authorize_test_speech(&raw_headers, "tts").await {
             Ok(selected) => selected,
             Err(error) => return error.into_response(),
         };
@@ -325,7 +325,7 @@ async fn transcribe(
         let Some(fixture_service) = &state.fixture_service else {
             return ApiError::not_ready(request_id).into_response();
         };
-        let selected = match control.authorize_test_speech(&raw_headers).await {
+        let selected = match control.authorize_test_speech(&raw_headers, "stt").await {
             Ok(selected) => selected,
             Err(error) => return error.into_response(),
         };

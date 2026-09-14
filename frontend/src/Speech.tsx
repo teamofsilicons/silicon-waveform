@@ -8,6 +8,7 @@ import {
 } from "solid-js";
 import {
   api,
+  recordEvent,
   ApiError,
   duration,
   providerNames,
@@ -106,6 +107,7 @@ export default function Speech(props: {
     setRequestId(attempt.id);
     setBusy(true);
     setElapsed(0);
+    const started = performance.now();
     const timer = setInterval(() => {
       if (mounted) setElapsed((s) => s + 1);
     }, 1000);
@@ -119,8 +121,10 @@ export default function Speech(props: {
         setResult(response);
         setRequestId(response.request_id);
       }
+      recordEvent("speech_completed", Math.round(performance.now() - started));
       attempt = undefined;
     } catch (err) {
+      recordEvent("speech_failed", Math.round(performance.now() - started));
       if (mounted) setError(err);
       if (
         err instanceof ApiError &&

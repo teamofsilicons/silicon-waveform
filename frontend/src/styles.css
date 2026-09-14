@@ -1439,3 +1439,5 @@ dialog .muted {
   margin: 0;
   overflow-wrap: anywhere;
 }
+
+.testing-banner{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;padding:12px 24px;background:#fff2cc;color:#523600;border-bottom:1px solid #e5c765}.testing-banner .button{margin-left:auto}
