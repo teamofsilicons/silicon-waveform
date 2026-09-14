@@ -24,7 +24,13 @@ use std::{
 )]
 struct Args {
     /// Select an IAM test app_secret (ask_…) or a previously saved sandbox UUID.
-    #[arg(long, value_name = "APP_SECRET_OR_ID", global = true, env = "WAVEFORM_TEST", hide_env_values = true)]
+    #[arg(
+        long,
+        value_name = "APP_SECRET_OR_ID",
+        global = true,
+        env = "WAVEFORM_TEST",
+        hide_env_values = true
+    )]
     test: Option<String>,
     /// Read an IAM test app_secret from a file (use - for stdin).
     #[arg(long, global = true, conflicts_with = "test")]

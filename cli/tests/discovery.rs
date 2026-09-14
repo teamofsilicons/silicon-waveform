@@ -291,6 +291,13 @@ async fn environment_selects_test_requests_and_explicit_flag_overrides_it() {
     let env_key = "abcdefghijklmnopqrstuvwxyz123456";
     let explicit_key = "123456abcdefghijklmnopqrstuvwxyz";
     for explicit in [false, true] {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/testing-environment"))
+            .and(header("x-testing-environment-key", if explicit { explicit_key } else { env_key }))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": if explicit { "00000000-0000-0000-0000-000000000098" } else { "00000000-0000-0000-0000-000000000099" },
+                "name":"CLI sandbox"
+            }))).expect(1).mount(&server).await;
         Mock::given(method("GET")).and(path("/api/v1/iam"))
             .and(header("x-testing-environment-key", if explicit { explicit_key } else { env_key }))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
