@@ -4,7 +4,7 @@ Waveform testing environments are isolated planes backed by the IAM and
 Briefcase testing environments supplied when the plane is created. A request
 selects a plane with `X-Testing-Environment-Key`; the header is mandatory for
 test traffic and omission always means production. Waveform never accepts a
-production IAM or Briefcase root key as a substitute for a test key.
+production IAM credentials or a Briefcase root key as a substitute for an imported test application secret.
 
 ## Create a plane
 
@@ -18,7 +18,7 @@ Authenticate against the production Waveform plane and call
   "iam_environment_id": "<IAM test-environment UUID>",
   "iam_environment_key": "<32-character IAM root key>",
   "app_secret": "<test-only Waveform application secret>",
-  "briefcase_environment_key": "<32-character Briefcase root key>"
+  "briefcase_environment_key": "<imported Briefcase app secret: ask_ plus 43 base64url characters>"
 }
 ```
 
@@ -65,13 +65,13 @@ when its clip is missing. Test TTS loads the selected audio from PostgreSQL.
 Waveform hashes the final bytes, exchanges the caller's
 test-plane access token for a Briefcase upload proof using the paired IAM SDK
 client, and uploads those bytes through the official Briefcase SDK with the
-paired Briefcase root key. Each new request has a distinct generated filename.
+paired Briefcase imported application secret in `X-Briefcase-App-Secret`. Each new request has a distinct generated filename.
 The response contains a permanent URL and `temporary_url: null`. An upstream
 failure returns an error; the runtime does not substitute an in-memory upload
 or fabricate a successful storage URL. Unit-test-only storage fixtures remain
 in the test suite.
 
-Briefcase 0.2.0 supports delegated listings and file reads. Waveform resolves
+Briefcase 1.1.0 supports delegated listings and file reads. Waveform resolves
 an organization-qualified permanent URL by listing its parent with a fresh
 IAM proof for each page, then obtains a separate proof for the exact file read.
 STT returns the prescribed fixture transcript after the authorized read and

@@ -197,9 +197,9 @@ dependencies = [
 
 [[package]]
 name = "briefcase-client"
-version = "0.3.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "441c49931493467290b123cc07f04aed2137696408c3f57f299e05679a4b4781"
+checksum = "9f32b6ac37a293d256bc9b3001878908b61cb848a0f64061d152295ff2c2b4d1"
 dependencies = [
  "futures-core",
  "libc",
@@ -1930,10 +1930,11 @@ dependencies = [
 
 [[package]]
 name = "silicon-iam-client"
-version = "1.3.0"
+version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "227c284ce877fd6f3e4081abe8b00556ec533082e1d03d53810078876164e1e5"
+checksum = "41f430f493c26ff76c2a385a1d0d9813c79a74a87ac67ffc838366cb2886af1f"
 dependencies = [
+ "base64",
  "hmac 0.12.1",
  "http",
  "reqwest",
