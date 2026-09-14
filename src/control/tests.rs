@@ -50,6 +50,10 @@ fn fixture(
     iam: &MockServer,
 ) -> Result<Arc<ControlState>, Box<dyn std::error::Error>> {
     Ok(Arc::new(ControlState {
+        tts_scope: "obo:tos>briefcase:briefcase.files.create".into(),
+        stt_scope: "obo:tos>briefcase:briefcase.files.read".into(),
+        mail: None,
+        station: None,
         pool,
         iam: Client::builder(&iam.uri())?
             .credential(Credential::application("tos>waveform", "test-app-secret"))
@@ -67,6 +71,7 @@ fn fixture(
             max_download_bytes: 1_000_000,
         },
         iam_timeout: std::time::Duration::from_secs(5),
+        source_stt_action: "waveform.stt".to_owned(),
         vault: Some(Vault::new(&SecretString::from("19".repeat(32)))?),
         verifier: Some(WebhookVerifier::new(WebhookSecretKeyring::new(
             1,
@@ -644,7 +649,7 @@ async fn sandbox_creation_and_atomic_clean_preserve_the_environment() -> TestRes
         Some("oat_fixture"),
         json!({
             "name":"local-sandbox", "iam_environment_id":iam_environment_id,
-            "iam_environment_key":"I".repeat(32), "app_secret":"test-environment-app-secret", "briefcase_environment_key":format!("ask_{}", "B".repeat(43))
+            "iam_environment_key":"I".repeat(32), "app_secret":"test-environment-app-secret", "briefcase_environment_key":format!("ask_{}","B".repeat(43))
         }),
     )
     .await?;
@@ -765,6 +770,22 @@ async fn sandbox_creation_and_atomic_clean_preserve_the_environment() -> TestRes
     )
     .await?;
     assert_eq!(status, StatusCode::OK);
+    let mut clean_snapshot = snapshot(Uuid::new_v4());
+    clean_snapshot["authorization"]["testing_environment_id"] =
+        created["iam_environment_id"].clone();
+    let iam_id: Uuid =
+        sqlx::query_scalar("SELECT iam_environment_id FROM waveform_environments WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    clean_snapshot["authorization"]["testing_environment_id"] = json!(iam_id);
+    clean_snapshot["authorization"]["org_role"] = json!("owner");
+    Mock::given(path("/api/v1/oauth/introspect"))
+        .and(header("x-testing-environment-key", "I".repeat(32)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(clean_snapshot))
+        .with_priority(1)
+        .mount(&iam)
+        .await;
     for route in [
         "/api/v1/testing-environment",
         "/api/v1/testing-environment/clean",
@@ -778,6 +799,8 @@ async fn sandbox_creation_and_atomic_clean_preserve_the_environment() -> TestRes
             .method(method)
             .uri(route)
             .header("x-testing-environment-key", rotated_key)
+            .header("x-org-id", "tos")
+            .header("authorization", "Bearer oat_fixture")
             .body(Body::empty())?;
         assert!(app.clone().oneshot(request).await?.status().is_success());
     }
@@ -963,3 +986,338 @@ async fn unscoped_identity_uses_iam_workspace_and_rejects_wrong_audience() -> Te
     pool.close().await;
     Ok(())
 }
+
+async fn mock_discovery(
+    iam: &MockServer,
+    id: Uuid,
+    secret: &str,
+    version: i64,
+    cleaned: Option<&str>,
+) {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    Mock::given(path("/api/v1/application/testing-context"))
+      .and(header("x-testing-application",format!("Basic {}",STANDARD.encode(format!("tos>waveform:{secret}")))))
+      .respond_with(ResponseTemplate::new(200).set_body_json(json!({"environment_id":id,"application":{"app_id":"tos>waveform","base_url":"https://backend.waveform.example","app_scope":{"iam":[],"external":[]},"webhook_scope":[],"testing_idle_days":15},"environment":{"environment_id":id,"org_id":"tos","name":format!("Sandbox {version}"),"version":version,"key_generation":1,"cleaned_at":cleaned,"created_at":"2026-09-01T00:00:00Z","creator_type":"carbon","creator_id":"alice"},"webhook_key_digest":"00".repeat(32)}))).mount(iam).await;
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn app_secret_discovery_revalidates_isolates_and_cleans() -> TestResult {
+    let (pool, schema) = database().await?;
+    let iam = MockServer::start().await;
+    let state = fixture(pool.clone(), &iam)?;
+    let id = Uuid::new_v4();
+    let secret = format!("ask_{}", "a".repeat(43));
+    mock_discovery(&iam, id, &secret, 1, None).await;
+    assert_eq!(
+        state
+            .discover_plane(&secret)
+            .await
+            .map_err(|_| "discovery failed")?
+            .id,
+        id
+    );
+    let credentials: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT iam_key_cipher,briefcase_key_cipher FROM waveform_environments WHERE id=$1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+    assert!(credentials.0.is_empty() && credentials.1.is_empty());
+    let actor = Uuid::new_v4();
+    for plane in [Uuid::nil(), id] {
+        sqlx::query("INSERT INTO waveform_account_preferences(plane_id,org_id,actor_id) VALUES($1,'tos',$2)").bind(plane).bind(actor).execute(&pool).await?;
+    }
+    iam.reset().await;
+    mock_discovery(&iam, id, &secret, 2, Some("2026-09-13T00:00:00Z")).await;
+    state
+        .discover_plane(&secret)
+        .await
+        .map_err(|_| "clean discovery failed")?;
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM waveform_account_preferences WHERE plane_id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining, 0);
+    let production: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM waveform_account_preferences WHERE plane_id=$1")
+            .bind(Uuid::nil())
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(production, 1);
+    iam.reset().await;
+    mock_discovery(&iam, id, &secret, 1, None).await;
+    assert!(state.discover_plane(&secret).await.is_err());
+    iam.reset().await;
+    Mock::given(path("/api/v1/application/testing-context"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&iam)
+        .await;
+    assert!(state.discover_plane(&secret).await.is_err());
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
+}
+
+async fn sandbox_call(
+    app: &Router,
+    secret: &str,
+    route: &str,
+    body: Value,
+    key: &str,
+) -> Result<(StatusCode, Value), Box<dyn std::error::Error>> {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(route)
+                .header("content-type", "application/json")
+                .header("x-testing-environment-key", secret)
+                .header("x-org-id", "tos")
+                .header("authorization", "Bearer oat_sandbox")
+                .header("idempotency-key", key)
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 65536).await?;
+    Ok((
+        status,
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!(String::from_utf8_lossy(&bytes)))
+        },
+    ))
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+#[allow(clippy::too_many_lines)]
+async fn discovered_identity_reports_permissions_and_webhooks_are_isolated() -> TestResult {
+    use sha2::Digest as _;
+    let (pool, schema) = database().await?;
+    let iam = MockServer::start().await;
+    let state = fixture(pool.clone(), &iam)?;
+    let app = router(state.clone());
+    let id = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let secret = format!("ask_{}", "R".repeat(43));
+    mock_discovery(&iam, id, &secret, 1, None).await;
+    let mut authority = snapshot(actor);
+    authority["authorization"]["testing_environment_id"] = json!(id);
+    Mock::given(path("/api/v1/oauth/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(authority.clone()))
+        .mount(&iam)
+        .await;
+    Mock::given(path("/api/v1/app-auth/tokens")).and(body_string_contains("slt=test-carbon"))
+      .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"oat_sandbox","refresh_token":"ort_sandbox","token_type":"Bearer","expires_in":1800,"scope":"roles.read","actor":{"principal_id":actor,"type":"carbon","public_id":"test-carbon"},"org_id":"tos"}))).mount(&iam).await;
+    Mock::given(path("/api/v1/app-auth/tokens"))
+        .and(body_string_contains("slt=inactive"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error":"invalid_grant"})))
+        .mount(&iam)
+        .await;
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            json!({"slt":"test-carbon"})
+        )
+        .await?
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        sandbox_call(
+            &app,
+            &secret,
+            "/api/v1/auth/login",
+            json!({"slt":"test-carbon"}),
+            "discovered-identity-login"
+        )
+        .await?
+        .0,
+        StatusCode::OK
+    );
+    assert!(
+        !sandbox_call(
+            &app,
+            &secret,
+            "/api/v1/auth/login",
+            json!({"slt":"inactive"}),
+            "inactive-identity-login"
+        )
+        .await?
+        .0
+        .is_success()
+    );
+    // The secret does not grant the missing speech scope or local lifecycle control.
+    let mut headers = HeaderMap::new();
+    headers.insert("x-testing-environment-key", secret.parse()?);
+    headers.insert("x-org-id", "tos".parse()?);
+    headers.insert("authorization", "Bearer oat_sandbox".parse()?);
+    assert!(state.authorize_test_speech(&headers, "tts").await.is_err());
+    assert_eq!(
+        sandbox_call(
+            &app,
+            &secret,
+            "/api/v1/testing-environment/clean",
+            json!({}),
+            "clean"
+        )
+        .await?
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let report = json!({"message":"Sandbox report only","client_version":"test"});
+    let (status, first) =
+        sandbox_call(&app, &secret, "/api/v1/reports", report.clone(), "report-1").await?;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(first["notification"], "simulated");
+    assert_eq!(
+        sandbox_call(&app, &secret, "/api/v1/reports", report.clone(), "report-1")
+            .await?
+            .1,
+        first
+    );
+    assert_eq!(
+        sandbox_call(
+            &app,
+            &secret,
+            "/api/v1/reports",
+            json!({"message":"Different"}),
+            "report-1"
+        )
+        .await?
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        sandbox_call(
+            &app,
+            &secret,
+            "/api/v1/reports",
+            json!({"message":secret}),
+            "secret"
+        )
+        .await?
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    for n in 2..=10 {
+        assert_eq!(
+            sandbox_call(
+                &app,
+                &secret,
+                "/api/v1/reports",
+                report.clone(),
+                &format!("report-{n}")
+            )
+            .await?
+            .0,
+            StatusCode::ACCEPTED
+        );
+    }
+    assert_eq!(
+        sandbox_call(&app, &secret, "/api/v1/reports", report, "report-11")
+            .await?
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert!(state.deliver_report().await.is_ok());
+    assert_eq!(
+        sandbox_call(
+            &app,
+            &secret,
+            "/api/v1/telemetry",
+            json!({"event":"page_view"}),
+            "event"
+        )
+        .await?
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        sandbox_call(
+            &app,
+            &secret,
+            "/api/v1/telemetry",
+            json!({"event":"page_view","secret":"not-allowed"}),
+            "event"
+        )
+        .await?
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let production_reports: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM waveform_bug_reports WHERE plane_id=$1")
+            .bind(Uuid::nil())
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(production_reports, 0);
+    let test_root = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
+    sqlx::query("UPDATE waveform_environments SET webhook_key_digest=$1 WHERE id=$2")
+        .bind(format!("{:x}", Sha256::digest(test_root.as_bytes())))
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    let event_id = Uuid::new_v4();
+    let event=json!({"test":{"testing_key":test_root,"metadata":{"spec_version":"1.0","event_id":event_id,"event_type":"session.revoked.v1","occurred_at":"2026-09-07T00:00:00Z","organization_id":Uuid::from_u128(2),"aggregate":{"type":"session","id":actor,"version":2}},"data":{"private":"must-not-persist"}}}).to_string();
+    assert_eq!(
+        webhook(&app, event_id, &event, true).await?,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        webhook(&app, event_id, &event, false).await?,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        webhook(&app, event_id, &event, false).await?,
+        StatusCode::NO_CONTENT
+    );
+    let events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM waveform_webhook_events WHERE plane_id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(events, 1);
+    let other = event.replace(test_root, "Z1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6");
+    assert_eq!(
+        webhook(&app, event_id, &other, false).await?,
+        StatusCode::UNAUTHORIZED
+    );
+    // Live IAM disagreement about the bearer plane is rejected, without production fallback.
+    iam.reset().await;
+    mock_discovery(&iam, id, &secret, 1, None).await;
+    authority["authorization"]["testing_environment_id"] = Value::Null;
+    Mock::given(path("/api/v1/oauth/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(authority))
+        .mount(&iam)
+        .await;
+    assert_eq!(
+        sandbox_call(
+            &app,
+            &secret,
+            "/api/v1/reports",
+            json!({"message":"wrong world"}),
+            "wrong"
+        )
+        .await?
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
+}
+#[path = "source_target_tests.rs"]
+mod source_target_tests;

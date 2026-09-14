@@ -10,12 +10,14 @@ The product contract lives in [`UNDERSTANDING.md`](./UNDERSTANDING.md),
 implementation choices and contract interpretations are recorded in the
 append-only [`decisions.md`](./decisions.md).
 
+Read the [usage and development documentation](https://docs.waveform.teamofsilicons.com/). Test environments now use only the Waveform test `app_secret`; IAM discovers the sandbox and supplies downstream storage credentials. See [testing](docs/testing.md).
+
 ## Current implementation status
 
 Bearer TTS and test-plane TTS use official IAM proof exchange and Briefcase
 uploads. Personal provider keys are selected per account, and CLI sessions
 are isolated by server and test plane. STT source reads and TTS/STT replay
-access checks use the Briefcase 1.1 delegated API. Inbound OBO speech remains
+access checks use the Briefcase 1.0 delegated API. Inbound OBO speech remains
 unavailable because IAM does not issue a downstream subject token from a
 consumed proof. See [the implementation checklist](./docs/IMPLEMENTATION.md) for
 remaining work and the distinction between local mocks and deployed tests.

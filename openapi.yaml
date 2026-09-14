@@ -26,6 +26,57 @@ tags:
   - name: Webhooks
 
 paths:
+  /api/v1/telemetry:
+    post:
+      operationId: recordBrowserEvent
+      summary: Record an authenticated browser diagnostic
+      description: Test events and opted-out account events are discarded. No credentials or user content are accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [event]
+              properties:
+                event: { type: string, enum: [speech_completed, speech_failed, settings_saved, page_view] }
+                elapsed_ms: { type: integer, minimum: 0, maximum: 86400000, default: 0 }
+      responses:
+        '204': { description: Event handled }
+  /api/v1/reports:
+    post:
+      operationId: submitBugReport
+      summary: Submit a bug report with optional pull request
+      description: Authenticated, idempotent, ten reports per actor per hour. Testing simulates delivery.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              additionalProperties: false
+              properties:
+                message: { type: string, minLength: 1, maxLength: 60000 }
+                pr: { type: [string, 'null'], format: uri }
+                client_version: { type: string, maxLength: 100 }
+      responses:
+        '202':
+          description: Persisted report with queued, sent, or simulated notification status
+        '400': { description: Invalid report or credential content }
+        '401': { description: Missing or invalid authentication }
+        '409': { description: Idempotency key reused with different content }
+        '429': { description: Hourly report limit exceeded }
+        '503': { description: Postmark not configured }
+
   /tts:
     post:
       security:
@@ -72,6 +123,56 @@ paths:
         '504': { $ref: '#/components/responses/GatewayTimeout' }
         default: { $ref: '#/components/responses/Error' }
 
+  /stt/source-target:
+    post:
+      security:
+        - bearerAuth: []
+      tags: [Speech]
+      operationId: prepareTranscriptionSourceTarget
+      summary: Resolve the current actor's private Waveform source folder
+      description: |
+        Requires current selected-organization STT and self.identity.read scopes.
+        Uses fresh, exact Briefcase entries.list proofs to materialize and verify
+        the caller's own reserved apps/<waveform-app>/private/<public-id> folder.
+        Returns no credentials and invokes no speech provider. Repeating the
+        request reauthorizes and verifies the same native folder; no authority
+        or successful response is cached. Upload a same-actor copy through the
+        normal Briefcase uploads endpoint, then transcribe the copied permanent
+        URL. The original file and Briefcase's application namespace fence remain.
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: Verified current actor's private folder, not an upload or transcription receipt
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [org_id, app_id, actor_id, folder_id, folder_path, testing_environment_id]
+                properties:
+                  org_id: { type: string }
+                  app_id: { type: string }
+                  actor_id: { type: string, description: Current IAM public actor identifier }
+                  folder_id: { type: string, format: uuid }
+                  folder_path: { type: string }
+                  testing_environment_id: { type: [string, 'null'], format: uuid }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/SourceNotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/Error' }
   /stt:
     post:
       security:
@@ -81,6 +182,8 @@ paths:
       operationId: transcribeSpeech
       summary: Transcribe an authorized Briefcase file
       description: |
+        The source must be within the originating Waveform application namespace.
+        Use /stt/source-target to prepare an owner-authorized copy when necessary.
         Re-authorizes the permanent Briefcase reference as the represented
         actor, then attempts Gemini 3.5 Transcribe, OpenAI gpt-transcribe, and
         Deepgram Nova-3 Multilingual. Waveform never fetches the supplied URL
@@ -687,8 +790,8 @@ components:
       name: X-Testing-Environment-Key
       in: header
       required: false
-      description: Explicit Waveform root key selecting an isolated test plane.
-      schema: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
+      description: IAM test app_secret selecting the Waveform sandbox. Validated live; no paired Briefcase key needed. Legacy root selectors remain accepted.
+      schema: { type: string, pattern: '^(ask_[A-Za-z0-9_-]{43}|[A-Za-z0-9]{32})$' }
     JobId:
       name: job_id
       in: path
@@ -934,7 +1037,7 @@ components:
       additionalProperties: false
       required: [slt]
       properties:
-        slt: { type: string, minLength: 5, maxLength: 16384, pattern: '^oac_[!-~]+$' }
+        slt: { type: string, minLength: 1, maxLength: 16384, description: 'Production requires an IAM SLT. A selected sandbox also accepts an existing active identity public ID.' }
     RefreshRequest:
       type: object
       additionalProperties: false
@@ -1020,6 +1123,7 @@ components:
       type: object
       required: [tts_order, stt_order, voice_profile, defaults]
       properties:
+        telemetry_enabled: { type: boolean, default: true }
         voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
         tts_order: { type: array, items: { type: string, enum: [gemini, elevenlabs, openai] } }
         stt_order: { type: array, items: { type: string, enum: [gemini, openai, deepgram] } }
@@ -1034,6 +1138,7 @@ components:
       type: object
       additionalProperties: false
       properties:
+        telemetry_enabled: { type: boolean, default: true }
         voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
         tts_order: { type: [array, 'null'], items: { type: string, enum: [gemini, elevenlabs, openai] } }
         stt_order: { type: [array, 'null'], items: { type: string, enum: [gemini, openai, deepgram] } }
@@ -1060,7 +1165,7 @@ components:
         iam_environment_id: { type: string, format: uuid }
         iam_environment_key: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
         app_secret: { type: string, minLength: 1, maxLength: 512 }
-        briefcase_environment_key: { type: string, minLength: 47, maxLength: 47, pattern: '^ask_[A-Za-z0-9_-]{43}$', description: 'Imported Briefcase application secret from the same IAM testing world.' }
+        briefcase_environment_key: { type: string, minLength: 47, maxLength: 47, pattern: '^ask_[A-Za-z0-9_-]{43}$' }
     CreatedTestingEnvironment:
       allOf:
         - $ref: '#/components/schemas/TestingEnvironment'

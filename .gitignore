@@ -10,3 +10,10 @@ coverage/
 .DS_Store
 /.local-test/
 /.local-deploy/
+
+/docs-site/node_modules/
+/docs-site/dist/
+/docs-site/.vercel/
+/docs-site/waveform-source.tar.gz
+
+/docs-site/waveform-source.tar.gz.sha256

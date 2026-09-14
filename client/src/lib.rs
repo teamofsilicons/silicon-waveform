@@ -13,6 +13,7 @@ use std::{
 use thiserror::Error;
 use url::Url;
 
+pub mod telemetry;
 pub mod update;
 
 /// A bounded client failure that never includes bearer or app-secret material.
@@ -256,9 +257,15 @@ impl TestEnvironmentKey {
     /// Validates the test-plane root-key wire format.
     pub fn new(key: impl Into<String>) -> Result<Self> {
         let key = key.into();
-        if key.len() != 32 || !key.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        if !((key.len() == 32 && key.bytes().all(|b| b.is_ascii_alphanumeric()))
+            || (key.len() == 47
+                && key.starts_with("ask_")
+                && key[4..]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')))
+        {
             return Err(Error::Invalid(
-                "test environment key must be 32 alphanumeric characters".into(),
+                "use the IAM test app_secret (ask_ followed by 43 base64url characters)".into(),
             ));
         }
         Ok(Self(SecretString::from(key)))
@@ -612,14 +619,49 @@ impl Client {
             authenticated: true,
             actor: Some(LoginActor {
                 principal_id: authority.principal_id.to_string(),
-                actor_type: authority.actor_type,
-                public_id: authority.public_id,
+                actor_type: authority.actor_type.ok_or_else(|| {
+                    Error::Invalid("IAM did not identify a Carbon or Silicon".into())
+                })?,
+                public_id: authority
+                    .public_id
+                    .ok_or_else(|| Error::Invalid("IAM did not return a public identity".into()))?,
             }),
             org_id: Some(authority.org_id),
             testing_environment_id: authority.testing_environment_id.map(|id| id.to_string()),
         })
     }
 
+    /// Discovers the selected sandbox, without needing an organization or a login.
+    pub async fn current_test_environment(&self) -> Result<serde_json::Value> {
+        self.request(Method::GET, "testing-environment", None::<&()>, None)
+            .await
+    }
+    /// Submits a bug report. Reuse the idempotency key when retrying the same report.
+    pub async fn report(
+        &self,
+        message: &str,
+        pr: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<serde_json::Value> {
+        let identity = self.me().await?;
+        self.request(Method::POST, "reports", Some(serde_json::json!({"message":message,"pr":pr,"client_version":env!("CARGO_PKG_VERSION")})), Some((identity["org_id"].as_str().ok_or_else(||Error::Invalid("IAM organization missing".into()))?, identity["principal_id"].as_str().ok_or_else(||Error::Invalid("IAM identity missing".into()))?, idempotency_key))).await
+    }
+    /// Sets the signed-in account's diagnostic opt-out for the selected plane.
+    pub async fn set_telemetry(
+        &self,
+        organization: &str,
+        actor: &str,
+        enabled: bool,
+    ) -> Result<serde_json::Value> {
+        self.scoped_request(
+            Method::PATCH,
+            "preferences",
+            organization,
+            actor,
+            Some(&serde_json::json!({"telemetry_enabled":enabled})),
+        )
+        .await
+    }
     /// Reads stable service capabilities without authentication.
     pub async fn capabilities(&self) -> Result<Capabilities> {
         self.request(Method::GET, "capabilities", None::<&()>, None)

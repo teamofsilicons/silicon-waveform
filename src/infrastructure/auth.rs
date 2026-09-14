@@ -246,7 +246,7 @@ impl IamPort for IamHttpAdapter {
         &self,
         request: DelegationRequest,
     ) -> Result<DelegatedAuthorization, IamError> {
-        delegate_storage(
+        let delegated = delegate_storage(
             &self.sdk,
             &self.application_id,
             self.storage_audience
@@ -254,7 +254,11 @@ impl IamPort for IamHttpAdapter {
                 .ok_or(IamError::ContractUnavailable)?,
             request,
         )
-        .await
+        .await?;
+        if delegated.testing_secret.is_some() {
+            return Err(IamError::InvalidResponse);
+        }
+        Ok(delegated)
     }
 }
 
@@ -276,7 +280,40 @@ impl IamPort for TestStorageDelegator {
         &self,
         request: DelegationRequest,
     ) -> Result<DelegatedAuthorization, IamError> {
-        delegate_storage(&self.sdk, &self.application_id, &self.audience, request).await
+        let delegated =
+            delegate_storage(&self.sdk, &self.application_id, &self.audience, request).await?;
+        if delegated.testing_secret.is_none() {
+            return Err(IamError::InvalidResponse);
+        }
+        Ok(delegated)
+    }
+}
+
+/// Delegates storage for an identity already verified by the source-target route.
+/// The selected SDK client retains its production or testing plane credentials.
+pub(crate) struct SourceStorageDelegator {
+    pub(crate) sdk: silicon_iam_client::Client,
+    pub(crate) application_id: ApplicationId,
+    pub(crate) audience: String,
+    pub(crate) testing: bool,
+}
+
+#[async_trait]
+impl IamPort for SourceStorageDelegator {
+    async fn authorize(&self, _request: AuthorizationRequest) -> Result<AuthorizedActor, IamError> {
+        Err(IamError::InvalidCredential)
+    }
+
+    async fn delegate(
+        &self,
+        request: DelegationRequest,
+    ) -> Result<DelegatedAuthorization, IamError> {
+        let delegated =
+            delegate_storage(&self.sdk, &self.application_id, &self.audience, request).await?;
+        if delegated.testing_secret.is_some() != self.testing {
+            return Err(IamError::InvalidResponse);
+        }
+        Ok(delegated)
     }
 }
 
@@ -355,6 +392,17 @@ async fn delegate_storage(
         return Err(IamError::InvalidResponse);
     }
     Ok(DelegatedAuthorization {
+        testing_secret: response
+            .testing_context
+            .map(|context| {
+                if context.app_id != audience {
+                    return Err(IamError::InvalidResponse);
+                }
+                briefcase_client::EnvironmentKey::new(&context.app_secret)
+                    .map_err(|_| IamError::InvalidResponse)?;
+                Ok(secrecy::SecretString::from(context.app_secret))
+            })
+            .transpose()?,
         application_id: application_id.clone(),
         proof: crate::domain::auth::OboProof::new(response.access_proof)
             .map_err(|_| IamError::InvalidResponse)?,
@@ -414,7 +462,7 @@ fn valid_action(value: &str) -> bool {
             .next()
             .is_some_and(|byte| byte.is_ascii_lowercase())
         && value.bytes().skip(1).all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.:-".contains(&byte)
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.:->".contains(&byte)
         })
 }
 

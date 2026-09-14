@@ -15,7 +15,7 @@ export function fixture() {
   const requests = [],
     environments = [],
     planes = new Map();
-  const testKey = "WaveformUiTestEnvironmentKey1234";
+  const testKey = "ask_" + "A".repeat(43);
   function plane(key) {
     if (!planes.has(key))
       planes.set(key, {
@@ -64,7 +64,7 @@ export function fixture() {
         },
       });
     if (path === "/api/v1/auth/login") {
-      if (body.slt !== "oac_waveform_ui_fixture")
+      if (body.slt !== "oac_waveform_ui_fixture" && !(key && body.slt === "test-carbon"))
         return error("invalid_token", 401);
       return Response.json({
         access_token: key ? "oat_test_fixture" : "oat_production_fixture",

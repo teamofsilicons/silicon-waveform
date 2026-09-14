@@ -212,7 +212,7 @@ test("environment create, list, inspect, retrieve key, rotate, delete and restor
   await s.call(path + "/restore", {});
   assert.equal((await (await s.call(path)).json()).deleted_at, null);
 });
-test("clean uses only the selected root and rejects production", async () => {
+test("clean requires a signed-in test actor and rejects production", async () => {
   const s = setup();
   await s.login();
   assert.equal(
@@ -220,6 +220,8 @@ test("clean uses only the selected root and rejects production", async () => {
     400,
   );
   await s.call("/api/session/environment", { key: s.fake.testKey });
+  assert.equal((await s.call("/api/v1/testing-environment/clean", {})).status,401);
+  await s.login();
   assert.equal(
     (await s.call("/api/v1/testing-environment/clean", {})).status,
     200,
@@ -229,7 +231,7 @@ test("clean uses only the selected root and rejects production", async () => {
     request.headers.get("x-testing-environment-key"),
     s.fake.testKey,
   );
-  assert.equal(request.headers.get("authorization"), null);
+  assert.match(request.headers.get("authorization"), /^Bearer /);
 });
 test("IAM handoff validates state and scrubs the code from the final URL", async () => {
   const s = setup();
@@ -392,4 +394,15 @@ test("voice catalog, account defaults, per-request overrides and test isolation"
     (await (await s.call("/api/v1/preferences")).json()).voice_profile,
     "puck",
   );
+});
+
+test("IAM app_secret selects a sandbox and public IDs remain test-only", async () => {
+  const s=setup();
+  await s.call("/api/session");
+  assert.equal((await s.call("/api/session/login",{slt:"test-carbon"})).status,400);
+  assert.equal((await s.call("/api/session/environment",{key:s.fake.testKey})).status,200);
+  assert.equal((await s.call("/api/session/login",{slt:"test-carbon"})).status,200);
+  const state=await (await s.call("/api/session")).json();
+  assert.equal(state.plane,"test");assert.equal(state.user.public_id,"test-carbon");
+  assert.ok(!JSON.stringify(state).includes(s.fake.testKey));
 });

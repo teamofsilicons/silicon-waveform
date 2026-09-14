@@ -22,8 +22,18 @@ use crate::{
     },
 };
 
+/// Server-verified destination for a caller-owned copy of STT source media.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct SourceTarget {
+    pub(crate) org_id: String,
+    pub(crate) app_id: String,
+    pub(crate) actor_id: String,
+    pub(crate) folder_id: uuid::Uuid,
+    pub(crate) folder_path: String,
+}
+
 #[derive(Clone)]
-pub(super) struct BriefcaseSdkReader {
+pub(crate) struct BriefcaseSdkReader {
     settings: BriefcaseSettings,
     iam: Arc<dyn IamPort>,
 }
@@ -41,7 +51,7 @@ struct ReadAuthority<'a> {
 }
 
 impl BriefcaseSdkReader {
-    pub(super) fn new(settings: BriefcaseSettings, iam: Arc<dyn IamPort>) -> Self {
+    pub(crate) fn new(settings: BriefcaseSettings, iam: Arc<dyn IamPort>) -> Self {
         Self { settings, iam }
     }
 
@@ -69,7 +79,7 @@ impl BriefcaseSdkReader {
         &self,
         authority: &ReadAuthority<'_>,
         manifest: &DelegatedManifest<T>,
-    ) -> Result<OboProof, BriefcaseError> {
+    ) -> Result<(OboProof, Option<EnvironmentKey>), BriefcaseError> {
         let result = self
             .iam
             .delegate(DelegationRequest {
@@ -105,7 +115,139 @@ impl BriefcaseSdkReader {
         {
             return Err(BriefcaseError::Unauthorized);
         }
-        OboProof::new(result.proof.expose_secret()).map_err(map_sdk)
+        let environment = result
+            .testing_secret
+            .as_ref()
+            .map(|s| EnvironmentKey::new(secrecy::ExposeSecret::expose_secret(s)))
+            .transpose()
+            .map_err(map_sdk)?;
+        Ok((
+            OboProof::new(result.proof.expose_secret()).map_err(map_sdk)?,
+            environment,
+        ))
+    }
+
+    /// Materialize the caller's reserved private application folder, then
+    /// resolve its actual identity through a fresh, exactly bound listing.
+    pub(crate) async fn prepare_source_target(
+        &self,
+        actor: &AuthorizedActor,
+        public_id: &str,
+        token: AccessToken,
+        request_id: RequestId,
+        environment: Option<EnvironmentKey>,
+    ) -> Result<SourceTarget, BriefcaseError> {
+        if !valid_public_id(public_id)
+            || actor
+                .expires_at
+                .is_some_and(|expiry| expiry <= time::OffsetDateTime::now_utc())
+        {
+            return Err(BriefcaseError::Unauthorized);
+        }
+        let token = Some(token);
+        let authority = ReadAuthority {
+            actor,
+            token: &token,
+            request_id,
+        };
+        let client = self
+            .connect(actor.organization_id.as_str(), environment)
+            .await?;
+        // Empty-path delegated list initializes only the current actor's native app folder.
+        self.source_list(
+            &client,
+            &authority,
+            DelegatedListEntries {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let parent = format!("apps/{}/private", self.settings.app_id);
+        let expected_path = format!("{parent}/{public_id}");
+        let expected_kind = match actor.actor.kind {
+            crate::domain::identity::ActorKind::Carbon => briefcase_client::ActorType::Carbon,
+            crate::domain::identity::ActorKind::Silicon => briefcase_client::ActorType::Silicon,
+        };
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        for _ in 0..100 {
+            let page = self
+                .source_list(
+                    &client,
+                    &authority,
+                    DelegatedListEntries {
+                        path: Some(parent.clone()),
+                        cursor,
+                        limit: Some(100),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            for entry in page.items {
+                if entry.path != expected_path {
+                    continue;
+                }
+                if entry.org_id != actor.organization_id.as_str()
+                    || !entry.is_folder()
+                    || entry.id.is_nil()
+                    || entry.deleted_at.is_some()
+                    || entry.origin_app_id.as_deref() != Some(self.settings.app_id.as_str())
+                    || entry.root_type != briefcase_client::RootType::Private
+                    || !entry.allows(briefcase_client::EffectiveAccess::Write)
+                    || entry.owner.as_ref().is_none_or(|owner| {
+                        owner.id != public_id || owner.actor_type != expected_kind
+                    })
+                    || self.path(
+                        &BriefcaseFileUrl::new(entry.permanent_url)
+                            .map_err(|_| BriefcaseError::InvalidResponse)?,
+                        &entry.org_id,
+                    )? != expected_path
+                {
+                    return Err(BriefcaseError::InvalidResponse);
+                }
+                return Ok(SourceTarget {
+                    org_id: entry.org_id,
+                    app_id: self.settings.app_id.clone(),
+                    actor_id: public_id.to_owned(),
+                    folder_id: entry.id,
+                    folder_path: entry.path,
+                });
+            }
+            match page.next_cursor {
+                None => return Err(BriefcaseError::NotFound),
+                Some(next) if seen.insert(next.clone()) => cursor = Some(next),
+                Some(_) => return Err(BriefcaseError::InvalidResponse),
+            }
+        }
+        Err(BriefcaseError::InvalidResponse)
+    }
+
+    async fn source_list(
+        &self,
+        client: &Client,
+        authority: &ReadAuthority<'_>,
+        request: DelegatedListEntries,
+    ) -> Result<briefcase_client::EntryPage, BriefcaseError> {
+        let manifest = request.prepare().map_err(map_sdk)?;
+        let (proof, discovered_environment) = self.proof(authority, &manifest).await?;
+        let scoped;
+        let selected = if discovered_environment.is_some() {
+            scoped = self
+                .connect(
+                    authority.actor.organization_id.as_str(),
+                    discovered_environment,
+                )
+                .await?;
+            &scoped
+        } else {
+            client
+        };
+        let app = ApplicationId::new(&self.settings.app_id).map_err(map_sdk)?;
+        selected
+            .list_entries_on_behalf_of(&app, proof, &manifest)
+            .await
+            .map_err(map_sdk)
     }
 
     // Decode URL segments exactly once. A path is a lookup key, never a URL to fetch.
@@ -160,7 +302,19 @@ impl BriefcaseSdkReader {
             }
             .prepare()
             .map_err(map_sdk)?;
-            let proof = self.proof(authority, &manifest).await?;
+            let (proof, discovered_environment) = self.proof(authority, &manifest).await?;
+            let scoped;
+            let client = if discovered_environment.is_some() {
+                scoped = self
+                    .connect(
+                        authority.actor.organization_id.as_str(),
+                        discovered_environment,
+                    )
+                    .await?;
+                &scoped
+            } else {
+                client
+            };
             let page = client
                 .list_entries_on_behalf_of(&app, proof, &manifest)
                 .await
@@ -220,7 +374,19 @@ impl BriefcaseSdkReader {
         }
         .prepare()
         .map_err(map_sdk)?;
-        let proof = self.proof(authority, &manifest).await?;
+        let (proof, discovered_environment) = self.proof(authority, &manifest).await?;
+        let scoped;
+        let client = if discovered_environment.is_some() {
+            scoped = self
+                .connect(
+                    authority.actor.organization_id.as_str(),
+                    discovered_environment,
+                )
+                .await?;
+            &scoped
+        } else {
+            &client
+        };
         let app = ApplicationId::new(&self.settings.app_id).map_err(map_sdk)?;
         client
             .read_file_on_behalf_of(&app, proof, &manifest)
@@ -295,6 +461,15 @@ impl BriefcaseSdkReader {
         .await
         .map_err(|_| BriefcaseError::Timeout)?
     }
+}
+
+fn valid_public_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !matches!(value, "." | "..")
+        && !value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\'))
 }
 
 fn map_sdk(error: briefcase_client::Error) -> BriefcaseError {
