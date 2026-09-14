@@ -141,9 +141,13 @@ cargo deny check
 ```
 
 The speech regressions use the real CLI against local mock services and PostgreSQL.
-Build and test with the same `CARGO_TARGET_DIR`, or set `WAVEFORM_TEST_CLI` to the
-built executable. Without either override they use `cli/target/debug/waveform`.
-A missing binary fails before creating database state or mock expectations.
+Build and test with the same absolute `CARGO_TARGET_DIR`, or set `WAVEFORM_TEST_CLI`
+to an absolute executable path. The explicit executable takes precedence; relative
+overrides are rejected because Cargo's invocation directory may differ from the
+test's working directory. Without either override they use `cli/target/debug/waveform`.
+A missing binary fails before creating database state or mock expectations. Each
+CLI subprocess uses the fixture's isolated `HOME` and `SILICON_HOME`, and inherited
+`WAVEFORM_TEST` / `WAVEFORM_ORG` cannot change its selected plane.
 
 ## Current dependency-contract blockers
 
