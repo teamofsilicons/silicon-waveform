@@ -20,9 +20,9 @@ when a login code or refresh token has already been consumed. Duplicate or inval
 keys are rejected before contacting IAM. Omitting the header remains supported,
 but generates a new key per request and cannot recover a prior request's receipt.
 
-The backend, Rust client and CLI use `silicon-iam-client` 1.3.0. Production
+The backend uses `silicon-iam-client` 1.8.0; the Rust client and CLI retain their existing SDK versions. Production
 introspection, test-plane authorization, login, webhooks and storage proof
-exchanges use the official SDK. Storage uses `briefcase-client` 0.2.0.
+exchanges use the official SDK. Storage uses `briefcase-client` 1.1.0, with mandatory API contract negotiation.
 For bearer speech, Waveform mints a separate proof for every delegated listing
 page, file read and upload. Proofs bind the SDK's exact request bytes and are
 never persisted in jobs or idempotency responses. See `testing.md` for the
@@ -35,3 +35,5 @@ issues to applications for downstream storage delegation. Organization,
 application audience, actor identity, expiry, and test-plane checks still apply.
 Deployments may explicitly configure a stricter issued scope through
 `WAVEFORM_IAM_TTS_ACTION` and `WAVEFORM_IAM_STT_ACTION`.
+
+The recipient catalog is bound to its canonical application ID and owning organization. Its owner may differ from the member’s selected storage organization. Every signed storage exchange carries that currently IAM-authorized `org_id`, the exact subject token, recipient, endpoint, method and body digest. The storage response must still match the selected organization and requested file.

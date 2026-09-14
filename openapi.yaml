@@ -1060,7 +1060,7 @@ components:
         iam_environment_id: { type: string, format: uuid }
         iam_environment_key: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
         app_secret: { type: string, minLength: 1, maxLength: 512 }
-        briefcase_environment_key: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
+        briefcase_environment_key: { type: string, minLength: 47, maxLength: 47, pattern: '^ask_[A-Za-z0-9_-]{43}$', description: 'Imported Briefcase application secret from the same IAM testing world.' }
     CreatedTestingEnvironment:
       allOf:
         - $ref: '#/components/schemas/TestingEnvironment'

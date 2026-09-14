@@ -39,7 +39,7 @@ pub struct AudioUpload<'a> {
     pub organization: &'a str,
     /// Fresh Briefcase-audience proof issued by IAM for this exact upload.
     pub delegated_authorization: &'a DelegatedAuthorization,
-    /// Mandatory paired Briefcase root for a test-plane request.
+    /// Paired Briefcase imported application secret for a test-plane request.
     pub environment: Option<EnvironmentKey>,
     /// Collision-resistant final name used in the proof metadata.
     pub filename: &'a GeneratedAudioFileName,

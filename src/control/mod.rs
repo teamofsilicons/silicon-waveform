@@ -274,9 +274,9 @@ impl ControlState {
         identity: &Identity,
     ) -> Result<AuthorizedActor, ControlError> {
         let actor_kind = match identity.authority.actor_type {
-            models::ApplicationAuthorizationActorType::Carbon => ActorKind::Carbon,
-            models::ApplicationAuthorizationActorType::Silicon => ActorKind::Silicon,
-            models::ApplicationAuthorizationActorType::Other(_) => {
+            Some(models::ApplicationAuthorizationActorType::Carbon) => ActorKind::Carbon,
+            Some(models::ApplicationAuthorizationActorType::Silicon) => ActorKind::Silicon,
+            Some(models::ApplicationAuthorizationActorType::Other(_)) | None => {
                 return Err(ControlError::forbidden());
             }
         };

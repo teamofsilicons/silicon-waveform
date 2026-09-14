@@ -1,0 +1,13 @@
+# Briefcase speech-storage compatibility
+
+The hosted Interface test-world STT attempts at **17:16:56 UTC** and **17:18:42 UTC** returned `dependency_unavailable` in 251 ms and 236 ms. Read-only container telemetry shows each failure immediately after a successful Briefcase `GET /api/version`, before any delegated file request or speech-provider attempt. Waveform was running reconciled release `0c23510f1527d5ca1fe01d7bd5ad29821612a56a`, whose lockfile selects `briefcase-client` 1.0.3; Briefcase was running `0c7174c`.
+
+The public [Briefcase catalog](https://backend.briefcase.teamofsilicons.com/api/version), captured in `tests/fixtures/briefcase-v1.1.0.json`, now advertises version 1.1.0 for five permanent-link/access operations. The older SDK expects version 1.0.0 for those operations and rejects the complete catalog during connection. This is a dependency contract mismatch, not a speech-provider outage or malformed audio request.
+
+The fix selects `briefcase-client` 1.1.0 and retains mandatory negotiation. IAM 1.8.0 supplies explicit `org_id` on signed delegation requests. The recipient catalog remains bound to its canonical application ID and owner; that owner need not equal the member's independently authorized storage organization. Actor, organization, selected world, audience, endpoint, method, exact body digest, proof expiry and current file access remain checked. Test pairing uses the imported Briefcase `ask_` secret in `X-Briefcase-App-Secret`; an IAM root retains its separate format and purpose. Missing actor disclosure is not converted into authority.
+
+Validation passed: 153 ordinary backend/contract checks, all 8 control HTTP/database checks and all 8 PostgreSQL transaction checks, strict Clippy, formatting and OpenAPI parsing. Local checks use disposable PostgreSQL, loopback IAM/storage servers, real SDK transports and deterministic speech fixtures. They cover the published catalog, stale-contract rejection, Carbon/Silicon cross-organization delegated reads, exact single-use request proofs, transcript replay with fresh access, removed-file denial, and wrong-world/organization/audience or undisclosed/revoked actor rejection. No paid speech provider or production record is used.
+
+Operational evidence: Waveform SSM `554da18c-8af4-44fa-9880-0c1744605df8`; Briefcase SSM `5236959d-0eb4-4a1b-b08e-1c04472b79f6`. Both succeeded and emitted only allowlisted telemetry metadata, without credentials, headers, request bodies or audio.
+
+This PR targets GitHub main. The deployed reconciliation branch also contains newer app discovery, telemetry and testing features; a release must retain those changes. No deployment is performed by this fix, and a fresh hosted STT walkthrough remains required after rollout.

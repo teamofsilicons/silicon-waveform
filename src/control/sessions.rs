@@ -86,9 +86,9 @@ pub(super) async fn login(
         .login(&state.app_id, &body.slt, &mutation)
         .await
         .map_err(ControlError::iam)?;
-    if let Some(org) = &tokens.org_id {
+    if let (Some(org), Some(actor)) = (&tokens.org_id, &tokens.actor) {
         state
-            .ensure_voice_default(plane.id, org, tokens.actor.principal_id)
+            .ensure_voice_default(plane.id, org, actor.principal_id)
             .await?;
     }
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(tokens)).into_response())

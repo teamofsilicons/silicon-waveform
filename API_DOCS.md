@@ -30,7 +30,7 @@ All current generation requests are synchronous and hold the connection until su
 
 Production bearer TTS and test-plane TTS uploads are connected to the official
 IAM and Briefcase SDKs. STT delegated source reads and replay access checks use
-Briefcase 0.2.0. Local protocol tests use mocked upstreams; deployed paired
+Briefcase 1.1.0. Local protocol tests use mocked upstreams; deployed paired
 environment verification remains outstanding.
 
 ## IAM discovery

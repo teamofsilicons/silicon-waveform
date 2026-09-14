@@ -214,7 +214,7 @@ async fn session_retries_preserve_the_iam_receipt_in_both_planes() -> TestResult
         json!({
             "name":"session-retries", "iam_environment_id":Uuid::new_v4(),
             "iam_environment_key":"I".repeat(32), "app_secret":"test-environment-app-secret",
-            "briefcase_environment_key":"B".repeat(32)
+            "briefcase_environment_key":format!("ask_{}", "B".repeat(43))
         }),
     )
     .await?;
@@ -644,7 +644,7 @@ async fn sandbox_creation_and_atomic_clean_preserve_the_environment() -> TestRes
         Some("oat_fixture"),
         json!({
             "name":"local-sandbox", "iam_environment_id":iam_environment_id,
-            "iam_environment_key":"I".repeat(32), "app_secret":"test-environment-app-secret", "briefcase_environment_key":"B".repeat(32)
+            "iam_environment_key":"I".repeat(32), "app_secret":"test-environment-app-secret", "briefcase_environment_key":format!("ask_{}", "B".repeat(43))
         }),
     )
     .await?;

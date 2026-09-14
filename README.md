@@ -15,7 +15,7 @@ append-only [`decisions.md`](./decisions.md).
 Bearer TTS and test-plane TTS use official IAM proof exchange and Briefcase
 uploads. Personal provider keys are selected per account, and CLI sessions
 are isolated by server and test plane. STT source reads and TTS/STT replay
-access checks use the Briefcase 0.2 delegated API. Inbound OBO speech remains
+access checks use the Briefcase 1.1 delegated API. Inbound OBO speech remains
 unavailable because IAM does not issue a downstream subject token from a
 consumed proof. See [the implementation checklist](./docs/IMPLEMENTATION.md) for
 remaining work and the distinction between local mocks and deployed tests.

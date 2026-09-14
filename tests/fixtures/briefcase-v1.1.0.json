@@ -1,0 +1,371 @@
+{
+  "service": "silicon-briefcase",
+  "selected_api_version": "v1",
+  "supported_api_versions": [
+    "v1"
+  ],
+  "contract_version": "1.1.0",
+  "build": "1.1.0",
+  "operations": [
+    {
+      "id": "reserveDelegatedUpload",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/obo/uploads/reserve"
+    },
+    {
+      "id": "commitDelegatedUpload",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/obo/uploads/commit"
+    },
+    {
+      "id": "getDelegatedUploadStatus",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/obo/uploads/status"
+    },
+    {
+      "id": "cancelDelegatedUpload",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/obo/uploads/cancel"
+    },
+    {
+      "id": "transferDelegatedUpload",
+      "version": "1.0.0",
+      "method": "PUT",
+      "path": "/obo/uploads/{upload_id}/content"
+    },
+    {
+      "id": "readIamInfo",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/iam"
+    },
+    {
+      "id": "readLoginStatus",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/auth/status"
+    },
+    {
+      "id": "readApiVersion",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/version"
+    },
+    {
+      "id": "exchangeShortLivedToken",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/auth/slt"
+    },
+    {
+      "id": "refreshApplicationSession",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/auth/refresh"
+    },
+    {
+      "id": "listTestingEnvironments",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/organizations/{org_id}/testing-environments"
+    },
+    {
+      "id": "createTestingEnvironment",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/organizations/{org_id}/testing-environments"
+    },
+    {
+      "id": "getTestingEnvironment",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/organizations/{org_id}/testing-environments/{environment_id}"
+    },
+    {
+      "id": "updateTestingEnvironment",
+      "version": "1.0.0",
+      "method": "PATCH",
+      "path": "/organizations/{org_id}/testing-environments/{environment_id}"
+    },
+    {
+      "id": "deleteTestingEnvironment",
+      "version": "1.0.0",
+      "method": "DELETE",
+      "path": "/organizations/{org_id}/testing-environments/{environment_id}"
+    },
+    {
+      "id": "getTestingEnvironmentKey",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/organizations/{org_id}/testing-environments/{environment_id}/key"
+    },
+    {
+      "id": "replaceTestingEnvironmentIamPairing",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/organizations/{org_id}/testing-environments/{environment_id}/iam-pairings"
+    },
+    {
+      "id": "cleanTestingEnvironment",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/organizations/{org_id}/testing-environments/{environment_id}/cleanings"
+    },
+    {
+      "id": "restoreTestingEnvironment",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/organizations/{org_id}/testing-environments/{environment_id}/restorations"
+    },
+    {
+      "id": "describeCurrentTestingEnvironment",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/testing-environment"
+    },
+    {
+      "id": "cleanCurrentTestingEnvironment",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/testing-environment/cleanings"
+    },
+    {
+      "id": "listEntries",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/entries"
+    },
+    {
+      "id": "createFolder",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/entries"
+    },
+    {
+      "id": "getEntry",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/entries/{entry_id}"
+    },
+    {
+      "id": "updateEntry",
+      "version": "1.0.0",
+      "method": "PATCH",
+      "path": "/entries/{entry_id}"
+    },
+    {
+      "id": "moveEntryToBin",
+      "version": "1.0.0",
+      "method": "DELETE",
+      "path": "/entries/{entry_id}"
+    },
+    {
+      "id": "readEntryContent",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/entries/{entry_id}/content"
+    },
+    {
+      "id": "downloadEntry",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/entries/{entry_id}/download"
+    },
+    {
+      "id": "resolvePermanentUrl",
+      "version": "1.1.0",
+      "method": "GET",
+      "path": "/org/{org_id}/{path}"
+    },
+    {
+      "id": "uploadFile",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/uploads"
+    },
+    {
+      "id": "createFileOnBehalfOfMember",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/obo/files"
+    },
+    {
+      "id": "createFolderOnBehalfOfMember",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/obo/folders/create"
+    },
+    {
+      "id": "listEntriesOnBehalfOfMember",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/obo/entries/list"
+    },
+    {
+      "id": "readFileOnBehalfOfMember",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/obo/files/read"
+    },
+    {
+      "id": "trashEntryOnBehalfOfMember",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/obo/entries/trash"
+    },
+    {
+      "id": "listPermissions",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/entries/{entry_id}/permissions"
+    },
+    {
+      "id": "grantPermission",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/entries/{entry_id}/permissions"
+    },
+    {
+      "id": "revokePermission",
+      "version": "1.0.0",
+      "method": "DELETE",
+      "path": "/entries/{entry_id}/permissions/{grant_id}"
+    },
+    {
+      "id": "inspectEffectivePermissions",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/permissions/effective"
+    },
+    {
+      "id": "searchFiles",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/search"
+    },
+    {
+      "id": "submitTelemetry",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/telemetry"
+    },
+    {
+      "id": "submitReport",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/reports"
+    },
+    {
+      "id": "listNotifications",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/notifications"
+    },
+    {
+      "id": "readNotifications",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/notifications/read"
+    },
+    {
+      "id": "listEntryActivity",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/entries/{entry_id}/activity"
+    },
+    {
+      "id": "listVersions",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/entries/{entry_id}/versions"
+    },
+    {
+      "id": "restoreVersion",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/entries/{entry_id}/versions/{version_id}/restore"
+    },
+    {
+      "id": "readOrganizationUsage",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/usage"
+    },
+    {
+      "id": "listBin",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/bin"
+    },
+    {
+      "id": "restoreEntry",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/bin/{entry_id}/restore"
+    },
+    {
+      "id": "configureOrganizationBucket",
+      "version": "1.0.0",
+      "method": "PUT",
+      "path": "/storage/configuration"
+    },
+    {
+      "id": "listInvitations",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/entries/{entry_id}/invitations"
+    },
+    {
+      "id": "createInvitation",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/entries/{entry_id}/invitations"
+    },
+    {
+      "id": "revokeInvitation",
+      "version": "1.0.0",
+      "method": "DELETE",
+      "path": "/entries/{entry_id}/invitations/{grant_id}"
+    },
+    {
+      "id": "readLinkAccess",
+      "version": "1.1.0",
+      "method": "GET",
+      "path": "/entries/{entry_id}/link-access"
+    },
+    {
+      "id": "setLinkAccess",
+      "version": "1.1.0",
+      "method": "PUT",
+      "path": "/entries/{entry_id}/link-access"
+    },
+    {
+      "id": "listEntryLogs",
+      "version": "1.0.0",
+      "method": "GET",
+      "path": "/entries/{entry_id}/logs"
+    },
+    {
+      "id": "readPublicEntry",
+      "version": "1.1.0",
+      "method": "GET",
+      "path": "/public/{org_id}/{path}"
+    },
+    {
+      "id": "inviteOnBehalfOfMember",
+      "version": "1.0.0",
+      "method": "POST",
+      "path": "/obo/invitations"
+    },
+    {
+      "id": "setLinkAccessOnBehalfOfMember",
+      "version": "1.1.0",
+      "method": "POST",
+      "path": "/obo/link-access"
+    }
+  ]
+}

@@ -63,7 +63,8 @@ pub(super) async fn create(
         return Err(ControlError::bad_request("invalid_environment_name"));
     }
     validate_key(&body.iam_environment_key)?;
-    validate_key(&body.briefcase_environment_key)?;
+    briefcase_client::EnvironmentKey::new(&body.briefcase_environment_key)
+        .map_err(|_| ControlError::bad_request("briefcase_test_app_secret_required"))?;
     if body.app_secret.trim().is_empty()
         || body.app_secret.len() > 512
         || body
