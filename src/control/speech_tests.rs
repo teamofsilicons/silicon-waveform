@@ -290,6 +290,12 @@ fn cli_binary() -> Result<std::path::PathBuf, std::io::Error> {
             .join("debug")
             .join(format!("waveform{}", std::env::consts::EXE_SUFFIX))
     };
+    if !binary.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CLI test paths must be absolute: set WAVEFORM_TEST_CLI to an absolute executable path, or CARGO_TARGET_DIR to an absolute directory. Relative paths depend on Cargo's invocation directory and cannot be inferred here.",
+        ));
+    }
     if !binary.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -312,8 +318,10 @@ async fn cli_command(
         .arg(url)
         .args(args)
         .env("HOME", home)
+        .env("SILICON_HOME", home)
         .env("WAVEFORM_AUTO_UPDATE", "off")
         .env_remove("WAVEFORM_ORG")
+        .env_remove("WAVEFORM_TEST")
         .kill_on_drop(true)
         .output()
         .await?;
