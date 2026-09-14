@@ -217,6 +217,7 @@ paths:
       summary: Exchange an IAM SLT for Waveform session tokens
       security: []
       parameters:
+        - $ref: '#/components/parameters/SessionIdempotencyKey'
         - $ref: '#/components/parameters/TestingEnvironmentKey'
       requestBody:
         required: true
@@ -242,6 +243,7 @@ paths:
       summary: Exchange an IAM refresh token for a new token pair
       security: []
       parameters:
+        - $ref: '#/components/parameters/SessionIdempotencyKey'
         - $ref: '#/components/parameters/TestingEnvironmentKey'
       requestBody:
         required: true
@@ -267,6 +269,7 @@ paths:
       summary: Revoke an IAM access or refresh token
       security: []
       parameters:
+        - $ref: '#/components/parameters/SessionIdempotencyKey'
         - $ref: '#/components/parameters/TestingEnvironmentKey'
       requestBody:
         required: true
@@ -686,6 +689,19 @@ components:
         minLength: 1
         maxLength: 64
         pattern: '^[A-Za-z0-9_-]+$'
+    SessionIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Send one stable key per login, refresh or logout operation and reuse it
+        for retries. Waveform forwards it unchanged to IAM so a retry can recover
+        the original result. Without this header a new key is generated per request.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 255
+        pattern: '^[!-~]+$'
     IdempotencyKey:
       name: Idempotency-Key
       in: header

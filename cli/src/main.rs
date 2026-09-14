@@ -16,6 +16,7 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(
     name = "waveform",
+    bin_name = "waveform",
     version,
     about = "Silicon Waveform: speech for Carbons and Silicons",
     after_help = "Start: waveform iam --json → waveform login SLT → waveform tts --help\nDocs: https://docs.waveform.teamofsilicons.com\nRepository: https://github.com/teamofsilicons/silicon-waveform\nRust: https://crates.io/crates/silicon-waveform-client\nUse waveform docs TOPIC for bundled guides; every branch accepts --help.",
@@ -23,7 +24,7 @@ use std::{
 )]
 struct Args {
     /// Select an IAM test app_secret (ask_…) or a previously saved sandbox UUID.
-    #[arg(long, value_name = "APP_SECRET_OR_ID", global = true)]
+    #[arg(long, value_name = "APP_SECRET_OR_ID", global = true, env = "WAVEFORM_TEST", hide_env_values = true)]
     test: Option<String>,
     /// Read an IAM test app_secret from a file (use - for stdin).
     #[arg(long, global = true, conflicts_with = "test")]

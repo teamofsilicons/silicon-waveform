@@ -42,7 +42,11 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --all-features
       - name: Run PostgreSQL transaction tests
-        run: cargo test --test postgres_idempotency -- --ignored --test-threads=1
+        run: |
+          cargo build --manifest-path cli/Cargo.toml --locked
+          cargo test --test postgres_idempotency -- --ignored --test-threads=1
+          cargo test --lib control::tests::session_retries_preserve_the_iam_receipt_in_both_planes -- --ignored
+          cargo test --lib control::tests::speech_tests -- --ignored --test-threads=1
       - name: Check Rust client and CLI
         run: |
           cargo fmt --manifest-path client/Cargo.toml -- --check

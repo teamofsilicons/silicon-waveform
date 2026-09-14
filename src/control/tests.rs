@@ -148,6 +148,181 @@ async fn iam_discovery_is_public_and_exposes_only_public_configuration() -> Test
 }
 
 #[tokio::test]
+async fn session_mutations_reject_invalid_or_duplicate_keys_before_iam() -> TestResult {
+    let pool = PgPoolOptions::new().connect_lazy("postgres://localhost/unused")?;
+    let iam = MockServer::start().await;
+    let app = router(fixture(pool, &iam)?);
+    for (route, body) in [
+        ("login", json!({"slt":"oac_fixture"})),
+        ("refresh", json!({"refresh_token":"ort_fixture"})),
+        ("logout", json!({"token":"ort_fixture"})),
+    ] {
+        for key in [
+            "short".to_owned(),
+            "a".repeat(256),
+            "contains a space".to_owned(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/auth/{route}"))
+                        .header("content-type", "application/json")
+                        .header("idempotency-key", key)
+                        .body(Body::from(body.to_string()))?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/auth/{route}"))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "first-operation-key")
+                    .header("idempotency-key", "second-operation-key")
+                    .body(Body::from(body.to_string()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert!(
+        iam.received_requests()
+            .await
+            .ok_or("requests unavailable")?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+#[allow(clippy::too_many_lines)]
+async fn session_retries_preserve_the_iam_receipt_in_both_planes() -> TestResult {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (pool, schema) = database().await?;
+    let iam = MockServer::start().await;
+    let app = router(fixture(pool.clone(), &iam)?);
+    Mock::given(path("/api/v1/oauth/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(snapshot(Uuid::new_v4())))
+        .mount(&iam)
+        .await;
+    let (status, created) = call(
+        &app,
+        "POST",
+        "/api/v1/testing-environments",
+        Some("oat_fixture"),
+        json!({
+            "name":"session-retries", "iam_environment_id":Uuid::new_v4(),
+            "iam_environment_key":"I".repeat(32), "app_secret":"test-environment-app-secret",
+            "briefcase_environment_key":"B".repeat(32)
+        }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let root = created["key"].as_str().ok_or("environment key missing")?;
+    for testing in [false, true] {
+        for (route, body, upstream, success) in [
+            (
+                "login",
+                json!({"slt":"oac_fixture"}),
+                "/api/v1/app-auth/tokens",
+                StatusCode::OK,
+            ),
+            (
+                "refresh",
+                json!({"refresh_token":"ort_fixture"}),
+                "/api/v1/app-auth/tokens",
+                StatusCode::OK,
+            ),
+            (
+                "logout",
+                json!({"token":"ort_fixture"}),
+                "/api/v1/oauth/revoke",
+                StatusCode::NO_CONTENT,
+            ),
+        ] {
+            iam.reset().await;
+            let key = format!(
+                "session-{route}-{}-receipt",
+                if testing { "test" } else { "production" }
+            );
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let counter = attempts.clone();
+            let response = if success == StatusCode::NO_CONTENT {
+                ResponseTemplate::new(204)
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token":"oat_saved", "refresh_token":"ort_saved", "token_type":"Bearer",
+                    "expires_in":1800, "scope":"self.identity.read", "org_id":null,
+                    "actor":{"principal_id":Uuid::new_v4(),"type":"carbon","public_id":"tester"}
+                }))
+            };
+            // IAM has processed the operation, but the first response is unavailable.
+            // A repeat with the same key returns its saved receipt.
+            Mock::given(method("POST"))
+                .and(path(upstream))
+                .and(header("idempotency-key", key.as_str()))
+                .respond_with(move |_: &wiremock::Request| {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ResponseTemplate::new(502).set_body_json(
+                            json!({"error":{"code":"unavailable","message":"response lost"}}),
+                        )
+                    } else {
+                        response.clone()
+                    }
+                })
+                .expect(2)
+                .mount(&iam)
+                .await;
+            for expected in [StatusCode::SERVICE_UNAVAILABLE, success] {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/auth/{route}"))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", &key);
+                if testing {
+                    request = request.header("x-testing-environment-key", root);
+                }
+                let result = app
+                    .clone()
+                    .oneshot(request.body(Body::from(body.to_string()))?)
+                    .await?;
+                assert_eq!(result.status(), expected, "{route}, testing={testing}");
+                if expected == StatusCode::OK {
+                    let tokens: Value =
+                        serde_json::from_slice(&to_bytes(result.into_body(), 65536).await?)?;
+                    assert_eq!(tokens["refresh_token"], "ort_saved");
+                }
+            }
+            let requests = iam
+                .received_requests()
+                .await
+                .ok_or("requests unavailable")?;
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].body, requests[1].body);
+            assert_eq!(requests[0].headers, requests[1].headers);
+            assert_eq!(
+                requests[0]
+                    .headers
+                    .contains_key("x-testing-environment-key"),
+                testing
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            iam.verify().await;
+        }
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
 #[allow(clippy::too_many_lines)]
 async fn login_settings_secrets_webhooks_and_online_revocation() -> TestResult {

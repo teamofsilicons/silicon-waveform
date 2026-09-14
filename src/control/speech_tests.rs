@@ -282,13 +282,36 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
     Ok(())
 }
 
+fn cli_binary() -> Result<std::path::PathBuf, std::io::Error> {
+    let binary = if let Some(path) = std::env::var_os("WAVEFORM_TEST_CLI") {
+        std::path::PathBuf::from(path)
+    } else {
+        let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+            || std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cli/target"),
+            std::path::PathBuf::from,
+        );
+        target
+            .join("debug")
+            .join(format!("waveform{}", std::env::consts::EXE_SUFFIX))
+    };
+    if !binary.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "Waveform CLI test binary is missing at {}. Run cargo build --manifest-path cli/Cargo.toml with the same CARGO_TARGET_DIR, or set WAVEFORM_TEST_CLI to the built binary.",
+                binary.display()
+            ),
+        ));
+    }
+    Ok(binary)
+}
+
 async fn cli_command(
     home: &std::path::Path,
     url: &str,
     args: &[&str],
 ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
-    let binary = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cli/target/debug/waveform");
-    let output = tokio::process::Command::new(binary)
+    let output = tokio::process::Command::new(cli_binary()?)
         .arg("--url")
         .arg(url)
         .args(args)
@@ -305,6 +328,8 @@ async fn cli_command(
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL and cargo build --manifest-path cli/Cargo.toml"]
 #[allow(clippy::too_many_lines)]
 async fn real_cli_keeps_production_and_test_logins_separate() -> TestResult {
+    // Check before creating mock expectations: teardown must not hide a missing binary.
+    cli_binary()?;
     let (pool, schema) = database().await?;
     let iam = MockServer::start().await;
     let state = fixture(pool.clone(), &iam)?;
@@ -403,6 +428,7 @@ struct ReadLedger {
 #[tokio::test]
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL and cargo build --manifest-path cli/Cargo.toml"]
 async fn paired_stt_and_replays_work_for_carbons_and_silicons() -> TestResult {
+    cli_binary()?;
     for kind in ["carbon", "silicon"] {
         paired_read_roundtrip(kind).await?;
     }
