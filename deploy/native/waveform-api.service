@@ -1,0 +1,41 @@
+[Unit]
+Description=Waveform native API
+Requires=waveform-postgres.service
+After=network-online.target waveform-postgres.service
+PartOf=waveform-postgres.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=waveform
+Group=waveform
+EnvironmentFile=/etc/waveform/native.env
+ExecStartPre=+/usr/bin/python3 /opt/waveform/current/prepare.py
+ExecStart=/opt/waveform/current/bin/waveform-api
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=60
+KillSignal=SIGTERM
+RuntimeDirectory=waveform
+RuntimeDirectoryMode=0750
+StateDirectory=waveform-native
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/waveform-native
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+UMask=0077
+MemoryMax=768M
+TasksMax=256
+ReadWritePaths=/var/lib/waveform-native /run/waveform
+BindReadOnlyPaths=-/run/waveform/hosts:/etc/hosts
+
+[Install]
+WantedBy=multi-user.target
