@@ -58,7 +58,7 @@ enum Command {
         #[arg(long)]
         idempotency: Option<String>,
     },
-    /// Manage the unattended hourly updater. Install it once after installing the CLI.
+    /// Inspect or stop the legacy updater. Honeycomb manages installation and updates.
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,

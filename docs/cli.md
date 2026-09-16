@@ -1,6 +1,6 @@
 # Waveform CLI
 
-Install with `curl -fsSL https://docs.waveform.teamofsilicons.com/install.sh | sh`. This includes the hourly updater service. Registry releases can also be installed with `cargo install waveform-cli --locked`. Commands use
+Install with `honeycomb install 'tos>waveform'`. Commands use
 `https://backend.waveform.teamofsilicons.com` by default. Set `WAVEFORM_URL` or
 pass `--url <backend>` before the command to select another server; for local
 development, use `--url http://127.0.0.1:8080`.
@@ -46,15 +46,15 @@ orders are comma-separated provider names; key values are accepted only by
 `provider-key-set` and are never printed or returned by the server.
 
 The `test-env` lifecycle commands remain for legacy environments. New sandboxes are created,
-cleaned and retired in IAM. Read [testing](testing.md) before using those legacy commands.
+cleaned and retired in Honeycomb. Read [testing](testing.md) before using those legacy commands.
 
 ## Automatic CLI maintenance
 
-Install the unattended updater with `waveform daemon install`; check it with
-`waveform daemon status --json`. It runs hourly independently of CLI activity.
-`waveform config auto-update off` disables it; `on` re-enables it. A single-process
-lock and persisted attempt time prevent overlapping checks. Update failures do not
-change command results. The CLI disables the client's lockfile updater.
+Honeycomb manages native CLI installation and updates. Run `honeycomb update`.
+Waveform never independently replaces the CLI. `waveform daemon stop` disables
+a legacy updater; remove its OS service registration when migrating. Legacy
+`daemon start`, `daemon run`, `daemon install`, and `config auto-update on`
+return migration guidance.
 
 `waveform docs TOPIC` opens bundled guides (`start`, `cli`, `api`, `client`, `iam`,
 `testing`, `configuration`). `waveform report 'details' --pr https://github.com/teamofsilicons/silicon-waveform/pull/123`

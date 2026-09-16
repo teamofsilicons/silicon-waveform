@@ -40,22 +40,15 @@ authorization is organization-scoped: `create_test_environment`,
 `test_environments`, `test_environment_detail`, `test_environment_key`,
 `rotate_test_environment_key`, `delete_test_environment`, and
 `restore_test_environment`. `test_environment` and
-`clean_test_environment` operate on a legacy selected plane. Manage new discovered worlds in IAM.
+`clean_test_environment` operate on a legacy selected plane. Manage new discovered worlds in Honeycomb.
 
-## Automatic package maintenance
+## Dependency maintenance
 
-The client checks crates.io after a request finishes, at most once per hour
-per client and its clones. Checks are enabled by default. Use
-`client.with_auto_update(false)` or `WAVEFORM_CLIENT_AUTO_UPDATE=false` to opt out.
-`client.update_status()` exposes the last outcome. A failure leaves the API
-result unchanged, and cancelled attempts retain their hourly throttle.
-
-When a newer `silicon-waveform-client` release exists, maintenance runs
-`cargo update -p silicon-waveform-client --precise <version>` against the
-nearest consuming Cargo manifest. This updates its lockfile for the next build;
-it cannot replace library code already loaded in the current process.
-Unpublished packages or incompatible dependency constraints produce a failed
-maintenance status. No publish or installation was performed during local tests.
+The Rust client is a normal, stateless project dependency. Requests never query
+crates.io, invoke Cargo or modify a consuming project's lockfile. Update the
+dependency explicitly through your project's normal review and build process.
+`with_auto_update` remains a no-op for source compatibility; `update_status()`
+returns `Disabled`. Honeycomb owns CLI installation and updates.
 
 TTS `temporary_url` is optional. Published Briefcase one-shot uploads return a
 permanent authenticated URL. Test-plane TTS uses the same upload adapter and

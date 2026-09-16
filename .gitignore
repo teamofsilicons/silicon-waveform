@@ -17,3 +17,6 @@ coverage/
 /docs-site/waveform-source.tar.gz
 
 /docs-site/waveform-source.tar.gz.sha256
+
+/dist/
+**/__pycache__/

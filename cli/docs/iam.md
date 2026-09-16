@@ -38,4 +38,4 @@ Declare only the Briefcase private-file creation permission for generated audio.
 
 ## Current hosted integration limit
 
-The September 13 deployment verifies app-secret discovery, public-ID login and endpoint-bound IAM exchange against live services. However, IAM proof verification currently returns only the delegated endpoint scope, with `org_role` and `tags` undisclosed. Briefcase requires those fields and rejects the upload. Adding the declared permissions alone does not resolve that upstream contract mismatch. See [deployment verification](https://docs.waveform.teamofsilicons.com/verification-2026-09-13/).
+The September 13 deployment verifies app-secret discovery, public-ID login and endpoint-bound IAM exchange against live services. However, IAM proof verification currently returns only the delegated endpoint scope, with `org_role` and `tags` undisclosed. Briefcase requires those fields and rejects the upload. Adding the declared permissions alone does not resolve that upstream contract mismatch. See [deployment verification](verification-2026-09-13.md).

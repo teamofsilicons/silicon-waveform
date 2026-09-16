@@ -357,7 +357,7 @@ impl Client {
         })
     }
 
-    /// Enables or disables the hourly best-effort client update check.
+    /// Legacy no-op for source compatibility. Runtime dependency updates are disabled.
     #[must_use]
     pub fn with_auto_update(&self, enabled: bool) -> Self {
         Self {

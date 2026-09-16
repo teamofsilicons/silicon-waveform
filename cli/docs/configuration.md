@@ -7,25 +7,18 @@
 | State home | `SILICON_HOME`, otherwise `HOME` | `waveform config home /existing/directory` |
 | API URL | `https://backend.waveform.teamofsilicons.com` | `--url` or `WAVEFORM_URL` |
 | Sandbox | Production | `--app-secret-file FILE` or `--test APP_SECRET_OR_UUID` |
-| Automatic updates | On | `waveform config auto-update off` or `WAVEFORM_AUTO_UPDATE=0` |
+| CLI updates | Honeycomb | `honeycomb update` |
 | Local telemetry | On | `waveform config telemetry off` or `WAVEFORM_TELEMETRY=0` |
 | Account telemetry | On | `waveform telemetry off` or website preferences |
 
 CLI secrets are kept in private files under the selected home's `.waveform/dir`. Production and test sessions are separate. `ISI` is optional context; no command requires it.
 
-## Unattended updates
+## Updates
 
-```sh
-waveform daemon install
-waveform daemon status --json
-waveform config auto-update off
-```
-
-Installation registers a macOS launch agent or Linux user service. The daemon checks crates.io at most once per hour, including after a failed check, and installs newer stable CLI versions with Cargo. It reads opt-out settings independently of command usage. The new binary is used on the next invocation. `daemon start` runs without registering a service; `daemon run` runs in the foreground for another service manager. Linux user services run while the user manager is active; an administrator can enable lingering for operation after logout.
-
-After changing the state home, reinstall/restart the daemon so it reads the new directory. For a registered service, disable updates with `config auto-update off`; `daemon stop` only stops the current process and the service manager may restart it.
-
-The stateless Rust client retains its existing automatic lockfile updater. Disable that behavior with `.with_auto_update(false)` for pinned builds. A library cannot replace code already loaded into its process.
+Install with `honeycomb install 'tos>waveform'`; update with `honeycomb update`.
+The CLI does not run an updater. Stop a legacy updater with `waveform daemon stop`
+and remove its launchd/systemd registration. Rust clients never update dependencies
+at runtime; manage their versions in your application's Cargo manifest and lockfile.
 
 ## Backend configuration
 

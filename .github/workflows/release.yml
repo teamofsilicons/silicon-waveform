@@ -1,0 +1,98 @@
+name: Build validated Honeycomb release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x86_64
+            triple: x86_64-unknown-linux-gnu
+            binary: waveform
+          - runner: ubuntu-24.04-arm
+            target: linux-aarch64
+            triple: aarch64-unknown-linux-gnu
+            binary: waveform
+          - runner: windows-2025
+            target: windows-x86_64
+            triple: x86_64-pc-windows-msvc
+            binary: waveform.exe
+          - runner: windows-11-arm
+            target: windows-aarch64
+            triple: aarch64-pc-windows-msvc
+            binary: waveform.exe
+          - runner: macos-15-intel
+            target: macos-x86_64
+            triple: x86_64-apple-darwin
+            binary: waveform
+          - runner: macos-15
+            target: macos-aarch64
+            triple: aarch64-apple-darwin
+            binary: waveform
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+      - run: python ../scripts/sync-cli-docs.py --check
+      - run: cargo test --locked -p waveform-cli --target ${{ matrix.triple }}
+      - run: cargo build --release --locked -p waveform-cli --target ${{ matrix.triple }}
+      - run: ./target/${{ matrix.triple }}/release/${{ matrix.binary }} --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: cli/target/${{ matrix.triple }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+
+  package:
+    needs: binaries
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-binaries
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+      - name: Install the pinned Honeycomb packager
+        run: cargo install --locked --git https://github.com/teamofsilicons/silicon-honeycomb --rev 20f4a1ec5cef28da439cbf91226823811e07b73a silicon-honeycomb-cli
+      - name: Check release tag against the CLI version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          with open('cli/Cargo.toml', 'rb') as source:
+              version = tomllib.load(source)['package']['version']
+          assert os.environ['RELEASE_TAG'] == f'v{version}', 'Release tag must match the CLI version'
+          PY
+      - run: python scripts/package-release.py --binaries-dir release-binaries
+      - uses: actions/upload-artifact@v4
+        with:
+          name: waveform-honeycomb-release
+          path: dist/*
+          if-no-files-found: error
+
+# This workflow produces reviewable artifacts; it does not publish a release.

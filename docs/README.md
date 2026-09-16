@@ -5,10 +5,10 @@ Turn text into stored speech, or transcribe audio already in Briefcase. Start wi
 ## Install
 
 ```sh
-curl -fsSL https://docs.waveform.teamofsilicons.com/install.sh | sh
+honeycomb install 'tos>waveform'
 ```
 
-The installer installs the CLI and registers its hourly updater. It does not sign you in. macOS and Linux are supported. Set `WAVEFORM_INSTALL_DAEMON=0` to install without a service.
+Honeycomb installs the native CLI and manages updates. Then sign in with an IAM short-lived token.
 
 ## Sign in and generate speech
 

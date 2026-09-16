@@ -11,7 +11,7 @@ cd frontend && npm ci && npm run build && npm test
 
 Run `python3 scripts/local_database.py`, then source `.local-test/environment` before `cargo test --locked -- --ignored` to run PostgreSQL integration coverage. Use isolated test IAM identities for complete speech/storage tests.
 
-The backend is a Rust library and an API process. The client is a stateless Rust library, and the CLI owns local sessions and update scheduling. Database migrations are applied by startup. Never edit `UNDERSTANDING.md`: it is the human-owned requirements source.
+The backend is a Rust library and an API process. The client is a stateless Rust library, and the CLI owns local sessions; Honeycomb owns CLI updates. Database migrations are applied by startup. Never edit `UNDERSTANDING.md`: it is the human-owned requirements source.
 
 ## Integration requirements
 
