@@ -136,8 +136,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 WAVEFORM_TEST_DATABASE_URL=postgres://silicon_waveform:silicon_waveform@127.0.0.1:5432/silicon_waveform \
   cargo test --test postgres_idempotency -- --ignored --test-threads=1
+cargo build --manifest-path cli/Cargo.toml --locked
+WAVEFORM_TEST_DATABASE_URL=postgres://silicon_waveform:silicon_waveform@127.0.0.1:5432/silicon_waveform \
+  cargo test --lib control::tests::speech_tests -- --ignored --test-threads=1
 cargo deny check
 ```
+
+The speech regressions use the real CLI against local mock services and PostgreSQL.
+Build and test with the same `CARGO_TARGET_DIR`, or set `WAVEFORM_TEST_CLI` to the
+built executable. Without either override they use `cli/target/debug/waveform`.
+A missing binary fails before creating database state or mock expectations.
 
 ## Current dependency-contract blockers
 

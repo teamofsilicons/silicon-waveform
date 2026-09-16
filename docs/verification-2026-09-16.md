@@ -41,3 +41,17 @@ The new participant credential and Honeycomb registry entry are deployment
 configuration, and live shared-environment readiness still depends on IAM and
 Honeycomb. Controlled HTTP fixtures do not establish live paid speech, real email,
 upstream deployment compatibility or a successful production rollout.
+
+## Push reconciliation
+
+Before pushing, `origin/main` had advanced through PR #5. The merge preserves its
+Briefcase 1.1.0 integration, verified private transcription-source targets, IAM
+session mutation receipts, and published client 0.1.1 / CLI 0.1.2 versions. The
+Honeycomb manifest now uses CLI release 0.1.2; backend and library versions remain
+independent. Legacy test fixtures seed pre-existing planes directly because
+creation now belongs to Honeycomb.
+
+Merged verification passed: 154 backend unit tests, 2 Briefcase contract tests,
+13 PostgreSQL control/lifecycle/source-target integrations, 8 PostgreSQL transaction
+tests, 11 client tests, and 13 CLI tests. Backend strict Clippy and dependency policy
+passed, and all 24 documentation pages passed the link/canonical checks.

@@ -203,9 +203,9 @@ dependencies = [
 
 [[package]]
 name = "briefcase-client"
-version = "1.0.3"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6e3e0910415159d840c5267e631acce8defd600e3867daebfd33e1dbf32dec2"
+checksum = "9f32b6ac37a293d256bc9b3001878908b61cb848a0f64061d152295ff2c2b4d1"
 dependencies = [
  "futures-core",
  "libc",

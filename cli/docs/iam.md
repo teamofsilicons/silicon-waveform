@@ -12,9 +12,17 @@ metadata for deduplication. Bearer introspection uses IAM's published
 downstream actor-context exchange is defined by IAM. An inbound OBO proof is
 not an `oat_` token issued to Waveform and cannot be reused as an exchange subject.
 
+For login, refresh and logout, callers should send a stable `Idempotency-Key`
+(16–255 visible ASCII characters) and retain it across retries of that same
+operation. Waveform validates and forwards it unchanged to IAM in production and
+testing. This lets IAM replay its saved result after a response is lost, including
+when a login code or refresh token has already been consumed. Duplicate or invalid
+keys are rejected before contacting IAM. Omitting the header remains supported,
+but generates a new key per request and cannot recover a prior request's receipt.
+
 The backend, Rust client and CLI use `silicon-iam-client` 1.8.0. Production
 introspection, test-plane authorization, login, webhooks and storage proof
-exchanges use the official SDK. Storage uses `briefcase-client` 1.0.3.
+exchanges use the official SDK. Storage uses `briefcase-client` 1.1.0.
 For bearer speech, Waveform mints a separate proof for every delegated listing
 page, file read and upload. Proofs bind the SDK's exact request bytes and are
 never persisted in jobs or idempotency responses. See `testing.md` for the

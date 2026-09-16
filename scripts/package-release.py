@@ -74,8 +74,6 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist")
     args = parser.parse_args()
     version = tomllib.loads((ROOT / "cli/Cargo.toml").read_text())["package"]["version"]
-    if tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"] != version:
-        raise SystemExit("Backend and CLI release versions must match")
     manifest = (ROOT / "honeycomb.yaml").read_text()
     for key, expected in (("app_id", "tos>waveform"), ("version", version)):
         match = re.search(rf"^{key}:\s*[\"']?([^\s\"'#]+)[\"']?\s*(?:#.*)?$", manifest, re.MULTILINE)

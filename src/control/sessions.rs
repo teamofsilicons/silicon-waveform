@@ -8,7 +8,7 @@ use axum::{
 };
 use http::{HeaderMap, StatusCode, header};
 use serde::Deserialize;
-use silicon_iam_client::{Mutation, models};
+use silicon_iam_client::{IdempotencyKey, Mutation, models};
 use std::sync::Arc;
 
 #[derive(Deserialize)]
@@ -36,6 +36,17 @@ fn validate_token(token: &str, prefix: &str) -> Result<(), ControlError> {
         return Err(ControlError::bad_request("invalid_token"));
     }
     Ok(())
+}
+
+fn mutation(headers: &HeaderMap) -> Result<Mutation, ControlError> {
+    super::single_header(headers, "idempotency-key")?.map_or_else(
+        || Ok(Mutation::new()),
+        |key| {
+            IdempotencyKey::parse(key)
+                .map(Mutation::with_key)
+                .map_err(|_| ControlError::bad_request("invalid_idempotency_key"))
+        },
+    )
 }
 
 pub(super) async fn iam(
@@ -66,6 +77,7 @@ pub(super) async fn login(
     Json(body): Json<Login>,
 ) -> Result<Response, ControlError> {
     // IAM calls this an SLT, but serializes it as an OAuth authorization code.
+    let mutation = mutation(&headers)?;
     let plane = state.plane(&headers).await?;
     if plane.id.is_nil() || body.slt.starts_with("oac_") {
         validate_token(&body.slt, "oac_")?;
@@ -78,7 +90,7 @@ pub(super) async fn login(
     let tokens = plane
         .iam
         .oauth()
-        .login(&state.app_id, &body.slt, &Mutation::new())
+        .login(&state.app_id, &body.slt, &mutation)
         .await
         .map_err(ControlError::iam)?;
     if let (Some(org), Some(actor)) = (&tokens.org_id, &tokens.actor) {
@@ -95,11 +107,12 @@ pub(super) async fn refresh(
     Json(body): Json<Refresh>,
 ) -> Result<Response, ControlError> {
     validate_token(&body.refresh_token, "ort_")?;
+    let mutation = mutation(&headers)?;
     let plane = state.plane(&headers).await?;
     let tokens = plane
         .iam
         .oauth()
-        .refresh(&state.app_id, &body.refresh_token, &Mutation::new())
+        .refresh(&state.app_id, &body.refresh_token, &mutation)
         .await
         .map_err(ControlError::iam)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(tokens)).into_response())
@@ -114,6 +127,7 @@ pub(super) async fn logout(
         return Err(ControlError::bad_request("invalid_token"));
     }
     validate_token(&body.token, "o")?;
+    let mutation = mutation(&headers)?;
     let plane = state.plane(&headers).await?;
     plane
         .iam
@@ -123,7 +137,7 @@ pub(super) async fn logout(
                 token: body.token,
                 token_type_hint: None,
             },
-            &Mutation::new(),
+            &mutation,
         )
         .await
         .map_err(ControlError::iam)?;

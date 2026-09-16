@@ -4,7 +4,7 @@ Install with `honeycomb install 'tos>waveform'`, then `waveform login SLT`.
 Honeycomb owns CLI installation and updates. The Rust library is a normal Cargo
 dependency and never rewrites a project's lockfile at runtime.
 
-Keep the backend, CLI and root `honeycomb.yaml` release versions equal. The release
+Keep the CLI and root `honeycomb.yaml` release versions equal. Backend and Rust client versions can advance independently. The release
 workflow builds the CLI on Linux, Windows and macOS for x86_64 and aarch64, tests
 each native target, and uploads one archive plus checksums as reviewable artifacts.
 It does not publish or deploy. Run it with a matching `vVERSION` tag or manually.
