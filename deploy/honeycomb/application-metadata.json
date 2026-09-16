@@ -1,0 +1,40 @@
+{
+  "org_id": "tos",
+  "local_app_id": "waveform",
+  "name": "Silicon Waveform",
+  "description": "Silicon Waveform provides speech generation and transcription for people and applications in the Silicon ecosystem. Its native waveform command supports text to speech, speech to text, voice profiles, job management, and account preferences on Linux, Windows, and macOS. IAM supplies authentication and organization authorization. Briefcase stores generated audio and provides authorized access to transcription sources. The service routes speech requests through configured providers and supports isolated testing environments managed by Honeycomb. A hosted web interface and Rust client SDK provide additional ways to use the same API.",
+  "website_url": "https://waveform.teamofsilicons.com",
+  "docs_url": "https://docs.waveform.teamofsilicons.com",
+  "base_url": "https://backend.waveform.teamofsilicons.com",
+  "webhook_url": "https://backend.waveform.teamofsilicons.com/webhooks/",
+  "webhook_scope": [
+    "membership",
+    "updates",
+    "trust"
+  ],
+  "app_scope": {
+    "iam": [
+      "self.identity.read",
+      "self.profile.read",
+      "self.membership.read",
+      "self.tags.read"
+    ],
+    "external": [
+      {
+        "app_id": "tos>briefcase",
+        "endpoint_id": "briefcase.files.create"
+      },
+      {
+        "app_id": "tos>briefcase",
+        "endpoint_id": "briefcase.entries.list"
+      },
+      {
+        "app_id": "tos>briefcase",
+        "endpoint_id": "briefcase.files.read"
+      }
+    ]
+  },
+  "obo_endpoints": [],
+  "obo_review_message": "Waveform creates private generated-audio files and lists or reads user-authorized Briefcase sources for transcription and replay. Identity, membership and tag context allow Briefcase to enforce the initiating actor\u2019s resource permissions. No global file administration is requested.",
+  "testing_idle_days": 30
+}
