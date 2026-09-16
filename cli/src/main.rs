@@ -70,6 +70,8 @@ enum Command {
     },
     /// Show public IAM application metadata, including the app_id used to obtain an SLT.
     Iam,
+    /// Show API versions, compatibility and deprecation policy.
+    Contracts,
     /// Exchange one short-lived IAm token, or inspect the current login with `login status`.
     #[command(args_conflicts_with_subcommands = true)]
     Login {
@@ -205,7 +207,7 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Manage isolated Waveform test environments.
+    /// Inspect test environments. Lifecycle management is in Honeycomb.
     TestEnv {
         #[command(subcommand)]
         command: TestEnvironmentCommand,
@@ -253,7 +255,8 @@ enum ConfigCommand {
 
 #[derive(Subcommand, Debug)]
 enum TestEnvironmentCommand {
-    /// Create an isolated environment (run without --test).
+    /// Legacy command; create shared environments in Honeycomb.
+    #[command(hide = true)]
     Create {
         #[arg(long)]
         org: String,
@@ -280,25 +283,29 @@ enum TestEnvironmentCommand {
         org: String,
         environment_id: String,
     },
-    /// Print the current root key (authorized managers only).
+    /// Legacy command; manage shared environments in Honeycomb.
+    #[command(hide = true)]
     Key {
         #[arg(long)]
         org: String,
         environment_id: String,
     },
-    /// Rotate a root key (authorized managers only).
+    /// Legacy command; manage shared environments in Honeycomb.
+    #[command(hide = true)]
     Rotate {
         #[arg(long)]
         org: String,
         environment_id: String,
     },
-    /// Soft-delete one environment.
+    /// Legacy command; manage shared environments in Honeycomb.
+    #[command(hide = true)]
     Delete {
         #[arg(long)]
         org: String,
         environment_id: String,
     },
-    /// Restore one environment during its 30-day recovery window.
+    /// Legacy command; manage shared environments in Honeycomb.
+    #[command(hide = true)]
     Restore {
         #[arg(long)]
         org: String,
@@ -309,7 +316,8 @@ enum TestEnvironmentCommand {
         #[arg(long)]
         org: String,
     },
-    /// Remove all data from the selected environment.
+    /// Legacy command; manage shared environments in Honeycomb.
+    #[command(hide = true)]
     Clean {
         #[arg(long)]
         org: String,
@@ -779,6 +787,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                 .map_err(|e| e.to_string())?,
             )?;
         }
+        Command::Contracts => print_json(&client.contracts().await.map_err(|e| e.to_string())?)?,
         Command::Iam => print_json(&client.iam().await.map_err(|e| e.to_string())?)?,
         Command::Login {
             command: Some(LoginCommand::Status),

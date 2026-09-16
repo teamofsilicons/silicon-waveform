@@ -1,10 +1,12 @@
 //! Durable product APIs: application login, account settings and IAM events.
 
 mod accounts;
+pub(crate) mod contracts;
 mod discovery;
 mod environments;
 mod events;
 mod jobs;
+mod lifecycle;
 mod reporting;
 mod sessions;
 #[cfg(test)]
@@ -39,6 +41,8 @@ use vault::Vault;
 /// Shared infrastructure for the user-facing control APIs.
 pub struct ControlState {
     pool: PgPool,
+    honeycomb_token: Option<secrecy::SecretString>,
+    fence_slots: Arc<tokio::sync::Semaphore>,
     mail: Option<reporting::Mail>,
     station: Option<space_station::SpaceClient>,
     iam: Client,
@@ -84,6 +88,10 @@ impl ControlState {
             })
             .transpose()?;
         Ok(Self {
+            honeycomb_token: settings.control.honeycomb_token.clone(),
+            fence_slots: Arc::new(tokio::sync::Semaphore::new(
+                settings.database.max_connections.get() as usize,
+            )),
             mail: reporting::Mail::from_env()?,
             station: crate::telemetry::from_environment(),
             pool,
@@ -105,14 +113,12 @@ impl ControlState {
     }
 
     async fn plane(&self, headers: &HeaderMap) -> Result<Plane, ControlError> {
-        // Keep request-time cleanup as a safety net for short-lived local
-        // processes; the API runner also invokes this periodically.
-        let _ = self.cleanup_environments().await;
         let Some(key) = single_header(headers, "x-testing-environment-key")? else {
             return Ok(Plane {
                 id: Uuid::nil(),
                 iam: self.iam.clone(),
                 iam_environment_id: None,
+                fence: None,
             });
         };
         if key.starts_with("ask_") {
@@ -123,10 +129,11 @@ impl ControlState {
             .vault()?
             .digest(key, "environment-root")
             .map_err(ControlError::internal)?;
-        let row = sqlx::query("UPDATE waveform_environments SET last_activity_at=now() WHERE root_key_hash=$1 AND deleted_at IS NULL AND id <> $2 RETURNING id, iam_key_cipher, app_secret_cipher, iam_environment_id")
+        let row = sqlx::query("UPDATE waveform_environments SET last_activity_at=now() WHERE root_key_hash=$1 AND deleted_at IS NULL AND id <> $2 AND NOT EXISTS(SELECT 1 FROM waveform_lifecycle l WHERE l.environment_id=waveform_environments.id) RETURNING id, iam_key_cipher, app_secret_cipher, iam_environment_id")
             .bind(digest).bind(Uuid::nil()).fetch_optional(&self.pool).await?
             .ok_or_else(ControlError::unauthorized)?;
         let id: Uuid = row.try_get("id")?;
+        let fence = self.test_fence(id).await?;
         let encrypted: Vec<u8> = row.try_get("iam_key_cipher")?;
         let iam_key = self
             .vault()?
@@ -154,6 +161,7 @@ impl ControlState {
             id,
             iam,
             iam_environment_id: row.try_get("iam_environment_id")?,
+            fence: Some(fence),
         })
     }
 
@@ -210,6 +218,13 @@ impl ControlState {
             }
         }
         Ok(Identity { plane, authority })
+    }
+
+    pub(crate) async fn speech_fence(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<lifecycle::Fence>, ControlError> {
+        Ok(self.plane(headers).await?.fence)
     }
 
     /// Authorizes a test-plane speech request against the selected IAM plane.
@@ -275,6 +290,7 @@ impl ControlState {
         Ok(TestSpeechContext {
             authorization: actor,
             plane_id,
+            fence: identity.plane.fence,
             iam,
             briefcase: Arc::new(briefcase),
         })
@@ -339,30 +355,14 @@ impl ControlState {
         })
     }
 
-    /// Applies the documented test-plane inactivity and recovery retention
-    /// windows. This is also called lazily on requests, but the process-level
-    /// runner invokes it periodically so inactive planes are retired without
-    /// requiring another request to arrive.
+    /// Retention belongs to Honeycomb. Kept as the runtime maintenance hook.
     pub(crate) async fn cleanup_environments(&self) -> Result<u64, sqlx::Error> {
-        let purged = sqlx::query(
-            "DELETE FROM waveform_environments WHERE id <> $1 AND deleted_at < now() - interval '30 days'",
-        )
-        .bind(Uuid::nil())
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        let expired = sqlx::query(
-            "UPDATE waveform_environments SET deleted_at=now() WHERE id <> $1 AND deleted_at IS NULL AND iam_control_version IS NULL AND last_activity_at < now() - interval '15 days'",
-        )
-        .bind(Uuid::nil())
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(purged.saturating_add(expired))
+        self.sunset_contracts().await
     }
 }
 
 pub(crate) struct TestSpeechContext {
+    pub(crate) fence: Option<lifecycle::Fence>,
     pub(crate) authorization: AuthorizedActor,
     pub(crate) plane_id: Uuid,
     pub(crate) iam: Arc<dyn crate::application::ports::IamPort>,
@@ -370,6 +370,7 @@ pub(crate) struct TestSpeechContext {
 }
 
 struct Plane {
+    fence: Option<lifecycle::Fence>,
     id: Uuid,
     iam: Client,
     iam_environment_id: Option<Uuid>,
@@ -383,6 +384,11 @@ struct Identity {
 /// Routes merged before the main API's admission, deadlines and logging layers.
 pub fn router(state: Arc<ControlState>) -> Router {
     Router::new()
+        .route("/api/contracts", get(contracts::describe))
+        .route("/api/v1/contracts", get(contracts::describe))
+        .route("/internal/contracts/{version}/deprecate", post(contracts::deprecate))
+        .route("/internal/honeycomb/organizations/{org}/testing-environments/{environment}/operations/{operation}", axum::routing::put(lifecycle::apply).get(lifecycle::receipt))
+        .route("/internal/honeycomb/organizations/{org}/testing-environments/{environment}/activity", get(lifecycle::activity))
         .route("/api/v1/telemetry", post(events::record))
         .route("/api/v1/reports", post(reporting::submit))
         .route("/api/v1/iam", get(sessions::iam))
@@ -392,7 +398,7 @@ pub fn router(state: Arc<ControlState>) -> Router {
         .route("/api/v1/auth/me", get(sessions::me))
         .route("/api/v1/jobs", get(jobs::list))
         .route("/api/v1/jobs/{job_id}", get(jobs::get))
-        .route("/api/v1/testing-environments", post(environments::create))
+        .route("/api/v1/testing-environments", post(environments::managed_by_honeycomb))
         .route("/api/v1/testing-environments", get(environments::list))
         .route(
             "/api/v1/testing-environments/{environment_id}",
@@ -400,24 +406,24 @@ pub fn router(state: Arc<ControlState>) -> Router {
         )
         .route(
             "/api/v1/testing-environments/{environment_id}/key",
-            get(environments::key),
+            get(environments::managed_by_honeycomb),
         )
         .route(
             "/api/v1/testing-environments/{environment_id}/rotate-key",
-            post(environments::rotate_key),
+            post(environments::managed_by_honeycomb),
         )
         .route(
             "/api/v1/testing-environments/{environment_id}/delete",
-            post(environments::delete),
+            post(environments::managed_by_honeycomb),
         )
         .route(
             "/api/v1/testing-environments/{environment_id}/restore",
-            post(environments::restore),
+            post(environments::managed_by_honeycomb),
         )
         .route("/api/v1/testing-environment", get(environments::current))
         .route(
             "/api/v1/testing-environment/clean",
-            post(environments::clean),
+            post(environments::managed_by_honeycomb),
         )
         .route(
             "/api/v1/preferences",

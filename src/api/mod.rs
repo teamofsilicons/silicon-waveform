@@ -160,7 +160,9 @@ pub fn router(state: ApiState, server: &ServerSettings) -> Router {
         .fallback(not_found)
         .with_state(state);
     let router = if let Some(control) = control {
-        router.merge(crate::control::router(control))
+        router.merge(crate::control::router(control.clone())).layer(
+            axum_middleware::from_fn_with_state(control, crate::control::contracts::negotiate),
+        )
     } else {
         router
     };
@@ -203,6 +205,17 @@ async fn synthesize(
     // OBO speech requests are authorized by the application IAM adapter and
     // must retain the configured default chain until a matching OBO identity
     // lookup is available here.
+    let _request_fence = if raw_headers.contains_key("x-testing-environment-key") {
+        let Some(control) = &state.control else {
+            return ApiError::not_ready(headers.request_id).into_response();
+        };
+        match control.speech_fence(&raw_headers).await {
+            Ok(fence) => fence,
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        None
+    };
     let account_order = if raw_headers.get("authorization").is_some()
         && let Some(control) = &state.control
     {
@@ -247,13 +260,14 @@ async fn synthesize(
         context.plane_id = selected.plane_id;
         let service =
             Arc::new(fixture_service.with_storage_ports(selected.iam, selected.briefcase));
-        Some((service, selected.authorization))
+        Some((service, selected.authorization, selected.fence))
     } else {
         None
     };
     let operation: Pin<Box<dyn Future<Output = Result<_, _>> + Send>> =
-        if let Some((fixture_service, authorization)) = test_authorization {
+        if let Some((fixture_service, authorization, fence)) = test_authorization {
             Box::pin(async move {
+                let _fence = fence;
                 fixture_service
                     .synthesize_pre_authorized(context, request, authorization)
                     .await
@@ -287,6 +301,17 @@ async fn transcribe(
             Err(error) => return body_error(&error, headers.request_id).into_response(),
         },
         Err(error) => return json_error(&error, headers.request_id).into_response(),
+    };
+    let _request_fence = if raw_headers.contains_key("x-testing-environment-key") {
+        let Some(control) = &state.control else {
+            return ApiError::not_ready(headers.request_id).into_response();
+        };
+        match control.speech_fence(&raw_headers).await {
+            Ok(fence) => fence,
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        None
     };
     let account_order = if raw_headers.get("authorization").is_some()
         && let Some(control) = &state.control
@@ -332,13 +357,14 @@ async fn transcribe(
         context.plane_id = selected.plane_id;
         let service =
             Arc::new(fixture_service.with_storage_ports(selected.iam, selected.briefcase));
-        Some((service, selected.authorization))
+        Some((service, selected.authorization, selected.fence))
     } else {
         None
     };
     let operation: Pin<Box<dyn Future<Output = Result<_, _>> + Send>> =
-        if let Some((fixture_service, authorization)) = test_authorization {
+        if let Some((fixture_service, authorization, fence)) = test_authorization {
             Box::pin(async move {
+                let _fence = fence;
                 fixture_service
                     .transcribe_pre_authorized(context, request, authorization)
                     .await

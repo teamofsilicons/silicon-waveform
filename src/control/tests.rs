@@ -18,7 +18,7 @@ use wiremock::{
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 const SECRET: &str = "test-only-waveform-webhook-secret-123456";
 
-async fn database() -> Result<(PgPool, String), Box<dyn std::error::Error>> {
+pub(super) async fn database() -> Result<(PgPool, String), Box<dyn std::error::Error>> {
     let url = std::env::var("WAVEFORM_TEST_DATABASE_URL")?;
     // Identifier is generated exclusively from a UUID, with no user input.
     let schema = format!("control_{}", Uuid::new_v4().simple());
@@ -45,11 +45,15 @@ async fn database() -> Result<(PgPool, String), Box<dyn std::error::Error>> {
     Ok((pool, schema))
 }
 
-fn fixture(
+pub(super) fn fixture(
     pool: PgPool,
     iam: &MockServer,
 ) -> Result<Arc<ControlState>, Box<dyn std::error::Error>> {
     Ok(Arc::new(ControlState {
+        fence_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+        honeycomb_token: Some(SecretString::from(
+            "test-only-honeycomb-service-token-123456",
+        )),
         tts_scope: "obo:tos>briefcase:briefcase.files.create".into(),
         stt_scope: "obo:tos>briefcase:briefcase.files.read".into(),
         mail: None,
@@ -79,7 +83,7 @@ fn fixture(
     }))
 }
 
-async fn call(
+pub(super) async fn call(
     app: &Router,
     verb: &str,
     route: &str,
@@ -455,237 +459,57 @@ async fn webhook(
 
 #[tokio::test]
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
-#[allow(clippy::too_many_lines)]
-async fn sandbox_creation_and_atomic_clean_preserve_the_environment() -> TestResult {
+async fn environment_management_is_owned_by_honeycomb() -> TestResult {
     let (pool, schema) = database().await?;
     let iam = MockServer::start().await;
     let state = fixture(pool.clone(), &iam)?;
     let app = router(state.clone());
-    Mock::given(path("/api/v1/oauth/introspect"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(snapshot(Uuid::new_v4())))
-        .mount(&iam)
-        .await;
-    let iam_environment_id = Uuid::new_v4();
-    let (status, created) = call(
-        &app,
-        "POST",
-        "/api/v1/testing-environments",
-        Some("oat_fixture"),
-        json!({
-            "name":"local-sandbox", "iam_environment_id":iam_environment_id,
-            "iam_environment_key":"I".repeat(32), "app_secret":"test-environment-app-secret", "briefcase_environment_key":format!("ask_{}","B".repeat(43))
-        }),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    let key = created["key"].as_str().ok_or("environment key missing")?;
-    assert_eq!(key.len(), 32);
-    for (root, expected) in [
-        (key.to_owned(), StatusCode::OK),
-        ("A".repeat(32), StatusCode::UNAUTHORIZED),
-    ] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/iam")
-                    .header("x-testing-environment-key", &root)
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(response.status(), expected);
-        if expected == StatusCode::OK {
-            let value: Value =
-                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
-            assert_eq!(
-                value,
-                json!({"app_id":"tos>waveform", "iam_base_url":format!("{}/", iam.uri()), "testing_environment_id":iam_environment_id})
-            );
-        }
-    }
-    let id: Uuid = created["id"]
-        .as_str()
-        .ok_or("environment id missing")?
-        .parse()?;
-    let defaults: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM waveform_provider_defaults WHERE plane_id=$1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(defaults, 1);
-    let (status, environments) = call(
-        &app,
-        "GET",
-        "/api/v1/testing-environments",
-        Some("oat_fixture"),
-        Value::Null,
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        environments["items"]
-            .as_array()
-            .is_some_and(|items| { items.iter().any(|item| item["id"] == id.to_string()) })
-    );
-    let (status, detail) = call(
-        &app,
-        "GET",
-        &format!("/api/v1/testing-environments/{id}"),
-        Some("oat_fixture"),
-        Value::Null,
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(detail["id"], id.to_string());
-    let (status, retrieved) = call(
-        &app,
-        "GET",
-        &format!("/api/v1/testing-environments/{id}/key"),
-        Some("oat_fixture"),
-        Value::Null,
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(retrieved["key"], key);
-    let (status, rotated) = call(
-        &app,
-        "POST",
-        &format!("/api/v1/testing-environments/{id}/rotate-key"),
-        Some("oat_fixture"),
-        Value::Null,
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    let rotated_key = rotated["key"].as_str().ok_or("rotated key missing")?;
-    assert_ne!(rotated_key, key);
-    let old_key_request = Request::builder()
-        .method("GET")
-        .uri("/api/v1/testing-environment")
-        .header("x-testing-environment-key", key)
-        .body(Body::empty())?;
-    assert_eq!(
-        app.clone().oneshot(old_key_request).await?.status(),
-        StatusCode::UNAUTHORIZED
-    );
-    let (status, _) = call(
-        &app,
-        "POST",
-        &format!("/api/v1/testing-environments/{id}/delete"),
-        Some("oat_fixture"),
-        Value::Null,
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    let (status, _) = call(
-        &app,
-        "GET",
-        &format!("/api/v1/testing-environments/{id}/key"),
-        Some("oat_fixture"),
-        Value::Null,
-    )
-    .await?;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = call(
-        &app,
-        "POST",
-        &format!("/api/v1/testing-environments/{id}/restore"),
-        Some("oat_fixture"),
-        Value::Null,
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    let mut clean_snapshot = snapshot(Uuid::new_v4());
-    clean_snapshot["authorization"]["testing_environment_id"] =
-        created["iam_environment_id"].clone();
-    let iam_id: Uuid =
-        sqlx::query_scalar("SELECT iam_environment_id FROM waveform_environments WHERE id=$1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await?;
-    clean_snapshot["authorization"]["testing_environment_id"] = json!(iam_id);
-    clean_snapshot["authorization"]["org_role"] = json!("owner");
-    Mock::given(path("/api/v1/oauth/introspect"))
-        .and(header("x-testing-environment-key", "I".repeat(32)))
-        .respond_with(ResponseTemplate::new(200).set_body_json(clean_snapshot))
-        .with_priority(1)
-        .mount(&iam)
-        .await;
     for route in [
-        "/api/v1/testing-environment",
-        "/api/v1/testing-environment/clean",
+        "/api/v1/testing-environments".to_owned(),
+        "/api/v1/testing-environment/clean".to_owned(),
+        format!("/api/v1/testing-environments/{}/restore", Uuid::new_v4()),
     ] {
-        let method = if route.ends_with("/clean") {
-            "POST"
-        } else {
-            "GET"
-        };
-        let request = Request::builder()
-            .method(method)
-            .uri(route)
-            .header("x-testing-environment-key", rotated_key)
-            .header("x-org-id", "tos")
-            .header("authorization", "Bearer oat_fixture")
-            .body(Body::empty())?;
-        assert!(app.clone().oneshot(request).await?.status().is_success());
+        let (status, body) = call(&app, "POST", &route, Some("oat_fixture"), json!({})).await?;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "manage_environment_in_honeycomb");
     }
-    let remaining: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM waveform_environments WHERE id=$1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(remaining, 1);
-
-    sqlx::query(
-        "UPDATE waveform_environments SET last_activity_at=now() - interval '16 days' WHERE id=$1",
-    )
-    .bind(id)
-    .execute(&pool)
-    .await?;
-    assert_eq!(state.cleanup_environments().await?, 1);
-    let deleted: Option<time::OffsetDateTime> =
-        sqlx::query_scalar("SELECT deleted_at FROM waveform_environments WHERE id=$1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await?;
-    assert!(deleted.is_some());
-    sqlx::query(
-        "UPDATE waveform_environments SET deleted_at=now() - interval '31 days' WHERE id=$1",
-    )
-    .bind(id)
-    .execute(&pool)
-    .await?;
-    sqlx::query("INSERT INTO waveform_idempotency_records (plane_id,actor_type,actor_id,org_id,operation,idempotency_key,request_digest,request_id,state,lease_token,lease_expires_at,expires_at) VALUES ($1,'carbon',$2,'tos','tts','purge-key',decode(repeat('a',64),'hex'),$3,'pending',$4,now() + interval '1 hour',now() + interval '2 hours')")
-        .bind(id)
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .execute(&pool)
-        .await?;
-    assert_eq!(state.cleanup_environments().await?, 1);
-    let purged: i64 = sqlx::query_scalar("SELECT count(*) FROM waveform_environments WHERE id=$1")
+    let legacy = legacy_plane(&state, Uuid::new_v4()).await?;
+    let id: Uuid = legacy["id"].as_str().ok_or("id")?.parse()?;
+    sqlx::query("UPDATE waveform_environments SET last_activity_at=now()-interval '90 days',deleted_at=now()-interval '40 days' WHERE id=$1").bind(id).execute(&pool).await?;
+    assert_eq!(state.cleanup_environments().await?, 0);
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM waveform_environments WHERE id=$1)"
+        )
         .bind(id)
         .fetch_one(&pool)
-        .await?;
-    assert_eq!(purged, 0);
-    let orphaned_idempotency: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM waveform_idempotency_records WHERE plane_id=$1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(orphaned_idempotency, 0);
-    let request = Request::builder()
-        .method("POST")
-        .uri("/api/v1/testing-environment/clean")
-        .body(Body::empty())?;
-    assert_eq!(
-        app.oneshot(request).await?.status(),
-        StatusCode::BAD_REQUEST
+        .await?
     );
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&pool)
         .await?;
     pool.close().await;
     Ok(())
+}
+
+// Existing paired environments remain readable after management moves to Honeycomb.
+async fn legacy_plane(
+    state: &ControlState,
+    iam_id: Uuid,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let id = Uuid::new_v4();
+    let key = Uuid::new_v4().simple().to_string();
+    let vault = state.vault().map_err(|_| "vault")?;
+    sqlx::query("INSERT INTO waveform_environments(id,org_id,creator_id,name,root_key_hash,root_key_cipher,iam_key_cipher,app_secret_cipher,briefcase_key_cipher,iam_environment_id) VALUES($1,'tos',$2,'legacy sandbox',$3,$4,$5,$6,$7,$8)")
+        .bind(id).bind(Uuid::new_v4()).bind(vault.digest(&key,"environment-root")?)
+        .bind(vault.seal(&key,&format!("{id}/root-key"))?)
+        .bind(vault.seal(&"I".repeat(32),&format!("{id}/iam-key"))?)
+        .bind(vault.seal("test-environment-app-secret",&format!("{id}/app-secret"))?)
+        .bind(vault.seal(&format!("ask_{}","B".repeat(43)),&format!("{id}/briefcase-key"))?)
+        .bind(iam_id).execute(&state.pool).await?;
+    sqlx::query("INSERT INTO waveform_voice_profiles(plane_id,id,profile) SELECT $1,id,profile FROM waveform_voice_profiles WHERE plane_id=$2").bind(id).bind(Uuid::nil()).execute(&state.pool).await?;
+    sqlx::query("INSERT INTO waveform_provider_defaults(plane_id,tts_order,stt_order,voice_profile) SELECT $1,tts_order,stt_order,voice_profile FROM waveform_provider_defaults WHERE plane_id=$2").bind(id).bind(Uuid::nil()).execute(&state.pool).await?;
+    Ok(json!({"id":id,"key":key}))
 }
 
 #[path = "speech_tests.rs"]
@@ -998,7 +822,7 @@ async fn discovered_identity_reports_permissions_and_webhooks_are_isolated() -> 
         )
         .await?
         .0,
-        StatusCode::BAD_REQUEST
+        StatusCode::CONFLICT
     );
     let report = json!({"message":"Sandbox report only","client_version":"test"});
     let (status, first) =
@@ -1136,6 +960,201 @@ async fn discovered_identity_reports_permissions_and_webhooks_are_isolated() -> 
         .await?
         .0,
         StatusCode::FORBIDDEN
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+#[allow(
+    clippy::too_many_lines,
+    clippy::unwrap_used,
+    reason = "Sequential lifecycle integration assertions on local fixtures"
+)]
+async fn honeycomb_lifecycle_replays_fences_cleans_and_keeps_tombstones() -> TestResult {
+    let (pool, schema) = database().await?;
+    let iam = MockServer::start().await;
+    let state = fixture(pool.clone(), &iam)?;
+    let app = router(state.clone());
+    let id = Uuid::new_v4();
+    let secret = format!("ask_{}", "H".repeat(43));
+    let mut op = json!({"operation_id":Uuid::new_v4(),"environment_id":id,"org_id":"tos","app_id":"tos>waveform","environment_revision":1,"generation":1,"key_version":1,"action":"prepare","testing_key":"never-persist-this-root-key","snapshot":{}});
+    let route = |op: &Value| {
+        format!(
+            "/internal/honeycomb/organizations/tos/testing-environments/{id}/operations/{}",
+            op["operation_id"].as_str().unwrap()
+        )
+    };
+    let token = "test-only-honeycomb-service-token-123456";
+    assert_eq!(
+        call(&app, "PUT", &route(&op), Some(&secret), op.clone())
+            .await?
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, receipt) = call(&app, "PUT", &route(&op), Some(token), op.clone()).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["state"], "completed");
+    assert!(!receipt.to_string().contains("root-key"));
+    assert_eq!(
+        call(&app, "PUT", &route(&op), Some(token), op.clone())
+            .await?
+            .1,
+        receipt
+    );
+    let mut changed = op.clone();
+    changed["reason"] = json!("changed body");
+    assert_eq!(
+        call(&app, "PUT", &route(&changed), Some(token), changed.clone())
+            .await?
+            .0,
+        StatusCode::CONFLICT
+    );
+    mock_discovery(&iam, id, &secret, 1, None).await;
+    let plane = state
+        .discover_plane(&secret)
+        .await
+        .map_err(|_| "discovery failed")?;
+    drop(plane);
+    let actor = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO waveform_account_preferences(plane_id,org_id,actor_id) VALUES($1,'tos',$2)",
+    )
+    .bind(id)
+    .bind(actor)
+    .execute(&pool)
+    .await?;
+    let fence = state.test_fence(id).await.map_err(|_| "fence failed")?;
+    op["operation_id"] = json!(Uuid::new_v4());
+    op["environment_revision"] = json!(2);
+    op["generation"] = json!(2);
+    op["action"] = json!("clean");
+    let clean = op.clone();
+    let app_clone = app.clone();
+    let url = route(&op);
+    let cleaning = tokio::spawn(async move {
+        call(&app_clone, "PUT", &url, Some(token), clean)
+            .await
+            .map_err(|e| e.to_string())
+    });
+    // Wait for the durable pending barrier, without releasing the running request.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let pending: bool = sqlx::query_scalar(
+                "SELECT state='pending' FROM waveform_lifecycle WHERE environment_id=$1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if pending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(state.test_fence(id).await.is_err());
+    assert!(!cleaning.is_finished());
+    drop(fence);
+    assert_eq!(cleaning.await??.1["state"], "completed");
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM waveform_account_preferences WHERE plane_id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(count, 0);
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM waveform_environments WHERE id=$1)"
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?
+    );
+    // Retrying clean does not erase new data written after its completed receipt.
+    sqlx::query(
+        "INSERT INTO waveform_account_preferences(plane_id,org_id,actor_id) VALUES($1,'tos',$2)",
+    )
+    .bind(id)
+    .bind(actor)
+    .execute(&pool)
+    .await?;
+    assert_eq!(
+        call(&app, "PUT", &route(&op), Some(token), op.clone())
+            .await?
+            .1["state"],
+        "completed"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM waveform_account_preferences WHERE plane_id=$1"
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?,
+        1
+    );
+    let older_operation = op.clone();
+    for (revision, action) in [
+        (3, "disable"),
+        (4, "restore"),
+        (5, "rotate-key"),
+        (6, "purge"),
+    ] {
+        op["operation_id"] = json!(Uuid::new_v4());
+        op["environment_revision"] = json!(revision);
+        op["action"] = json!(action);
+        if action == "rotate-key" {
+            op["key_version"] = json!(2);
+        }
+        assert_eq!(
+            call(&app, "PUT", &route(&op), Some(token), op.clone())
+                .await?
+                .1["state"],
+            "completed"
+        );
+        if action == "disable" || action == "purge" {
+            assert!(state.discover_plane(&secret).await.is_err());
+        }
+        if action == "restore" {
+            assert!(state.discover_plane(&secret).await.is_ok());
+        }
+        if action == "rotate-key" {
+            assert!(state.discover_plane(&secret).await.is_err());
+        }
+    }
+    assert_eq!(
+        call(&app, "PUT", &route(&op), Some(token), op.clone())
+            .await?
+            .1["state"],
+        "completed"
+    );
+    let mut new_stale = older_operation;
+    new_stale["operation_id"] = json!(Uuid::new_v4());
+    assert_eq!(
+        call(
+            &app,
+            "PUT",
+            &route(&new_stale),
+            Some(token),
+            new_stale.clone()
+        )
+        .await?
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM waveform_environments WHERE id=$1)"
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?
     );
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&pool)

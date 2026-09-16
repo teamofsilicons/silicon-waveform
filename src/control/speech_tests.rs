@@ -100,7 +100,7 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
     settings.permanent_origin = "https://briefcase.example.test".parse()?;
     settings.cdn_origin = settings.permanent_origin.clone();
     crate::infrastructure::testing::seed_audio(&pool).await?;
-    let app = speech_app(state)?;
+    let app = speech_app(state.clone())?;
     let actor = Uuid::new_v4();
     let iam_plane = Uuid::new_v4();
     Mock::given(path("/api/v1/oauth/introspect"))
@@ -308,7 +308,7 @@ async fn real_cli_keeps_production_and_test_logins_separate() -> TestResult {
     let (pool, schema) = database().await?;
     let iam = MockServer::start().await;
     let state = fixture(pool.clone(), &iam)?;
-    let app = router(state);
+    let app = router(state.clone());
     let actor = Uuid::new_v4();
     let plane_id = Uuid::new_v4();
     Mock::given(path("/api/v1/oauth/introspect"))
@@ -340,13 +340,8 @@ async fn real_cli_keeps_production_and_test_logins_separate() -> TestResult {
         .expect(1)
         .mount(&iam)
         .await;
-    let (status, created) = call(&app, "POST", "/api/v1/testing-environments", Some("oat_fixture"), json!({
-        "name":"cli-sessions", "iam_environment_id":plane_id, "iam_environment_key":"I".repeat(32),
-        "app_secret":"test-environment-app-secret", "briefcase_environment_key":format!("ask_{}","B".repeat(43))
-    })).await?;
-    assert_eq!(status, StatusCode::OK);
+    let created = legacy_plane(&state, plane_id).await?;
     let key = created["key"].as_str().ok_or("root key missing")?;
-    let id = created["id"].as_str().ok_or("plane ID missing")?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -359,7 +354,7 @@ async fn real_cli_keeps_production_and_test_logins_separate() -> TestResult {
         vec!["--test", key, "me"],
         vec!["me"],
         vec!["--test", key, "refresh"],
-        vec!["--organization", "tos", "--test", id, "me"],
+        vec!["--organization", "tos", "--test", key, "me"],
         vec!["--test", key, "logout"],
         vec!["me"],
     ] {
@@ -426,7 +421,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
     settings.permanent_origin = "https://briefcase.example.test".parse()?;
     settings.cdn_origin = settings.permanent_origin.clone();
     crate::infrastructure::testing::seed_audio(&pool).await?;
-    let app = speech_app(state)?;
+    let app = speech_app(state.clone())?;
     let actor = Uuid::new_v4();
     let iam_plane = Uuid::new_v4();
     let mut actor_snapshot = snapshot(actor);
@@ -439,19 +434,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
         .respond_with(ResponseTemplate::new(200).set_body_json(actor_snapshot.clone()))
         .mount(&iam)
         .await;
-    let (status, created) = call(
-        &app,
-        "POST",
-        "/api/v1/testing-environments",
-        Some("oat_fixture"),
-        json!({
-            "name":format!("{kind}-roundtrip"), "iam_environment_id":iam_plane,
-            "iam_environment_key":"I".repeat(32), "app_secret":"test-environment-app-secret",
-            "briefcase_environment_key":format!("ask_{}","B".repeat(43))
-        }),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK, "{created}");
+    let created = legacy_plane(&state, iam_plane).await?;
     let root = created["key"].as_str().ok_or("missing root")?;
     actor_snapshot["authorization"]["testing_environment_id"] = json!(iam_plane);
     Mock::given(path("/api/v1/oauth/introspect"))

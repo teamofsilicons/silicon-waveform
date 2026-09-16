@@ -5,6 +5,10 @@ use sqlx::Row as _;
 use uuid::Uuid;
 
 impl ControlState {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "IAM discovery and fence validation are one atomic binding operation"
+    )]
     pub(super) async fn discover_plane(&self, secret: &str) -> Result<Plane, ControlError> {
         let iam = self
             .iam
@@ -28,6 +32,47 @@ impl ControlState {
         {
             return Err(ControlError::unauthorized());
         }
+        let fence = self.test_fence(id).await?;
+        // Repeat IAM validation under the lifecycle fence: a secret selected before
+        // a clean/rotation must not carry an old authority snapshot into the new world.
+        let confirmed = iam
+            .applications()
+            .testing_context()
+            .await
+            .map_err(ControlError::iam)?;
+        let fresh = confirmed
+            .environment
+            .as_ref()
+            .ok_or_else(ControlError::unauthorized)?;
+        if confirmed.environment_id != id
+            || confirmed.application.app_id != self.app_id
+            || fresh.version != meta.version
+            || fresh.key_generation != meta.key_generation
+            || fresh.cleaned_at != meta.cleaned_at
+            || fresh.org_id != meta.org_id
+        {
+            return Err(ControlError::unauthorized());
+        }
+        let managed = sqlx::query(
+            "SELECT org_id,key_version FROM waveform_lifecycle WHERE environment_id=$1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let honeycomb_managed = managed.is_some();
+        if let Some(row) = managed {
+            if row.try_get::<String, _>("org_id")? != meta.org_id
+                || row.try_get::<i64, _>("key_version")? != meta.key_generation
+            {
+                return Err(ControlError::unauthorized());
+            }
+            sqlx::query(
+                "UPDATE waveform_lifecycle SET last_activity_at=now() WHERE environment_id=$1",
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        }
         let vault = self.vault()?;
         let digest = vault
             .digest(secret, "environment-root")
@@ -46,7 +91,7 @@ impl ControlState {
                 return Err(ControlError::unauthorized());
             }
             let cleaned: Option<time::OffsetDateTime> = row.try_get("iam_cleaned_at")?;
-            if cleaned != meta.cleaned_at {
+            if !honeycomb_managed && cleaned != meta.cleaned_at {
                 // The environment row lock also fences existing idempotent speech work.
                 for table in [
                     "waveform_idempotency_records",
@@ -77,11 +122,14 @@ impl ControlState {
             .bind(id).bind(&meta.org_id).bind(creator).bind(&meta.name).bind(&meta.description).bind(digest).bind(root).bind(app).bind(meta.version).bind(meta.cleaned_at).bind(&current.webhook_key_digest).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO waveform_voice_profiles(plane_id,id,profile) SELECT $1,id,profile FROM waveform_voice_profiles WHERE plane_id=$2 ON CONFLICT DO NOTHING").bind(id).bind(Uuid::nil()).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO waveform_provider_defaults(plane_id,tts_order,stt_order,voice_profile) SELECT $1,tts_order,stt_order,voice_profile FROM waveform_provider_defaults WHERE plane_id=$2 ON CONFLICT DO NOTHING").bind(id).bind(Uuid::nil()).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO waveform_test_contract_usage(plane_id,version) VALUES($1,'v1') ON CONFLICT(plane_id,version) DO UPDATE SET last_request_at=now()")
+            .bind(id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(Plane {
             id,
             iam,
             iam_environment_id: Some(id),
+            fence: Some(fence),
         })
     }
 }

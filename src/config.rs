@@ -114,6 +114,8 @@ pub struct IamSettings {
 /// Secrets for product storage and authenticated lifecycle notifications.
 #[derive(Clone, Debug)]
 pub struct ControlSettings {
+    /// Dedicated Honeycomb participant credential, independent of runtime sessions.
+    pub honeycomb_token: Option<SecretString>,
     /// Independent 32-byte key encoded as 64 lowercase hexadecimal characters.
     pub encryption_key: Option<SecretString>,
     /// Caller-chosen IAM Application webhook signing secret.
@@ -323,6 +325,7 @@ impl Settings {
         let database = load_database(source, environment)?;
         let iam = load_iam(source)?;
         let control = ControlSettings {
+            honeycomb_token: optional_secret(source, "WAVEFORM_HONEYCOMB_SERVICE_TOKEN", 32, 512)?,
             encryption_key: optional_secret(source, "WAVEFORM_ENCRYPTION_KEY", 64, 64)?,
             webhook_secret: optional_secret(source, "WAVEFORM_WEBHOOK_SIGNING_SECRET", 32, 512)?,
             webhook_key_version: parse_or(source, "WAVEFORM_WEBHOOK_KEY_VERSION", "1")?,

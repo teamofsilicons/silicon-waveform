@@ -375,6 +375,16 @@ impl Client {
     pub fn update_status(&self) -> update::UpdateStatus {
         self.updater.status()
     }
+    /// Reads the current API compatibility matrix and deprecation policy.
+    pub async fn contracts(&self) -> Result<serde_json::Value> {
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .map_err(|_| Error::Invalid("invalid base URL".into()))?
+            .pop_if_empty()
+            .extend(["api", "contracts"]);
+        self.send_response(self.http.get(url)).await
+    }
+
     /// Reuses this client with an IAM bearer token.
     pub fn with_bearer(&self, token: impl Into<String>) -> Self {
         Self {
@@ -1141,7 +1151,12 @@ impl Client {
     }
 
     async fn send_empty_response(&self, request: reqwest::RequestBuilder) -> Result<()> {
-        let result = match request.send().await {
+        let result = match request
+            .header("x-waveform-api-version", "v1")
+            .header("x-waveform-protocol-version", "1")
+            .send()
+            .await
+        {
             Ok(response) => decode_empty_response(response).await,
             Err(error) => Err(Error::Transport(error)),
         };
@@ -1153,7 +1168,12 @@ impl Client {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<R> {
-        let result = match request.send().await {
+        let result = match request
+            .header("x-waveform-api-version", "v1")
+            .header("x-waveform-protocol-version", "1")
+            .send()
+            .await
+        {
             Ok(response) => decode_response(response).await,
             Err(error) => Err(Error::Transport(error)),
         };
@@ -1416,5 +1436,29 @@ mod tests {
             matches!(result, Err(Error::Invalid(message)) if message == "job polling timed out")
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
+    };
+    #[tokio::test]
+    async fn compatibility_discovery_survives_version_retirement() {
+        let server = MockServer::start().await;
+        let catalog = serde_json::json!({"service":"silicon-waveform","contracts":[{"api_version":"v1","state":"sunset"}]});
+        Mock::given(method("GET"))
+            .and(path("/api/contracts"))
+            .and(header("x-waveform-api-version", "v1"))
+            .and(header("x-waveform-protocol-version", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&catalog))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::new(&server.uri(), Auth::Anonymous).expect("fixture client");
+        assert_eq!(client.contracts().await.expect("discovery"), catalog);
     }
 }

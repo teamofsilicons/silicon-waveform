@@ -24,6 +24,7 @@ pub(super) async fn receive(
         .verify(&headers, &body)
         .map_err(|_| ControlError::unauthorized())?;
     let mut plane_id = Uuid::nil();
+    let mut received_digest = None;
     if delivery.is_testing() {
         // Never persist or log an unmatched test delivery, or its embedded key.
         let rows = sqlx::query("SELECT id, iam_key_cipher, webhook_key_digest FROM waveform_environments WHERE id<>$1 AND deleted_at IS NULL")
@@ -37,6 +38,7 @@ pub(super) async fn receive(
             .and_then(serde_json::Value::as_str)
             .ok_or_else(ControlError::unauthorized)?;
         let digest = format!("{:x}", Sha256::digest(received.as_bytes()));
+        received_digest = Some(digest.clone());
         for row in rows {
             let id: Uuid = row.try_get("id")?;
             let cipher: Vec<u8> = row.try_get("iam_key_cipher")?;
@@ -67,7 +69,36 @@ pub(super) async fn receive(
         }
         plane_id = matched.ok_or_else(ControlError::unauthorized)?;
     }
+    let _fence = if plane_id.is_nil() {
+        None
+    } else {
+        Some(state.test_fence(plane_id).await?)
+    };
+    if let Some(received) = received_digest {
+        let expected: Option<String> =
+            sqlx::query_scalar("SELECT webhook_key_digest FROM waveform_environments WHERE id=$1")
+                .bind(plane_id)
+                .fetch_optional(&state.pool)
+                .await?
+                .flatten();
+        if expected
+            .is_some_and(|expected| !bool::from(expected.as_bytes().ct_eq(received.as_bytes())))
+        {
+            return Err(ControlError::unauthorized());
+        }
+    }
     let event = delivery.event();
+    if !plane_id.is_nil() {
+        let cleaned: Option<time::OffsetDateTime> =
+            sqlx::query_scalar("SELECT cleaned_at FROM waveform_lifecycle WHERE environment_id=$1")
+                .bind(plane_id)
+                .fetch_optional(&state.pool)
+                .await?
+                .flatten();
+        if cleaned.is_some_and(|time| event.occurred_at <= time) {
+            return Ok(StatusCode::NO_CONTENT);
+        }
+    }
     let aggregate_id = event
         .aggregate
         .get("id")
