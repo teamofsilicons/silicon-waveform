@@ -592,11 +592,13 @@ async fn main() -> Result<(), String> {
         .test
         .as_ref()
         .map(|_| "Test environment: unresolved (validation required)".to_owned());
+    #[cfg(unix)]
     let local_enabled = fs::read(dirs_fallback().join("telemetry.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v["enabled"].as_bool())
         .unwrap_or(true);
+    #[cfg(unix)]
     let telemetry = if local_enabled
         && args.test.is_none()
         && !matches!(
@@ -607,6 +609,7 @@ async fn main() -> Result<(), String> {
     } else {
         None
     };
+    #[cfg(unix)]
     let step = match &args.command {
         Command::Tts { .. } => "tts",
         Command::Stt { .. } => "stt",
@@ -621,8 +624,10 @@ async fn main() -> Result<(), String> {
         Command::TestEnv { .. } => "legacy_environment_administration",
         _ => "read_configuration",
     };
+    #[cfg(unix)]
     let started = std::time::Instant::now();
     let result = run(args, &mut banner).await;
+    #[cfg(unix)]
     if let Some(station) = &telemetry {
         silicon_waveform_client::telemetry::record(
             station,
@@ -632,6 +637,7 @@ async fn main() -> Result<(), String> {
             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         );
     }
+    #[cfg(unix)]
     drop(telemetry);
     if let Err(error) = &result {
         eprintln!("{error}");
