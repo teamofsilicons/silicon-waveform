@@ -1,0 +1,2 @@
+# Keep release identity byte-for-byte identical across native build hosts.
+honeycomb.yaml text eol=lf
