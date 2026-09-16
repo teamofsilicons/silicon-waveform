@@ -16,7 +16,7 @@ name = "waveform-api"
 path = "src/bin/waveform_api.rs"
 
 [dependencies]
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 space-station = "0.1.1"
 anyhow = "1.0.100"
 async-trait = "0.1.89"

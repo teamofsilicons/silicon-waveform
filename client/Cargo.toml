@@ -9,7 +9,7 @@ documentation="https://docs.rs/silicon-waveform-client"
 license-file="LICENSE"
 readme="README.md"
 [dependencies]
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 space-station = "0.1.1"
 reqwest={version="0.13.4",default-features=false,features=["json","rustls"]}
 serde={version="1.0",features=["derive"]}
