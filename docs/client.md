@@ -82,6 +82,6 @@ the saved voice. TTS responses and jobs expose optional `VoiceProfileRef` metada
 
 ## Reporting and settings
 
-`report(message, pr, idempotency_key)` submits an authenticated report, with simulated delivery in sandboxes. `set_telemetry(org, actor, enabled)` controls the account opt-out. `telemetry::from_environment()` provides an optional Space Station sender for embedding programs; only record safe action labels and outcomes.
+`report(message, pr, idempotency_key)` submits an authenticated report, with simulated delivery in sandboxes. `set_telemetry(org, actor, enabled)` controls the account opt-out. On Unix, `telemetry::from_environment()` provides an optional Space Station sender for embedding programs; only record safe action labels and outcomes.
 
 `client.contracts().await?` reads version negotiation and compatibility information.

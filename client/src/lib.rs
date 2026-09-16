@@ -13,6 +13,8 @@ use std::{
 use thiserror::Error;
 use url::Url;
 
+/// Optional local Space Station integration, supported on Unix hosts only.
+#[cfg(unix)]
 pub mod telemetry;
 pub mod update;
 
