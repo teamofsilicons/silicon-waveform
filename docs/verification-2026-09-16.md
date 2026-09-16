@@ -34,9 +34,10 @@ sunset with persistent unversioned discovery.
 
 ## External verification still required
 
-The six-platform release workflow was added but not executed. A real distributable
-archive requires all six native binaries and successful `honeycomb validate` /
-`honeycomb pack`; no placeholder binaries or synthetic release archive were used.
+Six native CLI targets have now built and passed their tests. Downloaded artifacts
+were checked for native OS/CPU formats and matching manifests, then assembled
+with `honeycomb pack`; both the staging directory and final archive passed
+`honeycomb validate`. No placeholder binaries were used.
 The new participant credential and Honeycomb registry entry are deployment
 configuration, and live shared-environment readiness still depends on IAM and
 Honeycomb. Controlled HTTP fixtures do not establish live paid speech, real email,
@@ -55,3 +56,21 @@ Merged verification passed: 154 backend unit tests, 2 Briefcase contract tests,
 13 PostgreSQL control/lifecycle/source-target integrations, 8 PostgreSQL transaction
 tests, 11 client tests, and 13 CLI tests. Backend strict Clippy and dependency policy
 passed, and all 24 documentation pages passed the link/canonical checks.
+
+## Honeycomb build artifacts
+
+Build source: `9a8dece62e3b7f887a00b37bb93d4a043322bb7a`, CLI release 0.1.2,
+application `tos>waveform`. The [six-platform release run](https://github.com/teamofsilicons/silicon-waveform/actions/runs/35083867470)
+builds and tests Linux, Windows and macOS on x86_64 and aarch64. Each native
+artifact contains `honeycomb.yaml`; the final archive includes the same manifest
+and all six binaries, with archive and binary SHA-256 files supplied separately.
+
+The initial Windows runs exposed a Unix-only Space Station dependency and calls.
+They are now compiled only on Unix; Windows retains the speech/authentication
+client and account preference APIs. Git attributes preserve LF manifest bytes
+on Windows so cross-platform artifact identity checks remain exact.
+
+Frontend tests (16), production build, and all 24 docs-page checks passed locally.
+Downloaded frontend and docs artifacts include the canonical manifest. CI builds
+both API and frontend images and compares their embedded manifests against the
+root file. Production rollout and Honeycomb publication remain on hold.
