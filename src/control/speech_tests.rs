@@ -88,7 +88,7 @@ fn speech_app(state: Arc<ControlState>) -> Result<Router, Box<dyn std::error::Er
 #[tokio::test]
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
 #[allow(clippy::too_many_lines)]
-async fn test_tts_uploads_exact_fixture_with_both_paired_keys() -> TestResult {
+async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -> TestResult {
     let (pool, schema) = database().await?;
     let iam = MockServer::start().await;
     let storage = MockServer::start().await;
@@ -107,25 +107,26 @@ async fn test_tts_uploads_exact_fixture_with_both_paired_keys() -> TestResult {
         .respond_with(ResponseTemplate::new(200).set_body_json(snapshot(actor)))
         .mount(&iam)
         .await;
-    let (status, created) = call(&app, "POST", "/api/v1/testing-environments", Some("oat_fixture"), json!({
-        "name":"paired-storage", "iam_environment_id":iam_plane, "iam_environment_key":"I".repeat(32),
-        "app_secret":"test-environment-app-secret", "briefcase_environment_key":"B".repeat(32)
-    })).await?;
-    assert_eq!(status, StatusCode::OK);
-    let root = created["key"].as_str().ok_or("missing root")?;
+    let root = format!("ask_{}", "W".repeat(43));
+    super::mock_discovery(&iam, iam_plane, &root, 1, None).await;
+    let created = json!({"id":iam_plane});
     let mut test_snapshot = snapshot(actor);
     test_snapshot["authorization"]["testing_environment_id"] = json!(iam_plane);
+    test_snapshot["authorization"]["scopes"] = json!([
+        "obo:tos>briefcase:briefcase.files.create",
+        "obo:tos>briefcase:briefcase.files.read"
+    ]);
     Mock::given(path("/api/v1/oauth/introspect"))
-        .and(header("x-testing-environment-key", "I".repeat(32)))
+        .and(header("x-testing-application", basic_test(&root)))
         .respond_with(ResponseTemplate::new(200).set_body_json(test_snapshot))
         .with_priority(1)
         .mount(&iam)
         .await;
     Mock::given(method("GET")).and(path("/api/v1/obo-access/applications/tos%3Ebriefcase/endpoints"))
-        .and(header("x-testing-environment-key", "I".repeat(32)))
+        .and(header("x-testing-application", basic_test(&root)))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "application":{"app_id":"tos>briefcase","org_id":"tos"},
-            "endpoints":[{"endpoint_id":"briefcase.files.create","path":"/api/v1/obo/files","metadata":{"path":{"type":"string"},"name":{"type":"string"},"content_type":{"type":"string"}}}, {"endpoint_id":"briefcase.entries.list","path":"/api/v1/obo/entries/list","metadata":{}}, {"endpoint_id":"briefcase.files.read","path":"/api/v1/obo/files/read","metadata":{}}]
+            "endpoints":[{"critical":false,"endpoint_id":"briefcase.files.create","path":"/api/v1/obo/files","metadata":{"path":{"type":"string"},"name":{"type":"string"},"content_type":{"type":"string"}}}, {"critical":false,"endpoint_id":"briefcase.entries.list","path":"/api/v1/obo/entries/list","metadata":{}}, {"critical":false,"endpoint_id":"briefcase.files.read","path":"/api/v1/obo/files/read","metadata":{}}]
         }))).expect(4).mount(&iam).await;
     let read_ledger = Arc::new(Mutex::new(ReadLedger::default()));
     let minted_reads = read_ledger.clone();
@@ -136,7 +137,7 @@ async fn test_tts_uploads_exact_fixture_with_both_paired_keys() -> TestResult {
         include_bytes!("../infrastructure/test-audio/puck.mp3"),
     ];
     Mock::given(method("POST")).and(path("/api/v1/obo-access/exchanges"))
-        .and(header("x-testing-environment-key", "I".repeat(32)))
+        .and(header("x-testing-application", basic_test(&root)))
         .respond_with(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap_or_else(|_| panic!("exchange JSON"));
             assert_eq!(body["subject_token"], "oat_fixture");
@@ -146,25 +147,25 @@ async fn test_tts_uploads_exact_fixture_with_both_paired_keys() -> TestResult {
                 let endpoint = body["endpoint_id"].as_str().unwrap_or_else(|| panic!("endpoint"));
                 let digest = body["request"]["body_sha256"].as_str().unwrap_or_else(|| panic!("digest"));
                 minted_reads.lock().unwrap_or_else(|_| panic!("ledger")).proofs.insert(proof.clone(), (endpoint.to_owned(), digest.to_owned()));
-                return ResponseTemplate::new(201).set_body_json(json!({"access_proof":proof,"proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}));
+                return ResponseTemplate::new(201).set_body_json(json!({"testing_context":{"app_id":"tos>briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)},"access_proof":proof,"proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}));
             }
             let clip_index = exchange_names.lock().unwrap_or_else(|_| panic!("exchange lock")).len();
             assert_eq!(body["request"]["body_sha256"], silicon_iam_client::api::obo::body_sha256(expected_clips[clip_index]));
             assert!(request.headers.contains_key("x-obo-signature"));
             exchange_names.lock().unwrap_or_else(|_| panic!("exchange lock")).push(body["metadata"]["name"].as_str().unwrap_or_else(|| panic!("upload name")).to_owned());
-            ResponseTemplate::new(201).set_body_json(json!({"access_proof":"obo_paired_upload","proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
+            ResponseTemplate::new(201).set_body_json(json!({"testing_context":{"app_id":"tos>briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)},"access_proof":"obo_paired_upload","proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
         }).expect(4).mount(&iam).await;
     let operations = briefcase_client::OPERATIONS
         .iter()
         .map(|o| json!({"id":o.id,"version":o.version,"method":o.method,"path":o.path}))
         .collect::<Vec<_>>();
-    Mock::given(path("/api/version")).and(header("x-testing-environment-key", "B".repeat(32)))
+    Mock::given(path("/api/version"))
         .respond_with(ResponseTemplate::new(200).insert_header("briefcase-api-version","v1").set_body_json(json!({
             "service":"silicon-briefcase", "selected_api_version":"v1", "supported_api_versions":["v1"], "contract_version":"1.0.0", "build":"local-test", "operations":operations
-        }))).expect(3).mount(&storage).await;
+        }))).expect(5).mount(&storage).await;
     let stored_names = uploads.clone();
     Mock::given(method("POST")).and(path("/api/v1/obo/files"))
-        .and(header("x-testing-environment-key", "B".repeat(32)))
+        .and(header("x-briefcase-app-secret", format!("ask_{}","B".repeat(43))))
         .and(header("x-iam-obo-access-proof", "obo_paired_upload"))
         .and(header("x-app-id", "tos>waveform"))
         .respond_with(move |request: &wiremock::Request| {
@@ -183,7 +184,7 @@ async fn test_tts_uploads_exact_fixture_with_both_paired_keys() -> TestResult {
     let list_proofs = read_ledger.clone();
     let replay_entry_id = Uuid::new_v4();
     Mock::given(path("/api/v1/obo/entries/list"))
-        .and(header("x-testing-environment-key", "B".repeat(32)))
+        .and(header("x-briefcase-app-secret", format!("ask_{}","B".repeat(43))))
         .respond_with(move |request: &wiremock::Request| {
             consume_read_proof(&list_proofs, request, "briefcase.entries.list");
             let names = read_names.lock().unwrap_or_else(|_| panic!("names"));
@@ -197,7 +198,10 @@ async fn test_tts_uploads_exact_fixture_with_both_paired_keys() -> TestResult {
         }).expect(1).mount(&storage).await;
     let file_proofs = read_ledger.clone();
     Mock::given(path("/api/v1/obo/files/read"))
-        .and(header("x-testing-environment-key", "B".repeat(32)))
+        .and(header(
+            "x-briefcase-app-secret",
+            format!("ask_{}", "B".repeat(43)),
+        ))
         .respond_with(move |request: &wiremock::Request| {
             consume_read_proof(&file_proofs, request, "briefcase.files.read");
             let body: Value =
@@ -225,7 +229,7 @@ async fn test_tts_uploads_exact_fixture_with_both_paired_keys() -> TestResult {
             .header("content-type", "application/json")
             .header("authorization", "Bearer oat_fixture")
             .header("x-org-id", "tos")
-            .header("x-testing-environment-key", root)
+            .header("x-testing-environment-key", &root)
             .header("idempotency-key", key)
             .body(Body::from(
                 json!({"text":"use the deterministic fixture", "voice_profile": if index == 1 { Some("puck") } else { None }}).to_string(),
@@ -338,7 +342,7 @@ async fn real_cli_keeps_production_and_test_logins_separate() -> TestResult {
         .await;
     let (status, created) = call(&app, "POST", "/api/v1/testing-environments", Some("oat_fixture"), json!({
         "name":"cli-sessions", "iam_environment_id":plane_id, "iam_environment_key":"I".repeat(32),
-        "app_secret":"test-environment-app-secret", "briefcase_environment_key":"B".repeat(32)
+        "app_secret":"test-environment-app-secret", "briefcase_environment_key":format!("ask_{}","B".repeat(43))
     })).await?;
     assert_eq!(status, StatusCode::OK);
     let key = created["key"].as_str().ok_or("root key missing")?;
@@ -427,6 +431,10 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
     let iam_plane = Uuid::new_v4();
     let mut actor_snapshot = snapshot(actor);
     actor_snapshot["authorization"]["actor_type"] = json!(kind);
+    actor_snapshot["authorization"]["scopes"] = json!([
+        "obo:tos>briefcase:briefcase.files.create",
+        "obo:tos>briefcase:briefcase.files.read"
+    ]);
     Mock::given(path("/api/v1/oauth/introspect"))
         .respond_with(ResponseTemplate::new(200).set_body_json(actor_snapshot.clone()))
         .mount(&iam)
@@ -439,7 +447,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
         json!({
             "name":format!("{kind}-roundtrip"), "iam_environment_id":iam_plane,
             "iam_environment_key":"I".repeat(32), "app_secret":"test-environment-app-secret",
-            "briefcase_environment_key":"B".repeat(32)
+            "briefcase_environment_key":format!("ask_{}","B".repeat(43))
         }),
     )
     .await?;
@@ -456,8 +464,8 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
         .and(header("x-testing-environment-key", "I".repeat(32)))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "application":{"app_id":"tos>briefcase","org_id":"tos"}, "endpoints":[
-                {"endpoint_id":"briefcase.entries.list","path":"/api/v1/obo/entries/list","metadata":{}},
-                {"endpoint_id":"briefcase.files.read","path":"/api/v1/obo/files/read","metadata":{}}
+                {"critical":false,"endpoint_id":"briefcase.entries.list","path":"/api/v1/obo/entries/list","metadata":{}},
+                {"critical":false,"endpoint_id":"briefcase.files.read","path":"/api/v1/obo/files/read","metadata":{}}
             ]
         }))).mount(&iam).await;
     let ledger = Arc::new(Mutex::new(ReadLedger::default()));
@@ -476,14 +484,14 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
                 body["endpoint_id"].as_str().expect("endpoint").to_owned(),
                 body["request"]["body_sha256"].as_str().expect("digest").to_owned(),
             ));
-            ResponseTemplate::new(201).set_body_json(json!({"access_proof":proof,"proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
+            ResponseTemplate::new(201).set_body_json(json!({"testing_context":{"app_id":"tos>briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)},"access_proof":proof,"proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
         }).mount(&iam).await;
     let operations: Vec<_> = briefcase_client::OPERATIONS
         .iter()
         .map(|o| json!({"id":o.id,"version":o.version,"method":o.method,"path":o.path}))
         .collect();
     Mock::given(path("/api/version"))
-        .and(header("x-testing-environment-key", "B".repeat(32)))
+        .and(header("x-briefcase-app-secret", format!("ask_{}","B".repeat(43))))
         .respond_with(ResponseTemplate::new(200).insert_header("briefcase-api-version", "v1")
             .set_body_json(json!({"service":"silicon-briefcase","selected_api_version":"v1","supported_api_versions":["v1"],"contract_version":"1.0.0","build":"local-test","operations":operations})))
         .mount(&storage).await;
@@ -493,7 +501,10 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
     let listing = ledger.clone();
     Mock::given(method("POST"))
         .and(path("/api/v1/obo/entries/list"))
-        .and(header("x-testing-environment-key", "B".repeat(32)))
+        .and(header(
+            "x-briefcase-app-secret",
+            format!("ask_{}", "B".repeat(43)),
+        ))
         .and(header("x-app-id", "tos>waveform"))
         .respond_with(move |request: &wiremock::Request| {
             consume_read_proof(&listing, request, "briefcase.entries.list");
@@ -514,7 +525,10 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
     let reading = ledger.clone();
     Mock::given(method("POST"))
         .and(path("/api/v1/obo/files/read"))
-        .and(header("x-testing-environment-key", "B".repeat(32)))
+        .and(header(
+            "x-briefcase-app-secret",
+            format!("ask_{}", "B".repeat(43)),
+        ))
         .and(header("x-app-id", "tos>waveform"))
         .respond_with(move |request: &wiremock::Request| {
             consume_read_proof(&reading, request, "briefcase.files.read");
@@ -780,4 +794,12 @@ fn one_second_wav() -> Vec<u8> {
     wav.extend_from_slice(&16_000_u32.to_le_bytes());
     wav.resize(16_044, 0);
     wav
+}
+
+fn basic_test(secret: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    format!(
+        "Basic {}",
+        STANDARD.encode(format!("tos>waveform:{secret}"))
+    )
 }

@@ -48,6 +48,7 @@ export interface VoiceProfile {
   };
 }
 export interface Preferences {
+  telemetry_enabled?: boolean;
   voice_profile: string;
   tts_order: Provider[];
   stt_order: Provider[];
@@ -187,4 +188,10 @@ export function safeUrl(value?: string | null) {
   } catch {
     return undefined;
   }
+}
+
+/** Diagnostic events use the same authenticated gateway; no table key enters the browser. */
+export function recordEvent(event: "speech_completed" | "speech_failed" | "settings_saved" | "page_view", elapsed_ms = 0) {
+  if (session()?.plane === "test" || !session()?.authenticated) return;
+  void api("/api/v1/telemetry", {method:"POST", body:{event,elapsed_ms}}).catch(()=>{});
 }

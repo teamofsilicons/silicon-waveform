@@ -1,8 +1,11 @@
 //! Durable product APIs: application login, account settings and IAM events.
 
 mod accounts;
+mod discovery;
 mod environments;
+mod events;
 mod jobs;
+mod reporting;
 mod sessions;
 #[cfg(test)]
 mod tests;
@@ -36,8 +39,12 @@ use vault::Vault;
 /// Shared infrastructure for the user-facing control APIs.
 pub struct ControlState {
     pool: PgPool,
+    mail: Option<reporting::Mail>,
+    station: Option<space_station::SpaceClient>,
     iam: Client,
     app_id: String,
+    tts_scope: String,
+    stt_scope: String,
     briefcase_settings: crate::config::BriefcaseSettings,
     iam_timeout: std::time::Duration,
     vault: Option<Vault>,
@@ -77,9 +84,13 @@ impl ControlState {
             })
             .transpose()?;
         Ok(Self {
+            mail: reporting::Mail::from_env()?,
+            station: crate::telemetry::from_environment(),
             pool,
             iam,
             app_id: settings.iam.app_id.clone(),
+            tts_scope: settings.iam.tts_action.clone(),
+            stt_scope: settings.iam.stt_action.clone(),
             briefcase_settings: settings.briefcase.clone(),
             iam_timeout: settings.iam.timeout,
             vault,
@@ -104,6 +115,9 @@ impl ControlState {
                 iam_environment_id: None,
             });
         };
+        if key.starts_with("ask_") {
+            return self.discover_plane(key).await;
+        }
         EnvironmentKey::new(key).map_err(|_| ControlError::unauthorized())?;
         let digest = self
             .vault()?
@@ -187,6 +201,14 @@ impl ControlState {
         }
         self.ensure_voice_default(plane.id, &authority.org_id, authority.principal_id)
             .await?;
+        if plane.id.is_nil()
+            && let Some(station) = &self.station
+        {
+            let enabled: bool = sqlx::query_scalar("SELECT COALESCE((SELECT telemetry_enabled FROM waveform_account_preferences WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3),true)").bind(plane.id).bind(&authority.org_id).bind(authority.principal_id).fetch_one(&self.pool).await?;
+            if enabled {
+                crate::telemetry::record(station, "backend", "iam_authorization", true, 0);
+            }
+        }
         Ok(Identity { plane, authority })
     }
 
@@ -197,21 +219,42 @@ impl ControlState {
     pub(crate) async fn authorize_test_speech(
         &self,
         headers: &HeaderMap,
+        required_scope: &str,
     ) -> Result<TestSpeechContext, ControlError> {
         let identity = self.identity(headers).await?;
         if identity.plane.id.is_nil() {
             return Err(ControlError::bad_request("test_environment_required"));
         }
+        let required_scope = if required_scope == "tts" {
+            &self.tts_scope
+        } else {
+            &self.stt_scope
+        };
+        if !identity
+            .authority
+            .scopes
+            .iter()
+            .any(|scope| scope == required_scope)
+        {
+            return Err(ControlError::forbidden());
+        }
         let plane_id = identity.plane.id;
         let actor = Self::authorized_actor_from_identity(&identity)?;
         let cipher: Vec<u8> = sqlx::query_scalar("SELECT briefcase_key_cipher FROM waveform_environments WHERE id=$1 AND deleted_at IS NULL")
             .bind(plane_id).fetch_one(&self.pool).await?;
-        let key = self
-            .vault()?
-            .open(&cipher, &format!("{plane_id}/briefcase-key"))
-            .map_err(ControlError::internal)?;
-        let environment = briefcase_client::EnvironmentKey::new(key.expose_secret())
-            .map_err(|_| ControlError::unavailable("invalid_environment_binding"))?;
+        let environment = if cipher.is_empty() {
+            None
+        } else {
+            let key = self
+                .vault()?
+                .open(&cipher, &format!("{plane_id}/briefcase-key"))
+                .map_err(ControlError::internal)?;
+            Some(
+                briefcase_client::EnvironmentKey::new(key.expose_secret()).map_err(|_| {
+                    ControlError::unavailable("legacy_environment_requires_iam_app_secret")
+                })?,
+            )
+        };
         let iam = Arc::new(crate::infrastructure::auth::TestStorageDelegator {
             sdk: identity.plane.iam,
             application_id: self
@@ -220,13 +263,15 @@ impl ControlState {
                 .map_err(|_| ControlError::unavailable("invalid_application"))?,
             audience: self.briefcase_settings.audience.clone(),
         });
-        let briefcase = crate::infrastructure::briefcase::FailClosedBriefcaseStore::new(
+        let mut briefcase = crate::infrastructure::briefcase::FailClosedBriefcaseStore::new(
             &self.briefcase_settings,
         )
         .map_err(|_| ControlError::unavailable("invalid_briefcase_configuration"))?
         .with_uploads(&self.briefcase_settings)
-        .with_reads(&self.briefcase_settings, iam.clone())
-        .with_environment(environment);
+        .with_reads(&self.briefcase_settings, iam.clone());
+        if let Some(environment) = environment {
+            briefcase = briefcase.with_environment(environment);
+        }
         Ok(TestSpeechContext {
             authorization: actor,
             plane_id,
@@ -274,9 +319,9 @@ impl ControlState {
         identity: &Identity,
     ) -> Result<AuthorizedActor, ControlError> {
         let actor_kind = match identity.authority.actor_type {
-            models::ApplicationAuthorizationActorType::Carbon => ActorKind::Carbon,
-            models::ApplicationAuthorizationActorType::Silicon => ActorKind::Silicon,
-            models::ApplicationAuthorizationActorType::Other(_) => {
+            Some(models::ApplicationAuthorizationActorType::Carbon) => ActorKind::Carbon,
+            Some(models::ApplicationAuthorizationActorType::Silicon) => ActorKind::Silicon,
+            Some(models::ApplicationAuthorizationActorType::Other(_)) | None => {
                 return Err(ControlError::forbidden());
             }
         };
@@ -307,7 +352,7 @@ impl ControlState {
         .await?
         .rows_affected();
         let expired = sqlx::query(
-            "UPDATE waveform_environments SET deleted_at=now() WHERE id <> $1 AND deleted_at IS NULL AND last_activity_at < now() - interval '15 days'",
+            "UPDATE waveform_environments SET deleted_at=now() WHERE id <> $1 AND deleted_at IS NULL AND iam_control_version IS NULL AND last_activity_at < now() - interval '15 days'",
         )
         .bind(Uuid::nil())
         .execute(&self.pool)
@@ -338,6 +383,8 @@ struct Identity {
 /// Routes merged before the main API's admission, deadlines and logging layers.
 pub fn router(state: Arc<ControlState>) -> Router {
     Router::new()
+        .route("/api/v1/telemetry", post(events::record))
+        .route("/api/v1/reports", post(reporting::submit))
         .route("/api/v1/iam", get(sessions::iam))
         .route("/api/v1/auth/login", post(sessions::login))
         .route("/api/v1/auth/refresh", post(sessions::refresh))

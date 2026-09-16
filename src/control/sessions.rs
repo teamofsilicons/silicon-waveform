@@ -1,4 +1,4 @@
-//! SLT-only application login; user credentials never enter Waveform.
+//! Application login: issued SLTs, plus IAM-validated public IDs in testing only.
 
 use super::{ControlError, ControlState};
 use axum::{
@@ -66,17 +66,24 @@ pub(super) async fn login(
     Json(body): Json<Login>,
 ) -> Result<Response, ControlError> {
     // IAM calls this an SLT, but serializes it as an OAuth authorization code.
-    validate_token(&body.slt, "oac_")?;
     let plane = state.plane(&headers).await?;
+    if plane.id.is_nil() || body.slt.starts_with("oac_") {
+        validate_token(&body.slt, "oac_")?;
+    } else if body.slt.is_empty()
+        || body.slt.len() > 256
+        || !body.slt.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err(ControlError::bad_request("invalid_test_identity"));
+    }
     let tokens = plane
         .iam
         .oauth()
         .login(&state.app_id, &body.slt, &Mutation::new())
         .await
         .map_err(ControlError::iam)?;
-    if let Some(org) = &tokens.org_id {
+    if let (Some(org), Some(actor)) = (&tokens.org_id, &tokens.actor) {
         state
-            .ensure_voice_default(plane.id, org, tokens.actor.principal_id)
+            .ensure_voice_default(plane.id, org, actor.principal_id)
             .await?;
     }
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(tokens)).into_response())

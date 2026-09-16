@@ -146,7 +146,7 @@ export default function Environments(props: {
         action={
           <div class="actions">
             <button class="button" onClick={props.connect}>
-              Connect with a key
+              Use a test app_secret
             </button>
             <Show
               when={
@@ -161,13 +161,13 @@ export default function Environments(props: {
                   setCreating(true);
                 }}
               >
-                Create environment
+                Create legacy environment
               </button>
             </Show>
           </div>
         }
       >
-        A separate space to try everything.
+        Create new sandboxes in IAM, then connect with Waveform’s app_secret. The administration controls below are for legacy paired environments.
       </Heading>
       <Notice error={error() || environments.error} message={notice()} />
       <Show
@@ -344,7 +344,7 @@ export default function Environments(props: {
       </div>
       <Show when={creating()}>
         <Modal
-          title="Create testing environment"
+          title="Legacy sandbox administration"
           wide
           close={() => {
             if (!busy()) {
@@ -413,20 +413,20 @@ export default function Environments(props: {
               />
             </label>
             <label>
-              Briefcase environment key
+              Briefcase test app_secret
               <input
                 required
                 type="password"
                 autocomplete="off"
-                pattern="[A-Za-z0-9]{32}"
+                pattern="ask_[A-Za-z0-9_-]{43}"
                 value={briefcaseKey()}
                 onInput={(e) => setBriefcaseKey(e.currentTarget.value)}
-                placeholder="32-character key"
+                placeholder="ask_…"
               />
             </label>
             <Notice error={error()} />
             <button class="button primary" disabled={busy()}>
-              {busy() ? "Creating…" : "Create environment"}
+              {busy() ? "Creating…" : "Create legacy environment"}
             </button>
           </form>
         </Modal>

@@ -69,7 +69,7 @@ impl BriefcaseSdkReader {
         &self,
         authority: &ReadAuthority<'_>,
         manifest: &DelegatedManifest<T>,
-    ) -> Result<OboProof, BriefcaseError> {
+    ) -> Result<(OboProof, Option<EnvironmentKey>), BriefcaseError> {
         let result = self
             .iam
             .delegate(DelegationRequest {
@@ -105,7 +105,16 @@ impl BriefcaseSdkReader {
         {
             return Err(BriefcaseError::Unauthorized);
         }
-        OboProof::new(result.proof.expose_secret()).map_err(map_sdk)
+        let environment = result
+            .testing_secret
+            .as_ref()
+            .map(|s| EnvironmentKey::new(secrecy::ExposeSecret::expose_secret(s)))
+            .transpose()
+            .map_err(map_sdk)?;
+        Ok((
+            OboProof::new(result.proof.expose_secret()).map_err(map_sdk)?,
+            environment,
+        ))
     }
 
     // Decode URL segments exactly once. A path is a lookup key, never a URL to fetch.
@@ -160,7 +169,19 @@ impl BriefcaseSdkReader {
             }
             .prepare()
             .map_err(map_sdk)?;
-            let proof = self.proof(authority, &manifest).await?;
+            let (proof, discovered_environment) = self.proof(authority, &manifest).await?;
+            let scoped;
+            let client = if discovered_environment.is_some() {
+                scoped = self
+                    .connect(
+                        authority.actor.organization_id.as_str(),
+                        discovered_environment,
+                    )
+                    .await?;
+                &scoped
+            } else {
+                client
+            };
             let page = client
                 .list_entries_on_behalf_of(&app, proof, &manifest)
                 .await
@@ -220,7 +241,19 @@ impl BriefcaseSdkReader {
         }
         .prepare()
         .map_err(map_sdk)?;
-        let proof = self.proof(authority, &manifest).await?;
+        let (proof, discovered_environment) = self.proof(authority, &manifest).await?;
+        let scoped;
+        let client = if discovered_environment.is_some() {
+            scoped = self
+                .connect(
+                    authority.actor.organization_id.as_str(),
+                    discovered_environment,
+                )
+                .await?;
+            &scoped
+        } else {
+            &client
+        };
         let app = ApplicationId::new(&self.settings.app_id).map_err(map_sdk)?;
         client
             .read_file_on_behalf_of(&app, proof, &manifest)

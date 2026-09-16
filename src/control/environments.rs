@@ -63,7 +63,8 @@ pub(super) async fn create(
         return Err(ControlError::bad_request("invalid_environment_name"));
     }
     validate_key(&body.iam_environment_key)?;
-    validate_key(&body.briefcase_environment_key)?;
+    briefcase_client::EnvironmentKey::new(&body.briefcase_environment_key)
+        .map_err(|_| ControlError::bad_request("briefcase_test_app_secret_required"))?;
     if body.app_secret.trim().is_empty()
         || body.app_secret.len() > 512
         || body
@@ -193,13 +194,19 @@ pub(super) async fn key(
         return Err(ControlError::bad_request("production_management_required"));
     }
     let row = sqlx::query(
-        "SELECT creator_id,root_key_cipher FROM waveform_environments WHERE id=$1 AND org_id=$2 AND deleted_at IS NULL",
+        "SELECT creator_id,root_key_cipher,iam_control_version FROM waveform_environments WHERE id=$1 AND org_id=$2 AND deleted_at IS NULL",
     )
     .bind(environment_id)
     .bind(&identity.authority.org_id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(ControlError::not_found)?;
+    if row
+        .try_get::<Option<i64>, _>("iam_control_version")?
+        .is_some()
+    {
+        return Err(ControlError::bad_request("manage_environment_in_iam"));
+    }
     let creator: Uuid = row.try_get("creator_id")?;
     if !can_manage(&identity, creator) {
         return Err(ControlError::forbidden());
@@ -221,9 +228,15 @@ pub(super) async fn rotate_key(
     if !identity.plane.id.is_nil() {
         return Err(ControlError::bad_request("production_management_required"));
     }
-    let row = sqlx::query("SELECT creator_id FROM waveform_environments WHERE id=$1 AND org_id=$2 AND deleted_at IS NULL")
+    let row = sqlx::query("SELECT creator_id,iam_control_version FROM waveform_environments WHERE id=$1 AND org_id=$2 AND deleted_at IS NULL")
         .bind(environment_id).bind(&identity.authority.org_id).fetch_optional(&state.pool).await?
         .ok_or_else(ControlError::not_found)?;
+    if row
+        .try_get::<Option<i64>, _>("iam_control_version")?
+        .is_some()
+    {
+        return Err(ControlError::bad_request("manage_environment_in_iam"));
+    }
     let creator: Uuid = row.try_get("creator_id")?;
     if !can_manage(&identity, creator) {
         return Err(ControlError::forbidden());
@@ -251,9 +264,15 @@ pub(super) async fn delete(
     if !identity.plane.id.is_nil() {
         return Err(ControlError::bad_request("production_management_required"));
     }
-    let row = sqlx::query("SELECT creator_id FROM waveform_environments WHERE id=$1 AND org_id=$2 AND deleted_at IS NULL")
+    let row = sqlx::query("SELECT creator_id,iam_control_version FROM waveform_environments WHERE id=$1 AND org_id=$2 AND deleted_at IS NULL")
         .bind(environment_id).bind(&identity.authority.org_id).fetch_optional(&state.pool).await?
         .ok_or_else(ControlError::not_found)?;
+    if row
+        .try_get::<Option<i64>, _>("iam_control_version")?
+        .is_some()
+    {
+        return Err(ControlError::bad_request("manage_environment_in_iam"));
+    }
     let creator: Uuid = row.try_get("creator_id")?;
     if !can_manage(&identity, creator) {
         return Err(ControlError::forbidden());
@@ -276,9 +295,15 @@ pub(super) async fn restore(
     if !identity.plane.id.is_nil() {
         return Err(ControlError::bad_request("production_management_required"));
     }
-    let row = sqlx::query("SELECT creator_id FROM waveform_environments WHERE id=$1 AND org_id=$2 AND deleted_at IS NOT NULL AND deleted_at > now() - interval '30 days'")
+    let row = sqlx::query("SELECT creator_id,iam_control_version FROM waveform_environments WHERE id=$1 AND org_id=$2 AND deleted_at IS NOT NULL AND deleted_at > now() - interval '30 days'")
         .bind(environment_id).bind(&identity.authority.org_id).fetch_optional(&state.pool).await?
         .ok_or_else(ControlError::not_found)?;
+    if row
+        .try_get::<Option<i64>, _>("iam_control_version")?
+        .is_some()
+    {
+        return Err(ControlError::bad_request("manage_environment_in_iam"));
+    }
     let creator: Uuid = row.try_get("creator_id")?;
     if !can_manage(&identity, creator) {
         return Err(ControlError::forbidden());
@@ -296,9 +321,26 @@ pub(super) async fn clean(
     State(state): State<Arc<ControlState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ControlError> {
-    let plane = state.plane(&headers).await?;
+    let identity = state.identity(&headers).await?;
+    let plane = identity.plane;
     if plane.id.is_nil() {
         return Err(ControlError::bad_request("test_environment_required"));
+    }
+    // IAM alone owns lifecycle for discovered environments. A secret is not admin authority.
+    let discovered: bool = sqlx::query_scalar(
+        "SELECT iam_control_version IS NOT NULL FROM waveform_environments WHERE id=$1",
+    )
+    .bind(plane.id)
+    .fetch_one(&state.pool)
+    .await?;
+    if discovered {
+        return Err(ControlError::bad_request("manage_environment_in_iam"));
+    }
+    if !matches!(
+        identity.authority.org_role.as_deref(),
+        Some("admin" | "owner" | "head" | "org_admin" | "org_owner" | "org_head")
+    ) {
+        return Err(ControlError::forbidden());
     }
     let mut transaction = state.pool.begin().await?;
     sqlx::query(
@@ -313,6 +355,7 @@ pub(super) async fn clean(
         "waveform_webhook_events",
         "waveform_account_preferences",
         "waveform_provider_keys",
+        "waveform_bug_reports",
     ] {
         let statement = format!("DELETE FROM {table} WHERE plane_id=$1");
         sqlx::query(sqlx::AssertSqlSafe(statement))

@@ -1,4 +1,4 @@
-//! Opportunistic CLI updates after the requested command finishes.
+//! Hourly updates driven by the independent updater daemon.
 use silicon_waveform_client::update;
 use std::{
     fs,
@@ -60,13 +60,29 @@ pub async fn automatic(directory: &Path) -> Result<(), String> {
     // Reserve before network work, including failed attempts; the OS lock is
     // released on process exit and does not leave a stale lock directory.
     fs::write(&state_path, now.to_string()).map_err(|e| e.to_string())?;
-    let release = update::check("waveform-cli", env!("CARGO_PKG_VERSION"))
+    let installed = fs::read_to_string(directory.join("installed-version"))
+        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned());
+    let installed = installed
+        .trim()
+        .parse::<semver::Version>()
+        .unwrap_or_else(|_| {
+            semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("valid package version")
+        });
+    let compiled =
+        semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("valid package version");
+    let current = installed.max(compiled).to_string();
+    let release = update::check("waveform-cli", &current)
         .await
         .map_err(|e| e.to_string())?;
     if release.update_available() {
         update::install_binary("waveform-cli", &release.latest)
             .await
             .map_err(|e| e.to_string())?;
+        fs::write(
+            directory.join("installed-version"),
+            release.latest.to_string(),
+        )
+        .map_err(|e| e.to_string())?;
         eprintln!(
             "Waveform updated to {}; the next command uses the new release.",
             release.latest

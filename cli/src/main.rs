@@ -1,5 +1,6 @@
 //! Stateful Waveform CLI. Session material lives under a private `.waveform` directory.
 use clap::{Parser, Subcommand};
+mod daemon;
 mod updater;
 
 use silicon_waveform_client::{
@@ -16,13 +17,17 @@ use std::{
 #[command(
     name = "waveform",
     version,
-    about = "Synchronous Silicon Waveform speech client",
+    about = "Silicon Waveform: speech for Carbons and Silicons",
+    after_help = "Start: waveform iam --json → waveform login SLT → waveform tts --help\nDocs: https://docs.waveform.teamofsilicons.com\nRepository: https://github.com/teamofsilicons/silicon-waveform\nRust: https://crates.io/crates/silicon-waveform-client\nUse waveform docs TOPIC for bundled guides; every branch accepts --help.",
     after_long_help = include_str!("../README.md")
 )]
 struct Args {
-    /// Execute against a test environment root key or UUID. UUIDs are resolved through IAM.
-    #[arg(long, value_name = "ROOT_KEY_OR_ID", global = true)]
+    /// Select an IAM test app_secret (ask_…) or a previously saved sandbox UUID.
+    #[arg(long, value_name = "APP_SECRET_OR_ID", global = true)]
     test: Option<String>,
+    /// Read an IAM test app_secret from a file (use - for stdin).
+    #[arg(long, global = true, conflicts_with = "test")]
+    app_secret_file: Option<PathBuf>,
     /// Waveform backend origin; defaults to the production service.
     #[arg(
         long,
@@ -40,6 +45,29 @@ struct Args {
 }
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Read bundled usage and integration guides. Example: waveform docs testing.
+    Docs {
+        #[arg(default_value="start", value_parser=["start","cli","api","client","iam","testing","configuration"])]
+        topic: String,
+    },
+    /// Submit a detailed bug report; optionally include your pull request.
+    Report {
+        message: String,
+        #[arg(long)]
+        pr: Option<String>,
+        #[arg(long)]
+        idempotency: Option<String>,
+    },
+    /// Manage the unattended hourly updater. Install it once after installing the CLI.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+    /// Enable or disable account telemetry. Local CLI telemetry: config telemetry on|off.
+    Telemetry {
+        #[arg(value_parser=["on","off"])]
+        enabled: String,
+    },
     /// Show public IAM application metadata, including the app_id used to obtain an SLT.
     Iam,
     /// Exchange one short-lived IAm token, or inspect the current login with `login status`.
@@ -185,6 +213,20 @@ enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+enum DaemonCommand {
+    /// Run in the foreground; normally launched by the OS service manager.
+    Run,
+    /// Start for this session without registering an OS service.
+    Start,
+    /// Show whether this home's updater is running.
+    Status,
+    /// Request shutdown of a manually started updater. OS services may restart it.
+    Stop,
+    /// Register and start a macOS launch agent or Linux user service.
+    Install,
+}
+
+#[derive(Subcommand, Debug)]
 enum LoginCommand {
     /// Verify the saved session online and show its carbon or silicon identity.
     Status,
@@ -192,6 +234,11 @@ enum LoginCommand {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
+    /// Control local CLI diagnostic recording (enabled by default).
+    Telemetry {
+        #[arg(value_parser=["on","off"])]
+        enabled: String,
+    },
     /// Enable or disable hourly checks after commands complete.
     AutoUpdate {
         #[arg(value_parser = ["on", "off"])]
@@ -495,14 +542,87 @@ fn command_org(command: &Command) -> Option<&str> {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    let args = Args::parse();
-    let maintain = !matches!(args.command, Command::Config { .. });
-    let result = run(args).await;
+    let mut args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            let code = error.exit_code();
+            let _ = error.print();
+            if std::env::args().any(|s| {
+                s == "--test"
+                    || s.starts_with("--test=")
+                    || (s == "--app-secret-file" || s.starts_with("--app-secret-file="))
+            }) {
+                eprintln!("Test environment selected; command was not executed.");
+            }
+            std::process::exit(code);
+        }
+    };
+    if let Some(path) = args.app_secret_file.take() {
+        let value = if path.as_os_str() == "-" {
+            std::io::read_to_string(std::io::stdin())
+        } else {
+            fs::read_to_string(path)
+        };
+        match value {
+            Ok(value) => args.test = Some(value.trim().to_owned()),
+            Err(_) => {
+                eprintln!(
+                    "Cannot read test app_secret file. Test environment selection failed; no command executed."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+    let mut banner = args
+        .test
+        .as_ref()
+        .map(|_| "Test environment: unresolved (validation required)".to_owned());
+    let local_enabled = fs::read(dirs_fallback().join("telemetry.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["enabled"].as_bool())
+        .unwrap_or(true);
+    let telemetry = if local_enabled
+        && args.test.is_none()
+        && !matches!(
+            args.command,
+            Command::Config { .. } | Command::Daemon { .. }
+        ) {
+        silicon_waveform_client::telemetry::from_environment()
+    } else {
+        None
+    };
+    let step = match &args.command {
+        Command::Tts { .. } => "tts",
+        Command::Stt { .. } => "stt",
+        Command::Login { .. } => "login",
+        Command::Refresh => "refresh",
+        Command::Logout => "logout",
+        Command::Report { .. } => "report",
+        Command::Jobs { .. } => "jobs",
+        Command::Preferences { .. } => "preferences",
+        Command::Telemetry { .. } => "telemetry_preference",
+        Command::ProviderKeySet { .. } | Command::ProviderKeyDelete { .. } => "provider_key_change",
+        Command::TestEnv { .. } => "legacy_environment_administration",
+        _ => "read_configuration",
+    };
+    let started = std::time::Instant::now();
+    let result = run(args, &mut banner).await;
+    if let Some(station) = &telemetry {
+        silicon_waveform_client::telemetry::record(
+            station,
+            "cli",
+            step,
+            result.is_ok(),
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+    }
+    drop(telemetry);
     if let Err(error) = &result {
         eprintln!("{error}");
     }
-    if maintain && let Err(error) = updater::automatic(&dirs_fallback()).await {
-        eprintln!("Update check: {error}");
+    if let Some(banner) = banner {
+        eprintln!("{banner}");
     }
     if result.is_err() {
         std::process::exit(1);
@@ -510,7 +630,45 @@ async fn main() -> Result<(), String> {
     Ok(())
 }
 
-async fn run(args: Args) -> Result<(), String> {
+async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
+    if let Command::Docs { topic } = &args.command {
+        print!(
+            "{}",
+            match topic.as_str() {
+                "cli" => include_str!("../README.md"),
+                "api" => include_str!("../docs/api.md"),
+                "client" => include_str!("../docs/client.md"),
+                "iam" => include_str!("../docs/iam.md"),
+                "testing" => include_str!("../docs/testing.md"),
+                "configuration" => include_str!("../docs/configuration.md"),
+                _ => include_str!("../docs/README.md"),
+            }
+        );
+        return Ok(());
+    }
+    if let Command::Daemon { command } = &args.command {
+        if args.test.is_some() {
+            return Err("The local updater has no test environment; omit --test".into());
+        }
+        match command {
+            DaemonCommand::Run => daemon::run(&dirs_fallback()).await?,
+            DaemonCommand::Start => daemon::start(&dirs_fallback())?,
+            DaemonCommand::Stop => daemon::stop(&dirs_fallback())?,
+            DaemonCommand::Install => daemon::install()?,
+            DaemonCommand::Status => print_json(&daemon::status(&dirs_fallback())?)?,
+        };
+        return Ok(());
+    }
+    if let Command::Config {
+        command: ConfigCommand::Telemetry { enabled },
+    } = &args.command
+    {
+        write_session(
+            &dirs_fallback().join("telemetry.json"),
+            &serde_json::json!({"enabled":enabled=="on"}),
+        )?;
+        return print_status(&format!("Local telemetry {enabled}"), args.json);
+    }
     if let Command::Config {
         command: ConfigCommand::AutoUpdate { enabled },
     } = &args.command
@@ -571,8 +729,56 @@ async fn run(args: Args) -> Result<(), String> {
         let encoded_key = serde_json::to_string(&root_key).map_err(|e| e.to_string())?;
         session_file = session_path(&args.url, Some(&encoded_key));
         client = client.with_test_environment(root_key);
+        let metadata = client
+            .current_test_environment()
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(id) = metadata.get("id").and_then(serde_json::Value::as_str) {
+            let value: String = serde_json::from_str(&encoded_key).map_err(|e| e.to_string())?;
+            write_local_test_key(&args.url, id, &value)?;
+        }
+        *banner = Some(format!(
+            "Test environment: {} ({})",
+            metadata["name"].as_str().unwrap_or("unnamed"),
+            metadata["id"].as_str().unwrap_or("unknown")
+        ));
     }
     match args.command {
+        Command::Docs { .. } | Command::Daemon { .. } => {
+            unreachable!("local commands return early")
+        }
+        Command::Report {
+            message,
+            pr,
+            idempotency,
+        } => {
+            let c = bearer(&client, &session_file)?;
+            let key = idempotency.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            eprintln!("Report retry key: {key}");
+            print_json(
+                &c.report(&message, pr.as_deref(), &key)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )?;
+            if pr.is_none() {
+                eprintln!(
+                    "You can also submit a fix: https://github.com/teamofsilicons/silicon-waveform"
+                );
+            }
+        }
+        Command::Telemetry { enabled } => {
+            let c = bearer(&client, &session_file)?;
+            let me = c.me().await.map_err(|e| e.to_string())?;
+            print_json(
+                &c.set_telemetry(
+                    me["org_id"].as_str().ok_or("IAM organization missing")?,
+                    me["principal_id"].as_str().ok_or("IAM identity missing")?,
+                    enabled == "on",
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+            )?;
+        }
         Command::Iam => print_json(&client.iam().await.map_err(|e| e.to_string())?)?,
         Command::Login {
             command: Some(LoginCommand::Status),

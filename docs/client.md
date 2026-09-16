@@ -24,11 +24,10 @@ The stateless client does not resolve home directories. The CLI uses
 `SILICON_HOME` as its default home when present, otherwise `~`, with an explicit
 `waveform config home` setting taking precedence. See [CLI guide](cli.md).
 
-Use `with_test_environment(TestEnvironmentKey::new(root_key)?)` to select an
-isolated plane explicitly. Every selected-plane request carries the root key;
-omitting the selector always targets production. The CLI can resolve a test
-plane UUID to its root key, but the Rust client intentionally requires the
-root key so callers cannot accidentally use an unbounded environment lookup.
+Use `with_test_environment(TestEnvironmentKey::new(app_secret)?)` to select a sandbox.
+`current_test_environment()` validates the secret with IAM and returns safe metadata.
+Every request carries the selector; invalid selectors fail, without production fallback.
+No separate Briefcase key is needed. `login` accepts a test SLT or existing public ID in this mode.
 
 Speech methods are `tts` and `stt`; each accepts an optional `provider_order`
 prefix to override the account's first choices. `capabilities` is unauthenticated. Authenticated
@@ -36,12 +35,12 @@ control methods include `me`, actor-scoped `jobs`/`job`, provider `preferences`
 and `update_preferences`, and write-only personal provider-key methods.
 `jobs_page` accepts optional operation, limit (1-100), and opaque cursor values. A `Job` is terminal when its status is `completed` or `failed`; `wait_for_job` polls until a terminal state or caller timeout, and failed rows include `error_code`.
 
-Test-plane lifecycle methods require the organization ID because IAM
+Legacy test-plane lifecycle methods require the organization ID because IAM
 authorization is organization-scoped: `create_test_environment`,
 `test_environments`, `test_environment_detail`, `test_environment_key`,
 `rotate_test_environment_key`, `delete_test_environment`, and
 `restore_test_environment`. `test_environment` and
-`clean_test_environment` operate on the selected root-key plane.
+`clean_test_environment` operate on a legacy selected plane. Manage new discovered worlds in IAM.
 
 ## Automatic package maintenance
 
@@ -87,3 +86,7 @@ speech response retains the canonical ID if an idempotency key already existed.
 `update_preferences_with_voice(org, actor, tts_order, stt_order, voice_profile)`
 updates defaults atomically; the existing `update_preferences` method preserves
 the saved voice. TTS responses and jobs expose optional `VoiceProfileRef` metadata.
+
+## Reporting and settings
+
+`report(message, pr, idempotency_key)` submits an authenticated report, with simulated delivery in sandboxes. `set_telemetry(org, actor, enabled)` controls the account opt-out. `telemetry::from_environment()` provides an optional Space Station sender for embedding programs; only record safe action labels and outcomes.

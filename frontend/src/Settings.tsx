@@ -1,6 +1,7 @@
 import { createResource, createSignal, For, Show } from "solid-js";
 import {
   api,
+  recordEvent,
   date,
   providerNames,
   session,
@@ -11,7 +12,7 @@ import {
 import { Empty, Heading, Modal, Notice, Order } from "./ui";
 import VoiceProfilePicker from "./VoiceProfilePicker";
 import type { VoiceProfile } from "./api";
-export default function Settings(props: { signin: () => void }) {
+export default function Settings(props: { signin: () => void; connect: () => void }) {
   const [prefs, { refetch }] = createResource(
     () => session()?.authenticated,
     () => api<Preferences>("/api/v1/preferences"),
@@ -31,6 +32,7 @@ export default function Settings(props: { signin: () => void }) {
     () => session()?.authenticated,
     () => api<{ items: VoiceProfile[] }>("/api/v1/voice-profiles"),
   );
+  const [telemetry, setTelemetry] = createSignal<boolean>();
   const [voice, setVoice] = createSignal<string>();
   const [tts, setTts] = createSignal<Provider[]>(),
     [stt, setStt] = createSignal<Provider[]>(),
@@ -49,6 +51,7 @@ export default function Settings(props: { signin: () => void }) {
         method: "PATCH",
         body: {
           ...(voice() ? { voice_profile: voice() } : {}),
+          telemetry_enabled: telemetry() ?? prefs()?.telemetry_enabled ?? true,
           tts_order: tts() || prefs()?.tts_order,
           stt_order: stt() || prefs()?.stt_order,
         },
@@ -59,6 +62,7 @@ export default function Settings(props: { signin: () => void }) {
       setStt();
       setPreferencesVersion((v) => v + 1);
       setNotice("Preferences saved.");
+      recordEvent("settings_saved");
     } catch (err) {
       setError(err);
     } finally {
@@ -109,6 +113,9 @@ export default function Settings(props: { signin: () => void }) {
         Your providers. Your preferred order.
       </Heading>
       <Notice error={error() || prefs.error || keys.error} message={notice()} />
+      <div class="actions"><button class="button" onClick={props.connect}>Use a test app_secret</button></div>
+      <label><input type="checkbox" checked={telemetry() ?? prefs()?.telemetry_enabled ?? true} onChange={e=>setTelemetry(e.currentTarget.checked)}/> Send diagnostic events to Space Station (save preferences to apply)</label>
+
       <Show
         when={session()?.authenticated}
         fallback={

@@ -9,6 +9,7 @@ import {
 import {
   acceptSession,
   api,
+  recordEvent,
   contextVersion,
   session,
   sessionAction,
@@ -55,6 +56,7 @@ export default function App() {
     const hash = () => {
       if (location.hash === "#main-content") return;
       setPage(readPage());
+      recordEvent("page_view");
       setMenu(false);
     };
     window.addEventListener("hashchange", hash);
@@ -238,6 +240,13 @@ export default function App() {
               </button>
             </div>
           </header>
+          <Show when={session()?.plane === "test"}>
+            <div class="testing-banner" role="status">
+              <strong>Test environment · {session()?.environment?.name}</strong>
+              <span>Identity: {session()?.user?.public_id || "Not signed in"}</span>
+              <button class="button" onClick={() => void sessionAction("switch", {plane:"production"}).catch(setError)}>Exit testing mode</button>
+            </div>
+          </Show>
           <main id="main-content" tabindex="-1">
             <Show when={!login() && !connect()}>
               <Notice error={error()} />
@@ -264,7 +273,7 @@ export default function App() {
                       <History signin={signin} />
                     </Show>
                     <Show when={page() === "settings"}>
-                      <Settings signin={signin} />
+                      <Settings signin={signin} connect={() => {setKey("");setConnect(true);}} />
                     </Show>
                     <Show when={page() === "environments"}>
                       <Environments
@@ -406,7 +415,7 @@ export default function App() {
           <div class="stack">
             <p class="muted">
               {session()?.plane === "test"
-                ? "Use a short-lived code issued to Waveform in the linked IAM test environment."
+                ? "Use an IAM test SLT or the public ID of an existing active test Carbon or Silicon."
                 : "Sign in or create your account securely with Silicon IAM."}
             </p>
             <Show
@@ -434,6 +443,7 @@ export default function App() {
                 Continue with IAM <Icon name="arrow" />
               </a>
             </Show>
+            <button class="button" onClick={() => {setLogin(false);setConnect(true);}}>Use a test app_secret</button>
             <Notice error={error()} />
             <p class="hint">
               Access tokens stay on the frontend server. Waveform never asks for
@@ -455,8 +465,7 @@ export default function App() {
         >
           <form class="stack" onSubmit={connectEnvironment}>
             <p class="muted">
-              Use an existing Waveform environment key. After connecting, sign
-              in with an IAM code from that test environment.
+              Enter Waveform’s IAM testing app_secret. We discover the sandbox automatically. Then sign in with a test SLT or an existing test identity’s public ID.
             </p>
             <label>
               Organization handle
@@ -467,13 +476,13 @@ export default function App() {
               />
             </label>
             <label>
-              Waveform environment key
+              IAM testing app_secret
               <input
                 required
                 type="password"
                 autocomplete="off"
-                pattern="[A-Za-z0-9]{32}"
-                placeholder="32-character key"
+                pattern="ask_[A-Za-z0-9_-]{43}"
+                placeholder="ask_…"
                 value={key()}
                 onInput={(e) => setKey(e.currentTarget.value)}
               />
