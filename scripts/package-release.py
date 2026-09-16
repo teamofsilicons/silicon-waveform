@@ -3,6 +3,7 @@
 
 Local builds are read from cli/target/<triple>/release. CI can pass
 --binaries-dir containing <honeycomb-target>/waveform[.exe] instead.
+Each CI target directory must also contain the matching honeycomb.yaml.
 Requires Python 3.11+ and the Honeycomb CLI; never adds source or configuration.
 """
 
@@ -96,6 +97,10 @@ def main() -> None:
                 else ROOT / "cli/target" / triple / "release" / name
             )
             verify_binary(source, target)
+            if args.binaries_dir:
+                artifact_manifest = args.binaries_dir / target / "honeycomb.yaml"
+                if not artifact_manifest.is_file() or artifact_manifest.read_bytes() != (ROOT / "honeycomb.yaml").read_bytes():
+                    raise SystemExit(f"Missing or mismatched honeycomb.yaml in {target} artifact")
             relative = Path("targets") / target / name
             destination = stage / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -117,6 +122,7 @@ def main() -> None:
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     (output / f"{archive.name}.sha256").write_text(f"{digest}  {archive.name}\n")
     (output / f"waveform-{version}-binaries.sha256").write_text("\n".join(checksums) + "\n")
+    shutil.copyfile(ROOT / "honeycomb.yaml", output / "honeycomb.yaml")
     print(f"Validated release: {archive}\nSHA-256: {digest}")
 
 

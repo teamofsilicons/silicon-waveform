@@ -52,13 +52,28 @@ jobs:
         with:
           workspaces: cli
       - run: python ../scripts/sync-cli-docs.py --check
+      - run: python ../scripts/sync-honeycomb.py --check
       - run: cargo test --locked -p waveform-cli --target ${{ matrix.triple }}
       - run: cargo build --release --locked -p waveform-cli --target ${{ matrix.triple }}
       - run: ./target/${{ matrix.triple }}/release/${{ matrix.binary }} --version
+      - name: Stage native artifact with its manifest
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TRIPLE: ${{ matrix.triple }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, shutil
+          stage = pathlib.Path('../build-artifacts') / os.environ['TARGET']
+          stage.mkdir(parents=True, exist_ok=True)
+          shutil.copyfile(pathlib.Path('target') / os.environ['TRIPLE'] / 'release' / os.environ['BINARY'], stage / os.environ['BINARY'])
+          shutil.copyfile('../honeycomb.yaml', stage / 'honeycomb.yaml')
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: cli/target/${{ matrix.triple }}/release/${{ matrix.binary }}
+          path: build-artifacts/${{ matrix.target }}/
           if-no-files-found: error
 
   package:
@@ -68,6 +83,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          pattern: '*-*64'
           path: release-binaries
       - uses: actions/setup-python@v5
         with:

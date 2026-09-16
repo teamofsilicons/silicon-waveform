@@ -15,6 +15,7 @@ const groups=[['Start here',['README.md','testing.md']],['Use Waveform',['cli.md
 await rm(out,{recursive:true,force:true});await mkdir(out,{recursive:true});
 await cp(join(here,'style.css'),join(out,'style.css'));
 await cp(join(root,'openapi.yaml'),join(out,'openapi.yaml'));
+await cp(join(root,'honeycomb.yaml'),join(out,'honeycomb.yaml'));
 await cp(join(root,'scripts/install.sh'),join(out,'install.sh'));
 const config=JSON.parse(await readFile(join(here,'vercel.json'),'utf8')); config.buildCommand=''; delete config.outputDirectory; await writeFile(join(out,'vercel.json'),JSON.stringify(config,null,2));
 for(const page of pages){

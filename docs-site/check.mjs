@@ -4,6 +4,7 @@ import {fileURLToPath} from 'node:url';
 const root=join(dirname(fileURLToPath(import.meta.url)),'dist'),pages=[];
 async function walk(dir){for(const e of await readdir(dir,{withFileTypes:true})){const p=join(dir,e.name);if(e.isDirectory())await walk(p);else if(e.name==='index.html')pages.push(p);}}
 await walk(root);let failures=[];
+if(!(await readFile(join(root,'honeycomb.yaml'))).equals(await readFile(resolve(root,'../../honeycomb.yaml'))))failures.push('Built Honeycomb manifest differs from the repository manifest');
 for(const page of pages){const html=await readFile(page,'utf8');if(!html.includes('rel="canonical" href="https://docs.waveform.teamofsilicons.com/'))failures.push(`${page}: canonical`);
 for(const [,href] of html.matchAll(/href="(\/[^"#]*)(?:#[^"]*)?"/g)){const target=resolve(root,'.'+decodeURI(href));if(!target.startsWith(root))throw Error('Escaping link');try{await stat(href.endsWith('/')?join(target,'index.html'):target)}catch{failures.push(`${page}: ${href}`)}}
 for(const [,id] of html.matchAll(/href="#([^"]+)"/g))if(!html.includes(`id="${id}"`))failures.push(`${page}: #${id}`);

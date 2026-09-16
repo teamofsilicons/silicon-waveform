@@ -17,6 +17,7 @@ RUN apt-get update \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin waveform
 
 COPY --from=builder /build/target/release/waveform-api /usr/local/bin/waveform-api
+COPY honeycomb.yaml /usr/share/waveform/honeycomb.yaml
 
 ENV WAVEFORM_ENVIRONMENT=production \
     WAVEFORM_BIND_ADDR=0.0.0.0:8080 \

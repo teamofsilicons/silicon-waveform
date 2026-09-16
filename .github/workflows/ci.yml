@@ -37,6 +37,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Check bundled documentation
         run: python3 scripts/sync-cli-docs.py --check
+      - name: Check Honeycomb build manifests
+        run: python3 scripts/sync-honeycomb.py --check
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
@@ -65,3 +67,41 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build production image
         run: docker build --tag silicon-waveform:test .
+      - name: Verify API image manifest
+        run: docker run --rm --entrypoint cat silicon-waveform:test /usr/share/waveform/honeycomb.yaml | cmp honeycomb.yaml -
+      - name: Build frontend image
+        run: docker build --tag silicon-waveform-frontend:test frontend
+      - name: Verify frontend image manifest
+        run: docker run --rm --entrypoint cat silicon-waveform-frontend:test /usr/share/waveform/honeycomb.yaml | cmp honeycomb.yaml -
+
+  web-builds:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: python3 scripts/sync-honeycomb.py --check
+      - name: Build and check frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm test
+          npm run build
+          cmp ../honeycomb.yaml dist/honeycomb.yaml
+      - name: Build and check docs
+        working-directory: docs-site
+        run: |
+          npm ci
+          npm run build
+          npm run check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: waveform-frontend
+          path: frontend/dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: waveform-docs
+          path: docs-site/dist/
+          if-no-files-found: error
