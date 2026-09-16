@@ -23,10 +23,9 @@ The public references are [API](api.md), [Rust client](client.md), [IAM](iam.md)
 
 Canonical Markdown lives in `docs/`; `docs-site` renders it to a static site with machine-readable `llms.txt` and `llms-full.txt`. CLI documentation is bundled from matching files under `cli/docs` for offline use. Update both when changing a public operation.
 
-Build and check the published docs and installer snapshot:
+Build and check the documentation:
 
 ```sh
-python3 scripts/package_docs_source.py
 cd docs-site
 npm ci
 npm run build

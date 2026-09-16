@@ -40,6 +40,8 @@ The public ID shortcut works only for an existing active test identity. Producti
 - [Rust client](client.md): build Waveform into your app.
 - [IAM integration](iam.md): scopes and delegated Briefcase storage.
 - [Configuration](configuration.md): local state, opt-outs and deployment settings.
+- [API compatibility](api-contracts.md): negotiation, consumer contracts and sunset policy.
+- [Releases](releases.md): build and validate the Honeycomb archive.
 - [Development](development.md): build, validate and extend Waveform.
 - [Voice profiles](voice-profiles.md): the available voices and provider mappings.
 

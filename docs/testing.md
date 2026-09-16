@@ -2,7 +2,7 @@
 
 ## Select your sandbox
 
-Create or import Waveform in an IAM testing environment. Take the application's `app_secret`, not the IAM environment root key. See [IAM testing environments](https://docs.iam.teamofsilicons.com/api/testing-environments/).
+Create or import Waveform in a Honeycomb testing environment. Take the application's `app_secret`, not the IAM environment root key. Use Honeycomb for lifecycle management and IAM for test identities.
 
 ```sh
 waveform --app-secret-file /private/path/test-secret login TEST_PUBLIC_ID
@@ -32,7 +32,7 @@ let authenticated = sandbox.with_bearer(tokens.access_token);
 
 The secret selects a world; it does not select a user or confer administrative privileges. Ordinary IAM authorization, organization and speech scopes apply. Unknown/inactive identities, production tokens, wrong-world tokens, revoked secrets and unavailable IAM are rejected. A failed test selection never falls back to production.
 
-New sandboxes contain no user data. Voice profiles and provider defaults are configuration shared as initial defaults. Jobs, provider keys, preferences, idempotency, reports and webhook metadata are scoped to the environment. IAM owns lifecycle for automatically discovered environments: clean or retire them through IAM. On the next live discovery, Waveform applies a changed clean generation before accepting work. Legacy Waveform lifecycle routes remain for older explicitly paired environments; they are not the setup path for new sandboxes.
+New sandboxes contain no user data. Voice profiles and provider defaults are configuration shared as initial defaults. Jobs, provider keys, preferences, idempotency, reports and webhook metadata are scoped to the environment. Honeycomb owns environment creation and lifecycle. Waveform receives authenticated preparation, rotation, cleaning, disabling, restoration and removal instructions; IAM still authenticates the test identities. Cleanup fences running operations and clears test records before acknowledging completion. The environment link survives cleanup. Old public lifecycle URLs return `manage_environment_in_honeycomb`. See the [participant protocol](honeycomb-lifecycle.md).
 
 ## Speech and Briefcase
 

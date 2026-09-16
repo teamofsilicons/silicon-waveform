@@ -31,6 +31,8 @@ TARGETS = {
 
 def verify_binary(path: Path, target: str) -> None:
     """Reject scripts, wrong operating systems and wrong CPU architectures."""
+    if not path.is_file():
+        raise SystemExit(f"Missing prebuilt {target} executable: {path}")
     data = path.read_bytes()
     arm = target.endswith("aarch64")
     if target.startswith("linux-"):

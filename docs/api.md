@@ -63,3 +63,7 @@ Voice profiles: `GET /voice-profiles` lists mappings; `PATCH /preferences` with
 `POST /reports` accepts `{message,pr?,client_version?}` with a bearer and `Idempotency-Key`. It returns 202 with the report ID and `notification` (`queued`, `sent`, or `simulated`). Retry identical content with the same key; changed content returns 409. The limit is ten reports per actor per hour. Sandbox delivery is always simulated.
 
 `PATCH /preferences` accepts `telemetry_enabled: false` for account opt-out. `GET /preferences` reports the effective boolean, which defaults to true. Backend diagnostics honor it; the CLI also has a local opt-out.
+
+## Contract negotiation
+
+See [API compatibility](api-contracts.md) for `GET /api/contracts`, version headers, consumer compatibility and the seven-day sunset policy. Public environment lifecycle mutations return `409 manage_environment_in_honeycomb`; use the [Honeycomb participant](honeycomb-lifecycle.md) from the coordinator.

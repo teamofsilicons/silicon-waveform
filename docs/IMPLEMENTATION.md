@@ -1,6 +1,6 @@
 # Implementation and validation
 
-The human-owned `UNDERSTANDING.md` defines the product requirements. The current source implements IAM app-secret discovery, test-only public-ID login, isolated sessions and user permissions, downstream Briefcase testing credentials from OBO exchange, deterministic speech clips, durable report submission, diagnostic opt-outs, and an independent hourly CLI updater.
+The human-owned `UNDERSTANDING.md` defines the product requirements. The current source implements IAM app-secret discovery, test-only public-ID login, isolated sessions and user permissions, downstream Briefcase testing credentials from OBO exchange, deterministic speech clips, durable report submission, diagnostic opt-outs, and Honeycomb-owned CLI installation and updates.
 
 ## What the sandbox integration verifies
 
@@ -16,6 +16,8 @@ The backend and matching frontend were deployed on September 13, 2026. Migration
 
 Live speech storage remains blocked by an upstream IAM/Briefcase contract mismatch: IAM proof verification returns only the delegated endpoint scope and no role/tag disclosure, which Briefcase requires. Controlled-fixture speech tests pass, but they do not establish live speech success. See [deployment evidence](verification-2026-09-13.md).
 
-The docs installer builds the source snapshot distributed with the documentation. The updater checks for newer stable registry releases; it does not publish packages. Live paid speech, real email delivery, and an actual newer-version automatic installation are not exercised by local regression tests.
+The compatibility installer delegates to Honeycomb. Rust client requests never update dependencies. The release workflow builds six native CLIs and validates one Honeycomb archive; local checks do not establish that every cross-platform binary has been built or published.
+
+The September 16 source changes add the [Honeycomb participant](honeycomb-lifecycle.md), remove autonomous environment retirement and public lifecycle mutations, and add [API contracts](api-contracts.md). These changes have not been deployed. Lifecycle credentials and the Honeycomb participant registration must be provisioned by the deployment operator before live coordination can work.
 
 Historical [2026-09-08 test evidence](test-report-2026-09-08.md) applies to the older explicitly paired environment protocol. Current deployment evidence is recorded separately. Inbound OBO speech remains unavailable because IAM does not provide the downstream subject-token handoff needed for that entry mode.

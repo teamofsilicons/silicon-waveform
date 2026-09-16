@@ -26,7 +26,30 @@ tags:
   - name: Webhooks
 
 paths:
-  /api/v1/telemetry:
+  /contracts:
+    get:
+      operationId: getApiContracts
+      summary: Read API versions, compatibility and deprecation policy
+      security: []
+      description: The unversioned /api/contracts endpoint stays available after a version sunsets. Optional X-Waveform-API-Version and X-Waveform-Protocol-Version request headers must match v1 and 1. Responses include selected API, protocol and contract headers. See the API compatibility guide for the seven-day quiet-period policy.
+      responses:
+        '200':
+          description: Contract catalog and compatibility matrix
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [service, default_api_version, protocol_versions, contracts, compatibility, policy]
+                properties:
+                  service: { type: string, const: silicon-waveform }
+                  default_api_version: { type: string, const: v1 }
+                  protocol_versions: { type: array, items: { type: string } }
+                  contracts: { type: array, items: { type: object } }
+                  compatibility: { type: array, items: { type: object } }
+                  policy: { type: object }
+        '406': { description: Unsupported API or protocol version }
+        '410': { description: The requested API version has sunset; use /api/contracts }
+  /telemetry:
     post:
       operationId: recordBrowserEvent
       summary: Record an authenticated browser diagnostic
@@ -44,7 +67,7 @@ paths:
                 elapsed_ms: { type: integer, minimum: 0, maximum: 86400000, default: 0 }
       responses:
         '204': { description: Event handled }
-  /api/v1/reports:
+  /reports:
     post:
       operationId: submitBugReport
       summary: Submit a bug report with optional pull request
@@ -482,43 +505,28 @@ paths:
     post:
       tags: [Testing environments]
       operationId: cleanTestingEnvironment
-      summary: Delete all disposable data in the selected test plane
-      security: []
-      parameters:
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      deprecated: true
+      summary: Manage this environment through Honeycomb
       responses:
-        '200':
-          description: Disposable test-plane data removed
+        '409':
+          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
           content:
             application/json:
-              schema:
-                type: object
-                required: [cleaned]
-                properties: { cleaned: { type: boolean, const: true } }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+              schema: { $ref: '#/components/schemas/Error' }
 
   /testing-environments:
     post:
       tags: [Testing environments]
       operationId: createTestingEnvironment
-      summary: Create an isolated test plane
-      parameters:
-        - $ref: '#/components/parameters/OrgId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/CreateTestingEnvironment' }
+      deprecated: true
+      summary: Manage this environment through Honeycomb
       responses:
-        '200':
-          description: Created plane and one-time root key
+        '409':
+          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/CreatedTestingEnvironment' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+              schema: { $ref: '#/components/schemas/Error' }
+
     get:
       tags: [Testing environments]
       operationId: listTestingEnvironments
@@ -560,87 +568,53 @@ paths:
     get:
       tags: [Testing environments]
       operationId: getTestingEnvironmentKey
-      summary: Retrieve the current test-plane root key
-      parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/EnvironmentId'
+      deprecated: true
+      summary: Manage this environment through Honeycomb
       responses:
-        '200':
-          description: Current root key
+        '409':
+          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
           content:
             application/json:
-              schema:
-                type: object
-                required: [key]
-                properties: { key: { type: string, minLength: 32, maxLength: 32 } }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/Error' }
+              schema: { $ref: '#/components/schemas/Error' }
 
   /testing-environments/{environment_id}/rotate-key:
     post:
       tags: [Testing environments]
       operationId: rotateTestingEnvironmentKey
-      summary: Rotate a test-plane root key
-      parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/EnvironmentId'
+      deprecated: true
+      summary: Manage this environment through Honeycomb
       responses:
-        '200':
-          description: New root key; previous key is immediately invalid
+        '409':
+          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
           content:
             application/json:
-              schema:
-                type: object
-                required: [key]
-                properties: { key: { type: string, minLength: 32, maxLength: 32 } }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/Error' }
+              schema: { $ref: '#/components/schemas/Error' }
 
   /testing-environments/{environment_id}/delete:
     post:
       tags: [Testing environments]
       operationId: deleteTestingEnvironment
-      summary: Soft-delete a test plane
-      parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/EnvironmentId'
+      deprecated: true
+      summary: Manage this environment through Honeycomb
       responses:
-        '200':
-          description: Plane marked deleted and recoverable for 30 days
+        '409':
+          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
           content:
             application/json:
-              schema:
-                type: object
-                required: [deleted, recoverable_for_days]
-                properties:
-                  deleted: { type: boolean, const: true }
-                  recoverable_for_days: { type: integer, const: 30 }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/Error' }
+              schema: { $ref: '#/components/schemas/Error' }
 
   /testing-environments/{environment_id}/restore:
     post:
       tags: [Testing environments]
       operationId: restoreTestingEnvironment
-      summary: Restore a soft-deleted test plane during its recovery window
-      parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/EnvironmentId'
+      deprecated: true
+      summary: Manage this environment through Honeycomb
       responses:
-        '200':
-          description: Plane restored
+        '409':
+          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
           content:
             application/json:
-              schema:
-                type: object
-                required: [restored]
-                properties: { restored: { type: boolean, const: true } }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/Error' }
+              schema: { $ref: '#/components/schemas/Error' }
 
   /webhooks/:
     post:

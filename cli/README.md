@@ -45,8 +45,7 @@ Control commands include `me`, `capabilities`, `preferences`,
 orders are comma-separated provider names; key values are accepted only by
 `provider-key-set` and are never printed or returned by the server.
 
-The `test-env` lifecycle commands remain for legacy environments. New sandboxes are created,
-cleaned and retired in Honeycomb. Read [testing](testing.md) before using those legacy commands.
+The historical `test-env` lifecycle commands return `manage_environment_in_honeycomb`. Create, clean, disable, restore and remove environments through Honeycomb. `test-env current` and saved app-secret selectors remain available. Read [testing](testing.md).
 
 ## Automatic CLI maintenance
 
@@ -151,3 +150,7 @@ waveform config auto-update off
 waveform login <slt>
 waveform login status --json
 ```
+
+## API compatibility
+
+`waveform contracts --json` shows API versions, protocol compatibility and deprecation policy.

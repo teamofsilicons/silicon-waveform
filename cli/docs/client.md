@@ -40,7 +40,7 @@ authorization is organization-scoped: `create_test_environment`,
 `test_environments`, `test_environment_detail`, `test_environment_key`,
 `rotate_test_environment_key`, `delete_test_environment`, and
 `restore_test_environment`. `test_environment` and
-`clean_test_environment` operate on a legacy selected plane. Manage new discovered worlds in Honeycomb.
+`clean_test_environment` retain their historical signatures for source compatibility. Lifecycle mutations now return `manage_environment_in_honeycomb`; manage shared worlds in Honeycomb.
 
 ## Dependency maintenance
 
@@ -83,3 +83,5 @@ the saved voice. TTS responses and jobs expose optional `VoiceProfileRef` metada
 ## Reporting and settings
 
 `report(message, pr, idempotency_key)` submits an authenticated report, with simulated delivery in sandboxes. `set_telemetry(org, actor, enabled)` controls the account opt-out. `telemetry::from_environment()` provides an optional Space Station sender for embedding programs; only record safe action labels and outcomes.
+
+`client.contracts().await?` reads version negotiation and compatibility information.
