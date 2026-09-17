@@ -20,6 +20,8 @@ p.add_argument('--backup-bucket', required=True)
 p.add_argument('--region', default='us-east-1')
 p.add_argument('--start-api', action='store_true')
 a = p.parse_args()
+if Path('/etc/waveform/native-release.json').exists():
+    raise SystemExit('This host runs the native API. Use deploy/native; refusing to replace it with Docker.')
 os.umask(0o077)
 config = Path('/etc/waveform')
 data = Path('/var/lib/waveform')
