@@ -18,7 +18,7 @@ Live speech storage remains blocked by an upstream IAM/Briefcase contract mismat
 
 The compatibility installer delegates to Honeycomb. Rust client requests never update dependencies. The release workflow builds six native CLIs and validates one Honeycomb archive; local checks do not establish that every cross-platform binary has been built or published.
 
-The September 16 source changes add the [Honeycomb participant](honeycomb-lifecycle.md), remove autonomous environment retirement and public lifecycle mutations, and add [API contracts](api-contracts.md). These changes have not been deployed. Lifecycle credentials and the Honeycomb participant registration must be provisioned by the deployment operator before live coordination can work.
+The September 16 source changes add the [Honeycomb participant](honeycomb-lifecycle.md), remove autonomous environment retirement and public lifecycle mutations, and add [API contracts](api-contracts.md). These changes are included in the September 20 native release. Live lifecycle coordination still requires the corresponding Honeycomb participant registration and credentials; this release did not change them.
 
 Historical [2026-09-08 test evidence](test-report-2026-09-08.md) applies to the older explicitly paired environment protocol. Current deployment evidence is recorded separately. Inbound OBO speech remains unavailable because IAM does not provide the downstream subject-token handoff needed for that entry mode.
 
@@ -28,5 +28,6 @@ TTS now defaults to one selected provider, with explicit automatic fallback.
 Provider-specific controls, actionable safe failure details, and request-only BYOK
 are available in the API, Rust client, CLI and website. Existing encrypted saved
 keys remain supported with request → saved → deployment precedence. STT retains
-automatic fallback. These source changes require a backend/client/frontend release;
-local verification is not evidence that they have been deployed.
+automatic fallback. Version 0.2.0 was deployed and published on September 20;
+see the [production verification](deployment-verification-2026-09-20.md) for
+service, package, backup and validation evidence.

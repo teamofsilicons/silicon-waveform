@@ -11,35 +11,28 @@ request. Registration credentials and private request/response files are exclude
 from Git. The one-time application credential is saved under the operator's
 protected `~/.config/silicon/waveform/` directory for the later service rollout.
 
-## Uploaded release
+## Current published release
 
-- Version: `0.1.2`
-- Release ID: `bf76ad0d-be7a-4eda-aba0-8fa20a4a92b8`
-- Archive size: 23,733,190 bytes
-- SHA-256: `29c5c3fad9ac747ef6f1e2a1e0ace0a42c535a87f1cf95d722c1d4a516ec906d`
+Version **0.2.0** is public as of September 20, 2026. The application remains
+active at configuration revision 1; its earlier publication request is approved
+and published. The new release did not change permissions or app configuration.
+
+- Release ID: `d47400ab-4ab3-4e59-afef-e569c3946b68`
+- Archive size: 24,357,252 bytes
+- SHA-256: `7604e2e73b512e526846fdb1c89c9236b1517bd9017fbb3b4f121f26c3f5790a`
 - Targets: Linux, Windows and macOS, each on x86_64 and aarch64
-- [Validated build artifacts](https://github.com/teamofsilicons/silicon-waveform/actions/runs/35083867470)
+- [Validated build artifacts](https://github.com/teamofsilicons/silicon-waveform/actions/runs/35522041395)
+- [GitHub release](https://github.com/teamofsilicons/silicon-waveform/releases/tag/v0.2.0)
 
-## Publication status at submission
+A fresh signed-out Honeycomb home installed the latest public release with an
+alias. Its native macOS ARM64 executable reported `waveform 0.2.0`, exposed the
+new controls/BYOK flags, and read the deployed API's compatible contract.
 
-Request `66efb189-0838-45d4-87b3-322518392f46`, revision 1, is
-`awaiting_validator`. The sole remaining gate is Honeycomb validation. The current
-operator is a `tos` organization owner, but does not have Honeycomb validator
-authority. Upload and submission do not mean the application is public.
-
-An authorized validator can review the request in the
-[Honeycomb console](https://console.honeycomb.teamofsilicons.com/). Honeycomb's
-coordinator activates approved requests and reconciles archive visibility using
-the authorizing manager's session; expired authorization may require the manager
-to sign in again and open Sent requests.
-
-Read current state before any retry:
+The backend and website are deployed. Both `silicon-waveform-client` and
+`waveform-cli` 0.2.0 are published on crates.io. See
+[production verification](../../docs/deployment-verification-2026-09-20.md).
 
 ```sh
-honeycomb publication get 'tos>waveform' --json
-honeycomb releases list 'tos>waveform' --json
+honeycomb install 'tos>waveform'
+honeycomb update 'tos>waveform'
 ```
-
-Production service rollout remains on hold. The newly registered application
-credential must be configured during that rollout; hosted runtime readiness has
-not been established by package publication.
