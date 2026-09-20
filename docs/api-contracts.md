@@ -7,8 +7,8 @@ The SDK uses the unversioned endpoint so compatibility discovery survives retire
 
 | Consumer | API | Wire protocol | Contract |
 | --- | --- | --- | --- |
-| Waveform Rust client 0.1.x | v1 | 1 (HTTP JSON) | 1.0.0 |
-| Waveform CLI 0.1.x | v1 | 1 (HTTP JSON) | 1.0.0 |
+| Waveform Rust client 0.1.x / 0.2.x | v1 | 1 (HTTP JSON) | 1.0.0 |
+| Waveform CLI 0.1.x / 0.2.x | v1 | 1 (HTTP JSON) | 1.0.0 |
 | Existing website / HTTP consumers | v1 | 1 (default) | 1.0.0 |
 
 ## Negotiation
@@ -25,6 +25,14 @@ requires a new major API path, matching handlers, a new migration registering it
 contract, and an updated compatibility matrix and consumer tests. A database entry
 alone does not implement a new protocol. The app release version is independent
 from the API contract version.
+
+The September 2026 TTS control update intentionally changes the v1 TTS fallback
+default at the product owner's request: omitted `auto_fallback` now means false.
+Consumers that require the previous provider chain must explicitly send
+`auto_fallback: true`; STT keeps its existing fallback behavior. Existing completed
+TTS jobs can be replayed with the old request identifier and idempotency key by
+sending `auto_fallback: true` without new controls or request keys. See the
+[API guide](api.md) for the new optional fields.
 
 ## Deprecation and sunset
 

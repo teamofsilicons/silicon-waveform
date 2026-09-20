@@ -36,7 +36,7 @@ New sandboxes contain no user data. Voice profiles and provider defaults are con
 
 ## Speech and Briefcase
 
-Test TTS selects the prerecorded Gemini clip matching the requested/account-default voice profile. Each request uploads a new uniquely named MP3 through the Briefcase client. Test STT validates source access and returns the fixed test transcript. No paid TTS or STT provider call runs.
+Test TTS selects the prerecorded Gemini clip matching the requested/account-default voice profile, even when ElevenLabs or OpenAI is selected with fallback off. Provider controls are validated, but do not change prerecorded audio. Supplied BYOK credentials are never sent to a real provider. Each request uploads a new uniquely named MP3 through the Briefcase client. Test STT validates source access and returns the fixed test transcript. No paid TTS or STT provider call runs.
 
 Waveform exchanges a subject-bound, exact-byte OBO request with IAM. In a test world IAM includes the destination application's test credential with the proof. Waveform forwards that credential only to Briefcase for the corresponding request; you do not provide a separate Briefcase key. If the downstream testing context is missing or invalid, the operation fails closed.
 

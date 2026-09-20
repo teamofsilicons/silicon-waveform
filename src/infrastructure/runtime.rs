@@ -291,7 +291,7 @@ async fn compose_and_serve(
     )
     .map_err(|_| RuntimeError::ServiceConfiguration)?;
     let (fixture_tts, fixture_stt) =
-        crate::infrastructure::testing::database_provider_chains(pool.clone());
+        crate::infrastructure::testing::database_provider_chains(&pool);
     let fixture_service = Arc::new(
         WaveformService::new(
             iam,

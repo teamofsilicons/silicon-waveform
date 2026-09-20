@@ -18,6 +18,12 @@ use crate::domain::{
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TtsRequestBody {
+    #[serde(default)]
+    auto_fallback: bool,
+    #[serde(default)]
+    provider_options: crate::domain::tts_options::TtsProviderOptions,
+    #[serde(default)]
+    provider_keys: crate::domain::provider_keys::ProviderApiKeys,
     text: String,
     voice_profile: Option<String>,
     lang: Option<String>,
@@ -47,6 +53,22 @@ impl TtsRequestBody {
             return Err(RequestBodyError::InvalidVoiceProfile);
         }
         let mut request = TtsRequest::new(text, language)?;
+        if self.auto_fallback && !self.provider_options.is_empty() {
+            return Err(RequestBodyError::InvalidProviderOptions(
+                "Provider-specific controls require auto_fallback=false.",
+            ));
+        }
+        if !self
+            .provider_keys
+            .supports_only(&crate::domain::provider::TTS_PROVIDER_CHAIN)
+        {
+            return Err(RequestBodyError::InvalidProviderOptions(
+                "A TTS request accepts keys only for gemini, elevenlabs and openai.",
+            ));
+        }
+        request.auto_fallback = self.auto_fallback;
+        request.provider_options = self.provider_options;
+        request.provider_keys = self.provider_keys;
         request.voice_profile = self.voice_profile;
         Ok(match provider_order {
             Some(order) => request.with_provider_order(order),
@@ -59,6 +81,8 @@ impl TtsRequestBody {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SttRequestBody {
+    #[serde(default)]
+    provider_keys: crate::domain::provider_keys::ProviderApiKeys,
     file_url: String,
     language: Option<String>,
     /// Optional provider prefix, completed against account defaults by the
@@ -81,7 +105,16 @@ impl SttRequestBody {
             .language
             .map(|value| LanguageHint::from_str(&value))
             .transpose()?;
-        let request = SttRequest::new(source_url, language)?;
+        if !self
+            .provider_keys
+            .supports_only(&crate::domain::provider::STT_PROVIDER_CHAIN)
+        {
+            return Err(RequestBodyError::InvalidProviderOptions(
+                "An STT request accepts keys only for gemini, openai and deepgram.",
+            ));
+        }
+        let mut request = SttRequest::new(source_url, language)?;
+        request.provider_keys = self.provider_keys;
         Ok(match provider_order {
             Some(order) => request.with_provider_order(order),
             None => request,
@@ -146,10 +179,13 @@ impl From<SttResult> for SttResponseBody {
 pub struct CapabilitiesResponseBody {
     tts: TtsCapabilitiesBody,
     stt: SttCapabilitiesBody,
+    byok: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
 struct TtsCapabilitiesBody {
+    auto_fallback_default: bool,
+    provider_options: serde_json::Value,
     output_format: &'static str,
     languages: Vec<&'static str>,
 }
@@ -164,6 +200,12 @@ impl From<Capabilities> for CapabilitiesResponseBody {
     fn from(capabilities: Capabilities) -> Self {
         Self {
             tts: TtsCapabilitiesBody {
+                auto_fallback_default: false,
+                provider_options: serde_json::json!({
+                    "gemini": ["voice", "scene", "audio_profile", "director_notes", "sample_context"],
+                    "elevenlabs": ["voice_id", "model_id", "stability", "similarity_boost", "style", "speed", "use_speaker_boost", "seed", "previous_text", "next_text", "apply_text_normalization"],
+                    "openai": ["voice", "model", "instructions", "speed"],
+                }),
                 output_format: capabilities.tts.output_format.as_str(),
                 languages: capabilities
                     .tts
@@ -172,6 +214,7 @@ impl From<Capabilities> for CapabilitiesResponseBody {
                     .map(|language| language.as_str())
                     .collect(),
             },
+            byok: serde_json::json!({"saved": true, "per_request": true, "precedence": ["request", "saved", "shared"]}),
             stt: SttCapabilitiesBody {
                 languages: capabilities
                     .stt
@@ -194,6 +237,9 @@ impl From<Capabilities> for CapabilitiesResponseBody {
 /// Validation failure for a syntactically valid JSON body.
 #[derive(Debug, Error)]
 pub enum RequestBodyError {
+    /// Provider controls must be supported by the selected mode and provider.
+    #[error("{0}")]
+    InvalidProviderOptions(&'static str),
     /// A voice profile must be a stable lowercase catalog identifier.
     #[error("invalid voice profile")]
     InvalidVoiceProfile,
@@ -245,6 +291,9 @@ mod tests {
     #[test]
     fn request_debug_does_not_serialize_response_secrets() {
         let request = TtsRequestBody {
+            auto_fallback: false,
+            provider_options: crate::domain::tts_options::TtsProviderOptions::default(),
+            provider_keys: crate::domain::provider_keys::ProviderApiKeys::default(),
             text: "private words".to_owned(),
             voice_profile: None,
             lang: Some("en-US".to_owned()),
@@ -258,6 +307,7 @@ mod tests {
     #[test]
     fn rejects_non_briefcase_shaped_urls_at_the_domain_boundary() {
         let request = SttRequestBody {
+            provider_keys: crate::domain::provider_keys::ProviderApiKeys::default(),
             file_url: "file:///etc/passwd".to_owned(),
             language: None,
             provider_order: None,

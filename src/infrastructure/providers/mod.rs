@@ -37,7 +37,12 @@ fn map_provider_error(provider: ProviderName, error: ProviderError) -> DomainPro
         ProviderErrorKind::InvalidResponse => ProviderFailureKind::InvalidResponse,
         ProviderErrorKind::Unavailable => ProviderFailureKind::Unavailable,
     };
-    DomainProviderError::new(provider, kind)
+    DomainProviderError {
+        provider,
+        kind,
+        status: error.status,
+        reason: error.reason,
+    }
 }
 
 fn audio_artifact(bytes: bytes::Bytes, media_type: &str) -> Result<AudioArtifact, ProviderError> {

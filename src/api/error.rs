@@ -1,6 +1,6 @@
 //! Stable, provider-independent HTTP error responses.
 
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 
 use axum::{
     Json,
@@ -18,7 +18,10 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 pub struct ApiError {
     status: StatusCode,
     code: &'static str,
-    message: &'static str,
+    message: Cow<'static, str>,
+    provider: Option<&'static str>,
+    reason: Option<&'static str>,
+    provider_status: Option<u16>,
     request_id: RequestId,
     retry_after: Option<Duration>,
 }
@@ -28,7 +31,9 @@ impl ApiError {
     #[must_use]
     pub fn from_waveform(error: WaveformError, request_id: RequestId) -> Self {
         let status = match error {
-            WaveformError::InvalidRequest => StatusCode::BAD_REQUEST,
+            WaveformError::InvalidRequest | WaveformError::InvalidProviderOptions(_) => {
+                StatusCode::BAD_REQUEST
+            }
             WaveformError::Unauthenticated => StatusCode::UNAUTHORIZED,
             WaveformError::Forbidden => StatusCode::FORBIDDEN,
             WaveformError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -37,13 +42,35 @@ impl ApiError {
             WaveformError::IdempotencyKeyReused | WaveformError::RequestInProgress { .. } => {
                 StatusCode::CONFLICT
             }
-            WaveformError::ProvidersExhausted => StatusCode::BAD_GATEWAY,
+            WaveformError::ProvidersExhausted | WaveformError::ProviderFailed { .. } => {
+                StatusCode::BAD_GATEWAY
+            }
             WaveformError::DependencyContractUnavailable { .. }
             | WaveformError::DependencyUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             WaveformError::DependencyTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
             WaveformError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let message = message_for_code(error.code().as_str());
+        let (message, provider, reason, provider_status) = match error {
+            WaveformError::ProviderFailed { failure } => (
+                Cow::Owned(format!(
+                    "{} request failed: {} Automatic fallback is off; correct the request or choose a different provider.",
+                    failure.provider,
+                    failure.message()
+                )),
+                Some(failure.provider.as_str()),
+                Some(failure.reason.unwrap_or(failure.kind.as_str())),
+                failure.status,
+            ),
+            WaveformError::InvalidProviderOptions(message) => {
+                (Cow::Borrowed(message), None, None, None)
+            }
+            _ => (
+                Cow::Borrowed(message_for_code(error.code().as_str())),
+                None,
+                None,
+                None,
+            ),
+        };
         let retry_after = error.retry_after().or_else(|| {
             (status == StatusCode::SERVICE_UNAVAILABLE).then_some(Duration::from_secs(5))
         });
@@ -51,6 +78,9 @@ impl ApiError {
             status,
             code: error.code().as_str(),
             message,
+            provider,
+            reason,
+            provider_status,
             request_id,
             retry_after,
         }
@@ -63,6 +93,17 @@ impl ApiError {
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "The request is malformed or contains an invalid value.",
+            request_id,
+        )
+    }
+
+    /// Constructs a precise validation failure using static, secret-free text.
+    #[must_use]
+    pub const fn invalid_options(message: &'static str, request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            message,
             request_id,
         )
     }
@@ -166,7 +207,10 @@ impl ApiError {
         Self {
             status,
             code,
-            message,
+            message: Cow::Borrowed(message),
+            provider: None,
+            reason: None,
+            provider_status: None,
             request_id,
             retry_after: None,
         }
@@ -185,6 +229,9 @@ impl IntoResponse for ApiError {
                 code: self.code,
                 message: self.message,
                 request_id: self.request_id.to_string(),
+                provider: self.provider,
+                reason: self.reason,
+                provider_status: self.provider_status,
             },
         };
         let mut response = (self.status, Json(body)).into_response();
@@ -209,8 +256,14 @@ struct ErrorEnvelope {
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     code: &'static str,
-    message: &'static str,
+    message: Cow<'static, str>,
     request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_status: Option<u16>,
 }
 
 fn message_for_code(code: &str) -> &'static str {
@@ -233,6 +286,37 @@ fn message_for_code(code: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn selected_provider_failure_explains_reason_and_retains_correlation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::domain::provider::{ProviderError, ProviderFailureKind, ProviderName};
+        let id = RequestId::new(Uuid::from_u128(43))?;
+        let response = ApiError::from_waveform(
+            WaveformError::ProviderFailed {
+                failure: ProviderError {
+                    provider: ProviderName::ElevenLabs,
+                    kind: ProviderFailureKind::Authentication,
+                    status: Some(401),
+                    reason: Some("invalid_api_key"),
+                },
+            },
+            id,
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(json["error"]["code"], "provider_failed");
+        assert_eq!(json["error"]["provider"], "elevenlabs");
+        assert_eq!(json["error"]["reason"], "invalid_api_key");
+        assert_eq!(json["error"]["provider_status"], 401);
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("different provider"))
+        );
+        Ok(())
+    }
     use std::time::Duration;
 
     use axum::{body::to_bytes, response::IntoResponse as _};

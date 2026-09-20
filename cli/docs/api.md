@@ -3,9 +3,12 @@
 The backend base is `https://backend.waveform.teamofsilicons.com/api/v1`; local runs
 normally use `http://127.0.0.1:8080`. Speech calls use `X-Org-ID`,
 `Idempotency-Key`, and exactly one IAM bearer or OBO credential. `POST /tts`
-accepts `{text,lang?,voice_profile?,provider_order?}` and `POST /stt` accepts
-`{file_url,language?,provider_order?}`. `provider_order` is a preferred
-provider prefix; omitted providers follow the caller's account preference.
+accepts `{text,lang?,voice_profile?,provider_order?,auto_fallback?,provider_options?,provider_keys?}`
+and `POST /stt` accepts `{file_url,language?,provider_order?,provider_keys?}`.
+`provider_order` is a preferred provider prefix; omitted providers follow the
+caller's account preference. TTS `auto_fallback` defaults to false, so only the
+first provider is attempted. Set it to true to try the remaining providers. STT
+retains its automatic provider fallback.
 Both routes are synchronous and return normalized provider-independent results.
 
 `GET /iam` is public discovery: it returns the configured `app_id`,
@@ -91,3 +94,40 @@ neither broadens the namespace fence nor grants another actor access.
 This is an additive v1 operation; existing speech schemas and published client
 operations remain unchanged. The authoritative operation catalog is OpenAPI;
 there is no separate Waveform operation-version negotiation endpoint.
+
+
+## Provider-specific controls and request keys
+
+TTS `provider_options` accepts one provider object matching the selected first
+provider, and only when `auto_fallback` is false:
+
+```json
+{"text":"Welcome home.","provider_order":["gemini"],"auto_fallback":false,"provider_options":{"gemini":{"scene":"A quiet evening at home","director_notes":"Warm, relaxed delivery"}}}
+```
+
+Gemini controls are `voice`, `scene`, `audio_profile`, `director_notes`, and
+`sample_context`. ElevenLabs controls are `voice_id`, `model_id`, `stability`,
+`similarity_boost`, `style`, `speed`, `use_speaker_boost`, `seed`, `previous_text`,
+`next_text`, and `apply_text_normalization`. OpenAI controls are `voice`, `model`,
+`instructions`, and `speed`; instructions require `gpt-4o-mini-tts` explicitly.
+The OpenAPI schema describes supported values and ranges. Unknown fields,
+controls for another provider, and controls combined with automatic fallback
+are rejected. Omitted controls use the selected profile defaults.
+
+TTS and STT `provider_keys` accept a map such as
+`{"gemini":"<private-provider-key>"}`. Each request key overrides the saved
+personal key and deployment key for that same provider. Request keys never
+persist to preferences, history, or idempotency results. Without a request key,
+existing saved-key selection remains in effect. Never include provider keys in
+URLs or diagnostic output.
+
+Provider failures return a safe `error.message` plus optional `provider`,
+`reason`, and `provider_status` fields, alongside `code` and `request_id`.
+With TTS automatic fallback disabled, the response explains the selected
+provider's failure so the caller can choose a different provider.
+
+This intentionally changes the omitted TTS fallback setting for existing HTTP
+callers: send `auto_fallback: true` to retain the earlier behavior. Existing saved
+keys/preferences/jobs remain valid. Replaying an older completed TTS operation
+requires explicit `auto_fallback: true` without new controls or credentials;
+changing those inputs requires a new idempotency key.

@@ -21,3 +21,12 @@ The compatibility installer delegates to Honeycomb. Rust client requests never u
 The September 16 source changes add the [Honeycomb participant](honeycomb-lifecycle.md), remove autonomous environment retirement and public lifecycle mutations, and add [API contracts](api-contracts.md). These changes have not been deployed. Lifecycle credentials and the Honeycomb participant registration must be provisioned by the deployment operator before live coordination can work.
 
 Historical [2026-09-08 test evidence](test-report-2026-09-08.md) applies to the older explicitly paired environment protocol. Current deployment evidence is recorded separately. Inbound OBO speech remains unavailable because IAM does not provide the downstream subject-token handoff needed for that entry mode.
+
+## September 20 TTS controls and BYOK source update
+
+TTS now defaults to one selected provider, with explicit automatic fallback.
+Provider-specific controls, actionable safe failure details, and request-only BYOK
+are available in the API, Rust client, CLI and website. Existing encrypted saved
+keys remain supported with request → saved → deployment precedence. STT retains
+automatic fallback. These source changes require a backend/client/frontend release;
+local verification is not evidence that they have been deployed.

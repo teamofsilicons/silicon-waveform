@@ -7,6 +7,8 @@ use thiserror::Error;
 /// Stable machine-readable error code independent of HTTP status mapping.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ErrorCode {
+    /// The selected provider failed with automatic fallback disabled.
+    ProviderFailed,
     /// Request syntax or a validated value was invalid.
     InvalidRequest,
     /// Caller did not provide a single valid credential mode.
@@ -40,6 +42,7 @@ impl ErrorCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ProviderFailed => "provider_failed",
             Self::InvalidRequest => "invalid_request",
             Self::Unauthenticated => "unauthenticated",
             Self::Forbidden => "forbidden",
@@ -77,6 +80,15 @@ pub enum Dependency {
 /// Cohesive service failure consumed by the delivery layer.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum WaveformError {
+    /// A validated provider control is incompatible with the request.
+    #[error("{0}")]
+    InvalidProviderOptions(&'static str),
+    /// The selected provider failed. Details are safe classifications only.
+    #[error("request failed: {failure}")]
+    ProviderFailed {
+        /// Failed provider and safe reason.
+        failure: crate::domain::provider::ProviderError,
+    },
     /// Validated request could not be constructed.
     #[error("request is invalid")]
     InvalidRequest,
@@ -135,7 +147,8 @@ impl WaveformError {
     #[must_use]
     pub const fn code(&self) -> ErrorCode {
         match self {
-            Self::InvalidRequest => ErrorCode::InvalidRequest,
+            Self::InvalidProviderOptions(_) | Self::InvalidRequest => ErrorCode::InvalidRequest,
+            Self::ProviderFailed { .. } => ErrorCode::ProviderFailed,
             Self::Unauthenticated => ErrorCode::Unauthenticated,
             Self::Forbidden => ErrorCode::Forbidden,
             Self::PayloadTooLarge => ErrorCode::PayloadTooLarge,

@@ -2,7 +2,7 @@
 
 Silicon Waveform is the organization-scoped speech service for Carbons,
 Silicons, and IAM applications. It provides one synchronous, provider-neutral
-API for text-to-speech and speech-to-text, applies the documented fallback
+API for text-to-speech and speech-to-text, applies explicit TTS and automatic STT fallback
 chains, and stores generated MP3 files in Silicon Briefcase.
 
 The product contract lives in [`UNDERSTANDING.md`](./UNDERSTANDING.md),
@@ -46,7 +46,7 @@ Operational probes are outside the product API:
 
 ## Provider order
 
-TTS:
+TTS (only the first selected provider runs unless `auto_fallback: true`):
 
 1. Gemini `gemini-3.1-flash-tts-preview`
 2. ElevenLabs `eleven_multilingual_v2`
@@ -58,8 +58,10 @@ STT:
 2. OpenAI `gpt-transcribe`
 3. Deepgram `nova-3` multilingual
 
-Provider adapters are isolated and bounded. They do not leak provider response
-schemas or private errors into the public API.
+Provider adapters are isolated and bounded. TTS supports per-provider performance
+controls with fallback off, and reports a safe reason when the selected provider
+fails. Saved encrypted keys and request-only BYOK override shared credentials.
+See [the API guide](docs/api.md) and [full reference](API_DOCS.md).
 
 ## Architecture
 

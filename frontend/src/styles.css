@@ -1414,7 +1414,52 @@ dialog .muted {
 
 .composer-voice {
   padding: 20px 24px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line);
+}
+.provider-controls,
+.request-key,
+.provider-controls-note {
+  padding: 20px 24px;
+  border-top: 1px solid var(--line);
+}
+.provider-controls summary,
+.request-key summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+.provider-controls > .hint,
+.request-key > .hint {
+  margin-top: 12px;
+}
+.request-key > label {
+  margin-top: 18px;
+}
+.provider-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+  margin-top: 20px;
+}
+.provider-fields .full-width {
+  grid-column: 1 / -1;
+}
+.provider-fields textarea {
+  resize: vertical;
+}
+.provider-fields .hint {
+  font-weight: 400;
+  font-size: 0.7rem;
+}
+@media (max-width: 700px) {
+  .provider-controls,
+  .request-key,
+  .provider-controls-note {
+    padding: 20px;
+  }
+  .provider-fields {
+    grid-template-columns: 1fr;
+  }
 }
 .settings-voice {
   margin: 0 0 28px;

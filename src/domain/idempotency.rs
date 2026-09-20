@@ -3,6 +3,7 @@
 use std::{fmt, str::FromStr, time::Duration};
 
 use hmac::{Hmac, Mac as _};
+use secrecy::ExposeSecret as _;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq as _;
@@ -180,7 +181,7 @@ impl RequestDigest {
         );
         // Hash only caller intent. A default or mapping change must not alter
         // replay of an already completed request with the same idempotency key.
-        if let Some(profile) = &request.voice_profile {
+        let original = if let Some(profile) = &request.voice_profile {
             let mut hasher = Hmac::<Sha256>::new_from_slice(key.as_bytes())
                 .unwrap_or_else(|_| unreachable!("validated HMAC key"));
             hasher.update(b"silicon-waveform:voice-profile:v1\0");
@@ -189,13 +190,36 @@ impl RequestDigest {
             Self(hasher.finalize().into_bytes().into())
         } else {
             original
+        };
+        // Explicit legacy behavior retains replay compatibility with stored jobs.
+        if request.auto_fallback
+            && request.provider_options.is_empty()
+            && request.provider_keys.is_empty()
+        {
+            return original;
         }
+        let mut hasher = Hmac::<Sha256>::new_from_slice(key.as_bytes())
+            .unwrap_or_else(|_| unreachable!("validated HMAC key"));
+        hasher.update(b"silicon-waveform:tts-controls:v1\0");
+        hasher.update(&original.0);
+        hasher.update(&[u8::from(request.auto_fallback)]);
+        // Serialization contains only typed, validated options. Only the HMAC is stored.
+        update_length_prefixed(
+            &mut hasher,
+            &serde_json::to_vec(&request.provider_options)
+                .unwrap_or_else(|_| unreachable!("validated provider options serialize")),
+        );
+        for (provider, credential) in request.provider_keys.iter() {
+            update_length_prefixed(&mut hasher, provider.as_str().as_bytes());
+            update_length_prefixed(&mut hasher, credential.expose_secret().as_bytes());
+        }
+        Self(hasher.finalize().into_bytes().into())
     }
 
     /// Computes the canonical digest for a validated STT request.
     #[must_use]
     pub fn for_stt(request: &SttRequest, key: &RequestDigestKey) -> Self {
-        digest_fields(
+        let original = digest_fields(
             SpeechOperation::Stt,
             request.source_url.as_url().as_str(),
             request
@@ -204,7 +228,19 @@ impl RequestDigest {
                 .map(super::language::LanguageHint::as_str),
             request.provider_order.as_deref(),
             key,
-        )
+        );
+        if request.provider_keys.is_empty() {
+            return original;
+        }
+        let mut hasher = Hmac::<Sha256>::new_from_slice(key.as_bytes())
+            .unwrap_or_else(|_| unreachable!("validated HMAC key"));
+        hasher.update(b"silicon-waveform:stt-keys:v1\0");
+        hasher.update(&original.0);
+        for (provider, credential) in request.provider_keys.iter() {
+            update_length_prefixed(&mut hasher, provider.as_str().as_bytes());
+            update_length_prefixed(&mut hasher, credential.expose_secret().as_bytes());
+        }
+        Self(hasher.finalize().into_bytes().into())
     }
 
     /// Reconstructs a digest loaded from trusted storage.
@@ -456,6 +492,26 @@ fn update_length_prefixed(hasher: &mut Hmac<Sha256>, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tts_controls_and_ephemeral_keys_are_bound_to_idempotency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::domain::speech::{SpeechText, TtsRequest};
+        let key = super::RequestDigestKey::new(&[7; 32])?;
+        let mut request = TtsRequest::new(SpeechText::new("hello".to_owned())?, None)?;
+        let original = super::RequestDigest::for_tts(&request, &key);
+        request.auto_fallback = true;
+        assert_ne!(original, super::RequestDigest::for_tts(&request, &key));
+        request.auto_fallback = false;
+        request.provider_options =
+            serde_json::from_value(serde_json::json!({"gemini":{"scene":"quiet room"}}))?;
+        let directed = super::RequestDigest::for_tts(&request, &key);
+        assert_ne!(original, directed);
+        request.provider_keys =
+            serde_json::from_value(serde_json::json!({"gemini":"request-only-key"}))?;
+        assert_ne!(directed, super::RequestDigest::for_tts(&request, &key));
+        assert!(!format!("{request:?}").contains("request-only-key"));
+        Ok(())
+    }
     use std::str::FromStr as _;
 
     use super::{

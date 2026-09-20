@@ -11,5 +11,7 @@ pub mod identity;
 pub mod language;
 pub mod media;
 pub mod provider;
+pub mod provider_keys;
 pub mod speech;
+pub mod tts_options;
 pub mod voice;

@@ -1,5 +1,8 @@
 import { randomBytes } from "node:crypto";
 
+// Match the backend's expanded JSON contract for provider controls and BYOK.
+export const MAX_REQUEST_BODY_BYTES = 327_680;
+
 const json = (value, status = 200) => Response.json(value, { status });
 const failure = (code, message, status = 400) =>
   json({ error: { code, message } }, status);
@@ -231,7 +234,7 @@ export function createGateway({
         )
           return finish(failure("json_required", "Use a JSON request.", 415));
         const text = await request.text();
-        if (Buffer.byteLength(text) > 128 * 1024)
+        if (Buffer.byteLength(text) > MAX_REQUEST_BODY_BYTES)
           return finish(
             failure("request_too_large", "This request is too large.", 413),
           );
@@ -424,7 +427,7 @@ export function createGateway({
       return finish(
         failure(
           "upstream_unavailable",
-          "Waveform could not reach the service. Try again; your request can be retried safely.",
+          "Waveform could not reach the service. If a speech request was submitted, its result may be uncertain; check job history before retrying.",
           502,
         ),
       );

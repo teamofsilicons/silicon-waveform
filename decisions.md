@@ -838,3 +838,28 @@ and includes each HTTP exchange within the caller's overall timeout.
 
 
 - **D-060 — Real paired-service compatibility:** Real IAM login serializes its short-lived application code as `oac_`, although the request field is `slt`. Waveform validates that prefix and the regression fixtures and OpenAPI schema use it. Default speech scope is `obo.issue`, an actual IAM-issued scope needed for downstream storage; actor, organization, audience, expiry and plane checks remain mandatory. Briefcase delegated reads use `download: false` to preserve the stored MIME type because download intent deliberately returns `application/octet-stream`. The real Carbon/Silicon TTS→storage→STT run verified these boundaries. CLI status commands now honor `--json`, including session and cleanup commands.
+
+
+## 2026-09-20 — Explicit TTS provider control and request BYOK
+
+The user requested default-off TTS automatic fallback while retaining STT fallback,
+per-generation controls for the selected provider, actionable failures, and BYOK.
+This explicit request supersedes the earlier common-fallback TTS request shape in
+the human-owned UNDERSTANDING.md; that file remains unchanged. The existing v1
+JSON transport gains auto_fallback, provider_options and provider_keys. Omitted
+TTS auto_fallback now means false; existing callers wanting the previous behavior
+must send true. Profiles and stored provider order still supply defaults.
+
+Nonempty provider controls require fallback off and must match the selected
+provider, avoiding silent loss of model-specific controls. TTS provider generation
+is attempted once. Safe provider categories/allowlisted reasons and upstream HTTP
+status explain failure without reflecting provider bodies, prompts or secrets.
+
+Saved BYOK already existed and remains encrypted per environment/org/actor.
+Request-only credentials override saved keys, which override deployment keys for
+the same provider. A rejected personal key never triggers a shared-key retry.
+Only a keyed digest binds ephemeral credentials and controls to idempotency; no
+plaintext key is stored. Explicit legacy fallback without new controls/keys keeps
+its original digest so completed operations can replay. Sandbox requests validate
+controls but use prerecorded profile clips for every TTS provider and never spend
+provider credentials. This source update is locally verified, not deployed.

@@ -11,6 +11,7 @@ use crate::{
         media::AudioArtifact,
         provider::{ProviderError as DomainProviderError, ProviderName},
         speech::{SttProviderRequest, SttProviderResult, TtsProviderRequest},
+        tts_options::GeminiTtsOptions,
     },
 };
 
@@ -86,23 +87,28 @@ impl GeminiProvider {
         text: &str,
         language: Option<&str>,
         voice: Option<&str>,
+        options: Option<&GeminiTtsOptions>,
     ) -> Result<AudioArtifact, ProviderError> {
         let _permit = self.tts_runtime.try_acquire()?;
         let url = self.tts_runtime.url("v1beta/interactions")?;
+        let prompt = options.map(|options| options.prompt(text));
         let body = GeminiTtsRequest {
             model: &self.tts_model,
-            input: text,
+            input: prompt.as_deref().unwrap_or(text),
             response_format: GeminiResponseFormat { kind: "audio" },
             generation_config: GeminiTtsGenerationConfig {
                 speech_config: [GeminiSpeechConfig {
-                    voice: voice.unwrap_or(&self.voice),
+                    voice: options
+                        .and_then(|options| options.voice.as_deref())
+                        .or(voice)
+                        .unwrap_or(&self.voice),
                     language,
                 }],
             },
         };
         let response = self
             .tts_runtime
-            .execute(|| {
+            .execute_without_retry(|| {
                 Ok(self
                     .tts_runtime
                     .client
@@ -426,6 +432,7 @@ impl TextToSpeechProvider for GeminiProvider {
                 Some(crate::domain::voice::ProviderVoice::Gemini(voice)) => Some(voice.as_str()),
                 _ => None,
             },
+            request.options.gemini.as_ref(),
         )
         .await
         .map_err(|error| map_provider_error(ProviderName::Gemini, error))
@@ -680,10 +687,12 @@ mod tests {
         let result = TextToSpeechProvider::synthesize(
             &provider,
             TtsProviderRequest {
+                fixture_voice: None,
                 text: crate::domain::speech::SpeechText::new("hello".into())
                     .unwrap_or_else(|e| panic!("{e}")),
                 language: Some("en".parse().unwrap_or_else(|e| panic!("{e}"))),
                 voice: Some(crate::domain::voice::ProviderVoice::Gemini("Puck".into())),
+                options: crate::domain::tts_options::TtsProviderOptions::default(),
             },
             RequestId::new(uuid::Uuid::new_v4()).unwrap_or_else(|e| panic!("{e}")),
         )
@@ -700,6 +709,65 @@ mod tests {
                                 && specification.channels() == 1
                     )
         ));
+    }
+
+    #[tokio::test]
+    async fn tts_returns_provider_failure_without_retrying_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1beta/interactions"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({"error":{"code":"quota_exceeded","message":"Private upstream detail"}})))
+            .expect(1).mount(&server).await;
+        let provider = provider(&server).ok_or("invalid fixture provider")?;
+        let error = provider
+            .synthesize_audio("Hello.", None, None, None)
+            .await
+            .err()
+            .ok_or("expected provider failure")?;
+        assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+        assert_eq!(error.status, Some(429));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tts_renders_scene_and_direction_with_a_voice_override()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1beta/interactions"))
+            .and(body_json(serde_json::json!({
+                "model": GEMINI_TTS_MODEL,
+                "input": "# AUDIO PROFILE\nA calm narrator\n\n## THE SCENE\nA quiet library\n\n### DIRECTOR'S NOTES\nWhisper slowly\n\n### SAMPLE CONTEXT\nThe room has fallen silent\n\n#### TRANSCRIPT\nHello.",
+                "response_format": {"type":"audio"},
+                "generation_config": {"speech_config":[{"voice":"Kore"}]}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status":"completed", "steps":[{"content":[{"type":"audio","data":STANDARD.encode([1,2,3,4]),"mime_type":"audio/l16","sample_rate":24000,"channels":1}]}]
+            })))
+            .expect(1).mount(&server).await;
+        let provider = provider(&server).ok_or("invalid fixture provider")?;
+        TextToSpeechProvider::synthesize(
+            &provider,
+            TtsProviderRequest {
+                fixture_voice: None,
+                text: crate::domain::speech::SpeechText::new("Hello.".into())?,
+                language: None,
+                voice: Some(crate::domain::voice::ProviderVoice::Gemini("Puck".into())),
+                options: crate::domain::tts_options::TtsProviderOptions {
+                    gemini: Some(GeminiTtsOptions {
+                        voice: Some("Kore".into()),
+                        audio_profile: Some("A calm narrator".into()),
+                        scene: Some("A quiet library".into()),
+                        director_notes: Some("Whisper slowly".into()),
+                        sample_context: Some("The room has fallen silent".into()),
+                    }),
+                    ..Default::default()
+                },
+            },
+            RequestId::new(uuid::Uuid::new_v4())?,
+        )
+        .await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -824,7 +892,8 @@ mod tests {
         assert!(matches!(
             result,
             Err(ProviderError {
-                kind: ProviderErrorKind::Unavailable
+                kind: ProviderErrorKind::Unavailable,
+                ..
             })
         ));
     }

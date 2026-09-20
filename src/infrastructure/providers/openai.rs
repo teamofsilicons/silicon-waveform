@@ -9,6 +9,7 @@ use crate::{
         media::AudioArtifact,
         provider::{ProviderError as DomainProviderError, ProviderName},
         speech::{SttProviderRequest, SttProviderResult, TtsProviderRequest},
+        tts_options::OpenAiTtsOptions,
     },
 };
 
@@ -75,23 +76,31 @@ impl OpenAiProvider {
         }
     }
 
-    /// Calls the binary Speech endpoint with the exact `tts-1` model.
+    /// Calls the binary Speech endpoint with per-request model and delivery controls.
     async fn synthesize_audio(
         &self,
         text: &str,
         voice: Option<&str>,
+        options: Option<&OpenAiTtsOptions>,
     ) -> Result<AudioArtifact, ProviderError> {
         let _permit = self.tts_runtime.try_acquire()?;
         let url = self.tts_runtime.url("v1/audio/speech")?;
         let body = OpenAiSpeechRequest {
-            model: &self.tts_model,
+            model: options
+                .and_then(|options| options.model.as_deref())
+                .unwrap_or(&self.tts_model),
             input: text,
-            voice: voice.unwrap_or(&self.voice),
+            voice: options
+                .and_then(|options| options.voice.as_deref())
+                .or(voice)
+                .unwrap_or(&self.voice),
             response_format: "mp3",
+            speed: options.and_then(|options| options.speed),
+            instructions: options.and_then(|options| options.instructions.as_deref()),
         };
         let response = self
             .tts_runtime
-            .execute(|| {
+            .execute_without_retry(|| {
                 Ok(self
                     .tts_runtime
                     .client
@@ -185,6 +194,7 @@ impl TextToSpeechProvider for OpenAiProvider {
                 Some(crate::domain::voice::ProviderVoice::OpenAi(voice)) => Some(voice.as_str()),
                 _ => None,
             },
+            request.options.openai.as_ref(),
         )
         .await
         .map_err(|error| map_provider_error(ProviderName::OpenAi, error))
@@ -224,6 +234,10 @@ struct OpenAiSpeechRequest<'a> {
     input: &'a str,
     voice: &'a str,
     response_format: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -312,18 +326,73 @@ mod tests {
         let result = TextToSpeechProvider::synthesize(
             &provider,
             TtsProviderRequest {
+                fixture_voice: None,
                 text: crate::domain::speech::SpeechText::new("hello".into())
                     .unwrap_or_else(|e| panic!("{e}")),
                 language: None,
                 voice: Some(crate::domain::voice::ProviderVoice::OpenAi(
                     "shimmer".into(),
                 )),
+                options: crate::domain::tts_options::TtsProviderOptions::default(),
             },
             RequestId::new(uuid::Uuid::new_v4()).unwrap_or_else(|e| panic!("{e}")),
         )
         .await;
 
         assert!(matches!(result, Ok(audio) if audio.bytes() == valid_mp3_frame().as_slice()));
+    }
+
+    #[tokio::test]
+    async fn tts_returns_provider_failure_without_retrying_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({"error":{"code":"insufficient_quota","message":"Private upstream detail"}})))
+            .expect(1).mount(&server).await;
+        let provider = provider(&server).ok_or("invalid fixture provider")?;
+        let error = provider
+            .synthesize_audio("Hello.", None, None)
+            .await
+            .err()
+            .ok_or("expected provider failure")?;
+        assert_eq!(error.kind, super::super::ProviderErrorKind::RateLimited);
+        assert_eq!(error.status, Some(429));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tts_sends_model_speed_and_instructions_with_voice_override()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .and(body_json(serde_json::json!({"model":"gpt-4o-mini-tts","input":"Hello.","voice":"marin","response_format":"mp3","speed":0.75,"instructions":"Speak softly"})))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type","audio/mpeg").set_body_bytes(valid_mp3_frame()))
+            .expect(1).mount(&server).await;
+        let provider = provider(&server).ok_or("invalid fixture provider")?;
+        TextToSpeechProvider::synthesize(
+            &provider,
+            TtsProviderRequest {
+                fixture_voice: None,
+                text: crate::domain::speech::SpeechText::new("Hello.".into())?,
+                language: None,
+                voice: Some(crate::domain::voice::ProviderVoice::OpenAi(
+                    "shimmer".into(),
+                )),
+                options: crate::domain::tts_options::TtsProviderOptions {
+                    openai: Some(OpenAiTtsOptions {
+                        model: Some("gpt-4o-mini-tts".into()),
+                        voice: Some("marin".into()),
+                        speed: Some(0.75),
+                        instructions: Some("Speak softly".into()),
+                    }),
+                    ..Default::default()
+                },
+            },
+            RequestId::new(uuid::Uuid::new_v4())?,
+        )
+        .await?;
+        Ok(())
     }
 
     #[tokio::test]

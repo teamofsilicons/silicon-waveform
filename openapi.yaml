@@ -1,11 +1,11 @@
 openapi: 3.1.0
 info:
   title: Silicon Waveform API
-  version: 0.1.0
+  version: 0.2.0
   summary: Provider-independent text-to-speech and speech-to-text
   description: |
     Synchronous speech operations for Carbons, Silicons, and IAM applications.
-    Provider selection and fallback are internal. TTS output is normalized to
+    TTS automatic fallback defaults to off; STT retains automatic fallback. TTS output is normalized to
     MP3 and stored in the represented actor's Briefcase. OBO requests are
     accepted only when the configured IAM and Briefcase request-bound contracts
     are available. Test planes use deterministic speech with paired IAM and
@@ -851,7 +851,7 @@ components:
         Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     BadGateway:
-      description: Every provider failed or returned an invalid response
+      description: Selected TTS provider failed with fallback off, or the enabled provider chain failed
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
         Cache-Control: { $ref: '#/components/headers/CacheControl' }
@@ -910,11 +910,82 @@ components:
                 use_speaker_boost: { type: boolean }
                 speed: { type: number, minimum: 0.7, maximum: 1.2 }
 
+    ProviderApiKey:
+      type: string
+      minLength: 1
+      maxLength: 16384
+      pattern: '^[!-~]+$'
+      writeOnly: true
+      description: Request-only credential. Overrides saved and deployment keys for this provider and is never persisted or returned.
+    TTSProviderKeys:
+      type: object
+      additionalProperties: false
+      properties:
+        gemini: { $ref: '#/components/schemas/ProviderApiKey' }
+        elevenlabs: { $ref: '#/components/schemas/ProviderApiKey' }
+        openai: { $ref: '#/components/schemas/ProviderApiKey' }
+    STTProviderKeys:
+      type: object
+      additionalProperties: false
+      properties:
+        gemini: { $ref: '#/components/schemas/ProviderApiKey' }
+        openai: { $ref: '#/components/schemas/ProviderApiKey' }
+        deepgram: { $ref: '#/components/schemas/ProviderApiKey' }
+    TTSProviderOptions:
+      type: object
+      additionalProperties: false
+      description: Nonempty controls must belong to the first resolved provider and require auto_fallback false. Omitted values inherit voice-profile and server settings.
+      properties:
+        gemini: { $ref: '#/components/schemas/GeminiTTSOptions' }
+        elevenlabs: { $ref: '#/components/schemas/ElevenLabsTTSOptions' }
+        openai: { $ref: '#/components/schemas/OpenAITTSOptions' }
+    GeminiTTSOptions:
+      type: object
+      additionalProperties: false
+      description: Direction fields become labeled prompt sections before the transcript. Total instructions at most 16384 characters.
+      properties:
+        voice: { type: string, minLength: 1, maxLength: 64, pattern: '^[A-Za-z]+$' }
+        scene: { type: string, minLength: 1, maxLength: 4096 }
+        audio_profile: { type: string, minLength: 1, maxLength: 4096 }
+        director_notes: { type: string, minLength: 1, maxLength: 4096 }
+        sample_context: { type: string, minLength: 1, maxLength: 4096 }
+    ElevenLabsTTSOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        voice_id: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }
+        model_id: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$', description: Provider validates model availability for the selected API key }
+        stability: { type: number, minimum: 0, maximum: 1 }
+        similarity_boost: { type: number, minimum: 0, maximum: 1 }
+        style: { type: number, minimum: 0, maximum: 1 }
+        speed: { type: number, minimum: 0.7, maximum: 1.2 }
+        use_speaker_boost: { type: boolean }
+        seed: { type: integer, minimum: 0, maximum: 4294967295 }
+        previous_text: { type: string, minLength: 1, maxLength: 4096 }
+        next_text: { type: string, minLength: 1, maxLength: 4096 }
+        apply_text_normalization: { type: string, enum: [auto, 'on', 'off'] }
+    OpenAITTSOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        voice: { type: string, description: Built-in voice supported by the selected model }
+        model: { type: string, enum: [tts-1, tts-1-hd, gpt-4o-mini-tts] }
+        instructions: { type: string, minLength: 1, maxLength: 4096, description: Requires model gpt-4o-mini-tts explicitly }
+        speed: { type: number, minimum: 0.25, maximum: 4 }
+
     TTSRequest:
       type: object
       additionalProperties: false
       required: [text]
       properties:
+        auto_fallback:
+          type: boolean
+          default: false
+          description: Try the remaining provider order only when true. Nonempty provider_options require false.
+        provider_options:
+          $ref: '#/components/schemas/TTSProviderOptions'
+        provider_keys:
+          $ref: '#/components/schemas/TTSProviderKeys'
         voice_profile:
           type: [string, 'null']
           pattern: '^[a-z0-9-]{1,64}$'
@@ -934,7 +1005,7 @@ components:
           minItems: 1
           maxItems: 3
           uniqueItems: true
-          description: Preferred provider prefix; omitted providers follow the account order.
+          description: Preferred provider prefix; only its first resolved provider runs unless auto_fallback is true.
           items:
             type: string
             enum: [gemini, elevenlabs, openai]
@@ -944,6 +1015,8 @@ components:
       additionalProperties: false
       required: [file_url]
       properties:
+        provider_keys:
+          $ref: '#/components/schemas/STTProviderKeys'
         file_url:
           type: string
           format: uri
@@ -1160,13 +1233,24 @@ components:
     Capabilities:
       type: object
       additionalProperties: false
-      required: [tts, stt]
+      required: [tts, stt, byok]
       properties:
+        byok:
+          type: object
+          required: [saved, per_request, precedence]
+          properties:
+            saved: { type: boolean, const: true }
+            per_request: { type: boolean, const: true }
+            precedence: { type: array, items: { type: string }, example: [request, saved, shared] }
         tts:
           type: object
           additionalProperties: false
-          required: [output_format, languages]
+          required: [output_format, languages, auto_fallback_default, provider_options]
           properties:
+            auto_fallback_default: { type: boolean, const: false }
+            provider_options:
+              type: object
+              additionalProperties: { type: array, items: { type: string } }
             output_format: { type: string, const: mp3 }
             languages:
               type: array
@@ -1310,6 +1394,7 @@ components:
                 - source_not_found
                 - idempotency_key_reused
                 - request_in_progress
+                - provider_failed
                 - providers_exhausted
                 - dependency_contract_unavailable
                 - dependency_unavailable
@@ -1320,5 +1405,8 @@ components:
                 - not_found
                 - method_not_allowed
                 - internal_error
+            provider: { type: string, enum: [gemini, elevenlabs, openai, deepgram] }
+            reason: { type: string, description: Safe failure category or allowlisted provider reason }
+            provider_status: { type: integer, minimum: 100, maximum: 599 }
             message: { type: string, minLength: 1 }
             request_id: { type: string, format: uuid }

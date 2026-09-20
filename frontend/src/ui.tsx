@@ -94,6 +94,17 @@ export function Notice(props: { error?: unknown; message?: string }) {
               ? String(props.error)
               : props.message}
         </p>
+        <Show when={props.error instanceof ApiError && props.error.provider}>
+          <small>
+            Provider: {providerNames[(props.error as ApiError).provider!] || (props.error as ApiError).provider}
+            <Show when={(props.error as ApiError).providerStatus}>
+              {" "}· Response {(props.error as ApiError).providerStatus}
+            </Show>
+          </small>
+          <Show when={(props.error as ApiError).reason && !(props.error as ApiError).message.includes((props.error as ApiError).reason!)}>
+            <small>Reason: {(props.error as ApiError).reason!.replaceAll("_", " ")}</small>
+          </Show>
+        </Show>
         <Show when={props.error instanceof ApiError && props.error.requestId}>
           <small class="mono">
             Request {(props.error as ApiError).requestId}

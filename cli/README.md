@@ -42,8 +42,9 @@ Speech commands:
 
 Control commands include `me`, `capabilities`, `preferences`,
 `provider-keys`, `provider-key-set`, and `provider-key-delete`. Preferences
-orders are comma-separated provider names; key values are accepted only by
-`provider-key-set` and are never printed or returned by the server.
+orders are comma-separated provider names. Provider keys can be saved for the
+account or supplied for just one speech request; secret values are never printed
+or returned by the server.
 
 The historical `test-env` lifecycle commands return `manage_environment_in_honeycomb`. Create, clean, disable, restore and remove environments through Honeycomb. `test-env current` and saved app-secret selectors remain available. Read [testing](testing.md).
 
@@ -130,8 +131,12 @@ to discover another server.
 server rejection (HTTP 401/403), it returns `authenticated: false` and null
 identity fields. These status results exit successfully; scripts should inspect
 `authenticated`. Network failures, server errors and malformed responses exit
-nonzero, with diagnostics on stderr. Status never prints, refreshes or changes
-saved tokens. Without `--json`, it prints a readable identity or login guidance.
+nonzero, with diagnostics on stderr. Authenticated commands, including status,
+automatically refresh within 60 seconds of access-token expiry. Saved sessions
+from older CLI versions refresh once to acquire an expiry timestamp. Refreshes
+serialize across processes, preserve the selected server and testing environment,
+and reuse the same retry key after an uncertain response. Tokens are never
+printed. Without `--json`, status prints a readable identity or login guidance.
 
 Both commands support `--test <app-secret-or-id>` and the usual server/session
 isolation. Resolving an uncached test UUID still requires a production session
@@ -154,3 +159,60 @@ waveform login status --json
 ## API compatibility
 
 `waveform contracts --json` shows API versions, protocol compatibility and deprecation policy.
+
+## Provider controls and automatic fallback
+
+TTS calls only the first selected provider by default. Use `--provider gemini`,
+`--provider elevenlabs`, or `--provider openai` to select it. Omission uses your
+saved provider order. `--provider-order` still accepts a comma-separated prefix;
+without `--auto-fallback`, only its first provider is attempted. Add
+`--auto-fallback` to enable the existing sequence of backup providers. STT keeps
+automatic fallback enabled.
+
+Supply `--provider-options '<JSON>'` or `--provider-options-file FILE` (`-` reads
+stdin) to control the selected TTS provider. Controls and automatic fallback
+cannot be combined. Supported fields are:
+
+- `gemini`: `voice`, `scene`, `audio_profile`, `director_notes`, `sample_context`.
+- `elevenlabs`: `voice_id`, `model_id`, `stability`, `similarity_boost`, `style`,
+  `speed`, `use_speaker_boost`, `seed`, `previous_text`, `next_text`,
+  `apply_text_normalization` (`auto`, `on`, or `off`).
+- `openai`: `voice`, `model`, `instructions`, `speed`. `instructions` requires
+  `model: "gpt-4o-mini-tts"`; the other supported models are `tts-1` and `tts-1-hd`.
+
+```sh
+waveform tts 'Welcome home.' --org bricks --actor ACTOR --provider gemini \
+  --provider-options '{"gemini":{"scene":"A quiet evening at home","director_notes":"Warm, relaxed delivery"}}'
+waveform tts 'Welcome home.' --org bricks --actor ACTOR --provider elevenlabs \
+  --provider-options '{"elevenlabs":{"stability":0.35,"speed":0.9}}'
+waveform tts 'Welcome home.' --org bricks --actor ACTOR --auto-fallback
+```
+
+Omitted controls use the selected voice profile's defaults. Controls for another
+provider, unknown fields, and unsupported values fail validation. If synthesis
+fails, the error identifies the provider and a safe reason so you can choose a
+different provider explicitly.
+
+## Bring your own provider keys
+
+Use `--provider-key-file PROVIDER=FILE` on TTS or STT for a request-only key.
+Repeat the flag for different providers; `PROVIDER=-` reads a key from stdin.
+The key overrides a saved personal or deployment key for that provider only and
+is never saved by this command. STT fallback and opt-in TTS fallback can still
+use the saved or deployment keys belonging to other providers.
+
+```sh
+waveform tts 'Hello.' --org bricks --actor ACTOR --provider gemini \
+  --provider-key-file gemini=/private/path/gemini.key
+waveform stt FILE_URL --org bricks --actor ACTOR \
+  --provider-key-file openai=/private/path/openai.key
+waveform provider-key-set --org bricks --actor ACTOR gemini \
+  --key-file /private/path/gemini.key
+```
+
+`provider-key-set --key-file -` reads stdin and saves the key for the authenticated
+account and selected environment. The historical positional key argument still
+works, but `--key-file` keeps the secret out of shell history and process arguments.
+Only one input may read stdin in a command. Key files contain only the key, with
+an optional final newline. Provider-key deletion restores normal selection on
+later requests.

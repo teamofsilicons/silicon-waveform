@@ -102,6 +102,15 @@ fn fixture_mp3() -> Bytes {
 }
 
 fn fixture_voice(request: &TtsProviderRequest) -> Result<&str, ProviderError> {
+    if let Some(voice) = &request.fixture_voice {
+        return TEST_TTS_CLIPS
+            .iter()
+            .any(|(name, _)| name == voice)
+            .then_some(voice.as_str())
+            .ok_or_else(|| {
+                ProviderError::new(TEST_FIXTURE_PROVIDER, ProviderFailureKind::InvalidResponse)
+            });
+    }
     match &request.voice {
         None => Ok("Kore"),
         Some(ProviderVoice::Gemini(voice))
@@ -116,9 +125,7 @@ fn fixture_voice(request: &TtsProviderRequest) -> Result<&str, ProviderError> {
     }
 }
 
-/// Deterministic TTS provider. Gemini succeeds; the other chain positions are
-/// represented by bounded unavailable responses so the normal fallback loop is
-/// still exercised when a caller deliberately chooses one of them.
+/// Deterministic TTS provider returning prerecorded audio for every selection.
 #[derive(Clone, Copy, Debug)]
 pub struct FixtureTtsProvider {
     provider: ProviderName,
@@ -143,12 +150,6 @@ impl TextToSpeechProvider for FixtureTtsProvider {
         request: TtsProviderRequest,
         _request_id: RequestId,
     ) -> Result<AudioArtifact, ProviderError> {
-        if self.provider != TEST_FIXTURE_PROVIDER {
-            return Err(ProviderError::new(
-                self.provider,
-                ProviderFailureKind::Unavailable,
-            ));
-        }
         let voice = fixture_voice(&request)?;
         let (_, bytes) = TEST_TTS_CLIPS
             .iter()
@@ -272,12 +273,12 @@ pub(crate) async fn seed_audio(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-struct DatabaseFixtureTtsProvider(sqlx::PgPool);
+struct DatabaseFixtureTtsProvider(sqlx::PgPool, ProviderName);
 
 #[async_trait]
 impl TextToSpeechProvider for DatabaseFixtureTtsProvider {
     fn name(&self) -> ProviderName {
-        TEST_FIXTURE_PROVIDER
+        self.1
     }
 
     async fn synthesize(
@@ -301,9 +302,11 @@ impl TextToSpeechProvider for DatabaseFixtureTtsProvider {
 }
 
 /// Runtime fixtures load the prescribed audio from the authoritative database.
-pub(crate) fn database_provider_chains(pool: sqlx::PgPool) -> FixtureProviderChains {
+pub(crate) fn database_provider_chains(pool: &sqlx::PgPool) -> FixtureProviderChains {
     let (mut tts, stt) = provider_chains();
-    tts[0] = Arc::new(DatabaseFixtureTtsProvider(pool));
+    for provider in &mut tts {
+        *provider = Arc::new(DatabaseFixtureTtsProvider(pool.clone(), provider.name()));
+    }
     (tts, stt)
 }
 
@@ -646,7 +649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixture_tts_is_exact_and_only_first_chain_position_succeeds() {
+    async fn fixture_tts_is_exact_and_every_tts_provider_works_without_fallback() {
         let (tts, _) = provider_chains();
         let request = TtsRequest::new(
             SpeechText::new("hello".to_owned()).unwrap_or_else(|_| unreachable!()),
@@ -677,7 +680,7 @@ mod tests {
                     request_id(),
                 )
                 .await
-                .is_err()
+                .is_ok()
         );
     }
 

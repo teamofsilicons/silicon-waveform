@@ -247,27 +247,38 @@ impl WaveformService {
         &self,
         plane_id: uuid::Uuid,
         actor: &AuthorizedActor,
+        request_keys: &crate::domain::provider_keys::ProviderApiKeys,
     ) -> Result<Self, WaveformError> {
         let mut service = self.clone();
-        if let Some(store) = &self.provider_keys {
-            let keys = store.load(plane_id, actor).await.map_err(|_| {
-                WaveformError::DependencyUnavailable {
+        // Sandbox requests always use deterministic fixtures, even with BYOK.
+        if !plane_id.is_nil() {
+            return Ok(service);
+        }
+        let mut keys = if let Some(store) = &self.provider_keys {
+            store
+                .load(plane_id, actor)
+                .await
+                .map_err(|_| WaveformError::DependencyUnavailable {
                     dependency: Dependency::ProviderKeys,
-                }
-            })?;
-            for provider in &mut service.tts_providers {
-                if let Some(key) = keys.get(&provider.name()) {
-                    *provider = provider
-                        .with_api_key(key.clone())
-                        .ok_or(WaveformError::Internal)?;
-                }
+                })?
+        } else {
+            crate::application::ports::ProviderKeys::new()
+        };
+        for (provider, key) in request_keys.iter() {
+            keys.insert(provider, key.clone());
+        }
+        for provider in &mut service.tts_providers {
+            if let Some(key) = keys.get(&provider.name()) {
+                *provider = provider
+                    .with_api_key(key.clone())
+                    .ok_or(WaveformError::Internal)?;
             }
-            for provider in &mut service.stt_providers {
-                if let Some(key) = keys.get(&provider.name()) {
-                    *provider = provider
-                        .with_api_key(key.clone())
-                        .ok_or(WaveformError::Internal)?;
-                }
+        }
+        for provider in &mut service.stt_providers {
+            if let Some(key) = keys.get(&provider.name()) {
+                *provider = provider
+                    .with_api_key(key.clone())
+                    .ok_or(WaveformError::Internal)?;
             }
         }
         Ok(service)
@@ -313,7 +324,26 @@ impl WaveformService {
         if request.text.character_count() > self.policy.max_text_chars {
             return Err(WaveformError::PayloadTooLarge);
         }
-        let service = self.for_actor(context.plane_id, &authorization).await?;
+        let provider_order = crate::domain::provider::resolve_order(
+            request.provider_order.as_deref().unwrap_or(&[]),
+            &TTS_PROVIDER_CHAIN,
+        )
+        .ok_or(WaveformError::InvalidRequest)?;
+        if request.auto_fallback && !request.provider_options.is_empty() {
+            return Err(WaveformError::InvalidProviderOptions(
+                "Provider-specific controls require auto_fallback=false.",
+            ));
+        }
+        request
+            .provider_options
+            .validate_for(provider_order[0])
+            .map_err(WaveformError::InvalidProviderOptions)?;
+        if !request.provider_keys.supports_only(&TTS_PROVIDER_CHAIN) {
+            return Err(WaveformError::InvalidRequest);
+        }
+        let service = self
+            .for_actor(context.plane_id, &authorization, &request.provider_keys)
+            .await?;
         let scope = IdempotencyScope {
             plane_id: context.plane_id,
             actor: authorization.actor,
@@ -471,7 +501,12 @@ impl WaveformService {
             return Err(WaveformError::InvalidRequest);
         }
 
-        let service = self.for_actor(context.plane_id, &authorization).await?;
+        if !request.provider_keys.supports_only(&STT_PROVIDER_CHAIN) {
+            return Err(WaveformError::InvalidRequest);
+        }
+        let service = self
+            .for_actor(context.plane_id, &authorization, &request.provider_keys)
+            .await?;
         let scope = IdempotencyScope {
             plane_id: context.plane_id,
             actor: authorization.actor,
@@ -664,9 +699,12 @@ impl WaveformService {
         // Mint the one-use storage proof only after normalization, because IAM
         // binds it to the exact final bytes and gives it a short lifetime.
         let requested_order = request.provider_order.as_deref().unwrap_or(&[]);
-        let provider_order =
+        let mut provider_order =
             crate::domain::provider::resolve_order(requested_order, &TTS_PROVIDER_CHAIN)
                 .ok_or(WaveformError::InvalidRequest)?;
+        if !request.auto_fallback {
+            provider_order.truncate(1);
+        }
         let mut successful_audio = None;
         for provider_name in provider_order {
             let Some(provider) = self
@@ -693,6 +731,9 @@ impl WaveformService {
                         error.kind.as_str(),
                         started,
                     );
+                    if !request.auto_fallback {
+                        return Err(WaveformError::ProviderFailed { failure: error });
+                    }
                     continue;
                 }
             };
@@ -715,6 +756,14 @@ impl WaveformService {
                         "invalid_audio",
                         started,
                     );
+                    if !request.auto_fallback {
+                        return Err(WaveformError::ProviderFailed {
+                            failure: crate::domain::provider::ProviderError::new(
+                                provider_name,
+                                crate::domain::provider::ProviderFailureKind::InvalidResponse,
+                            ),
+                        });
+                    }
                 }
                 Err(AudioNormalizationError::Failed) => {
                     trace_provider_attempt(
@@ -724,6 +773,11 @@ impl WaveformService {
                         "normalization_failed",
                         started,
                     );
+                    if !request.auto_fallback {
+                        return Err(WaveformError::DependencyUnavailable {
+                            dependency: Dependency::AudioNormalizer,
+                        });
+                    }
                 }
                 Err(error) => {
                     trace_provider_attempt(
@@ -1470,6 +1524,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tts_default_failure_never_attempts_another_provider() {
+        let fixture = fixture(
+            IdempotencyDecision::Acquired {
+                lease: lease(),
+                request_id: request_id(77),
+                operation_started_at: original_operation_start(),
+            },
+            [
+                provider_failure(ProviderName::Gemini),
+                Ok(audio_artifact()),
+                Ok(audio_artifact()),
+            ],
+            provider_failures_for_stt(),
+        );
+        let request = TtsRequest::new(
+            SpeechText::new("hello".to_owned()).unwrap_or_else(|_| unreachable!()),
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert!(!request.auto_fallback);
+        let result = fixture
+            .service
+            .synthesize(context(request_id(78), "no-fallback-key"), request)
+            .await;
+        assert!(
+            matches!(result, Err(WaveformError::ProviderFailed { failure }) if failure.provider == ProviderName::Gemini)
+        );
+        assert_eq!(lock(&fixture.tts[0].request_ids).len(), 1);
+        assert!(lock(&fixture.tts[1].request_ids).is_empty());
+        assert!(lock(&fixture.tts[2].request_ids).is_empty());
+        assert!(lock(&fixture.briefcase.store_requests).is_empty());
+        assert_eq!(
+            lock(&fixture.idempotency.releases)[0].failure_code,
+            Some(crate::domain::error::ErrorCode::ProviderFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn tts_rejects_controls_that_would_be_lost_by_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture(
+            IdempotencyDecision::Acquired {
+                lease: lease(),
+                request_id: request_id(77),
+                operation_started_at: original_operation_start(),
+            },
+            [
+                Ok(audio_artifact()),
+                Ok(audio_artifact()),
+                Ok(audio_artifact()),
+            ],
+            provider_failures_for_stt(),
+        );
+        let mut request = tts_request();
+        request.provider_options =
+            serde_json::from_value(serde_json::json!({"gemini":{"scene":"Quiet room"}}))?;
+        assert!(matches!(
+            fixture
+                .service
+                .synthesize(context(request_id(78), "controls-fallback"), request)
+                .await,
+            Err(WaveformError::InvalidProviderOptions(_))
+        ));
+        assert!(
+            fixture
+                .tts
+                .iter()
+                .all(|provider| lock(&provider.request_ids).is_empty())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reclaimed_tts_uses_the_original_request_id_for_every_side_effect() {
         let candidate_id = request_id(100);
         let canonical_id = request_id(7);
@@ -1947,6 +2074,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises saved and request credentials across both speech operations and shared-adapter isolation"
+    )]
     async fn personal_keys_reach_tts_and_stt_without_changing_shared_providers()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::infrastructure::providers::{
@@ -1954,27 +2085,27 @@ mod tests {
         };
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
-            matchers::{header, method, path},
+            matchers::{method, path},
         };
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/speech"))
-            .and(header("authorization", "Bearer personal-key"))
+            .and(wiremock::matchers::header_exists("authorization"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "audio/mpeg")
                     .set_body_bytes(include_bytes!("../infrastructure/test-fixture.mp3").to_vec()),
             )
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
-            .and(header("authorization", "Bearer personal-key"))
+            .and(wiremock::matchers::header_exists("authorization"))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"text":"personal transcription","usage":{"seconds":1.0}}),
             ))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         let adapter = Arc::new(OpenAiProvider::new(
@@ -1988,7 +2119,9 @@ mod tests {
                 voice: "alloy".to_owned(),
             },
         ));
-        for operation in ["tts", "stt"] {
+        for (operation, request_override) in
+            [("tts", false), ("stt", false), ("tts", true), ("stt", true)]
+        {
             let mut fixture = fixture(
                 IdempotencyDecision::Acquired {
                     lease: lease(),
@@ -2001,10 +2134,20 @@ mod tests {
             fixture.service.tts_providers[2] = adapter.clone();
             fixture.service.stt_providers[1] = adapter.clone();
             let service = fixture.service.with_provider_keys(Arc::new(PersonalKeys));
+            let mut tts = tts_request().with_provider_order(vec![ProviderName::OpenAi]);
+            tts.auto_fallback = false;
+            let mut stt = stt_request();
+            if request_override {
+                let keys = serde_json::from_value::<crate::domain::provider_keys::ProviderApiKeys>(
+                    serde_json::json!({"openai":"request-only-key"}),
+                )?;
+                tts.provider_keys = keys.clone();
+                stt.provider_keys = keys;
+            }
             if operation == "tts" {
                 assert_eq!(
                     service
-                        .synthesize(context(request_id(78), "personal-tts"), tts_request())
+                        .synthesize(context(request_id(78), "personal-tts"), tts)
                         .await?
                         .result
                         .provider,
@@ -2013,7 +2156,7 @@ mod tests {
             } else {
                 assert_eq!(
                     service
-                        .transcribe(context(request_id(79), "personal-stt"), stt_request())
+                        .transcribe(context(request_id(79), "personal-stt"), stt)
                         .await?
                         .result
                         .transcript
@@ -2038,8 +2181,26 @@ mod tests {
                 .await
                 .ok_or("requests unavailable")?
                 .len(),
-            2
+            4
         );
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("requests unavailable")?;
+        for (index, request) in received.iter().enumerate() {
+            assert_eq!(
+                request
+                    .headers
+                    .get("authorization")
+                    .ok_or("missing auth")?
+                    .to_str()?,
+                if index < 2 {
+                    "Bearer personal-key"
+                } else {
+                    "Bearer request-only-key"
+                }
+            );
+        }
         Ok(())
     }
 
@@ -2205,7 +2366,11 @@ mod tests {
     fn tts_request() -> TtsRequest {
         let text = SpeechText::new("hello world".to_owned())
             .unwrap_or_else(|error| panic!("valid text: {error}"));
-        TtsRequest::new(text, None).unwrap_or_else(|error| panic!("valid request: {error}"))
+        let mut request =
+            TtsRequest::new(text, None).unwrap_or_else(|error| panic!("valid request: {error}"));
+        // Existing fallback regression scenarios explicitly opt in.
+        request.auto_fallback = true;
+        request
     }
 
     fn stt_request() -> SttRequest {

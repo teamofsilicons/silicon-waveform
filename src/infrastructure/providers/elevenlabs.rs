@@ -9,6 +9,7 @@ use crate::{
         media::AudioArtifact,
         provider::{ProviderError as DomainProviderError, ProviderName},
         speech::TtsProviderRequest,
+        tts_options::ElevenLabsTtsOptions,
         voice::{ElevenLabsVoice, ElevenLabsVoiceSettings, ProviderVoice},
     },
 };
@@ -65,17 +66,32 @@ impl ElevenLabsProvider {
         &self,
         text: &str,
         voice: Option<&ElevenLabsVoice>,
+        options: Option<&ElevenLabsTtsOptions>,
     ) -> Result<AudioArtifact, ProviderError> {
         let _permit = self.runtime.try_acquire()?;
-        let url = self.speech_url(voice.map_or(&self.voice_id, |v| &v.voice_id))?;
+        let url = self.speech_url(
+            options
+                .and_then(|options| options.voice_id.as_deref())
+                .unwrap_or_else(|| voice.map_or(&self.voice_id, |v| &v.voice_id)),
+        )?;
         let body = ElevenLabsSpeechRequest {
             text,
-            model_id: voice.map_or(&self.model, |v| &v.model_id),
-            voice_settings: voice.map(|v| &v.voice_settings),
+            model_id: options
+                .and_then(|options| options.model_id.as_deref())
+                .unwrap_or_else(|| voice.map_or(&self.model, |v| &v.model_id)),
+            voice_settings: ElevenLabsSpeechSettings::merged(
+                voice.map(|v| &v.voice_settings),
+                options,
+            ),
+            seed: options.and_then(|options| options.seed),
+            previous_text: options.and_then(|options| options.previous_text.as_deref()),
+            next_text: options.and_then(|options| options.next_text.as_deref()),
+            apply_text_normalization: options
+                .and_then(|options| options.apply_text_normalization.as_deref()),
         };
         let response = self
             .runtime
-            .execute(|| {
+            .execute_without_retry(|| {
                 Ok(self
                     .runtime
                     .client
@@ -128,6 +144,7 @@ impl TextToSpeechProvider for ElevenLabsProvider {
                 Some(ProviderVoice::ElevenLabs(voice)) => Some(voice),
                 _ => None,
             },
+            request.options.elevenlabs.as_ref(),
         )
         .await
         .map_err(|error| map_provider_error(self.name(), error))
@@ -139,7 +156,57 @@ struct ElevenLabsSpeechRequest<'a> {
     text: &'a str,
     model_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    voice_settings: Option<&'a ElevenLabsVoiceSettings>,
+    voice_settings: Option<ElevenLabsSpeechSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apply_text_normalization: Option<&'a str>,
+}
+
+#[derive(Default, Serialize)]
+struct ElevenLabsSpeechSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stability: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    similarity_boost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    style: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    use_speaker_boost: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed: Option<f64>,
+}
+
+impl ElevenLabsSpeechSettings {
+    fn merged(
+        profile: Option<&ElevenLabsVoiceSettings>,
+        options: Option<&ElevenLabsTtsOptions>,
+    ) -> Option<Self> {
+        let mut result = profile.map_or_else(Self::default, |profile| Self {
+            stability: Some(profile.stability),
+            similarity_boost: Some(profile.similarity_boost),
+            style: Some(profile.style),
+            use_speaker_boost: Some(profile.use_speaker_boost),
+            speed: Some(profile.speed),
+        });
+        if let Some(options) = options {
+            result.stability = options.stability.or(result.stability);
+            result.similarity_boost = options.similarity_boost.or(result.similarity_boost);
+            result.style = options.style.or(result.style);
+            result.use_speaker_boost = options.use_speaker_boost.or(result.use_speaker_boost);
+            result.speed = options.speed.or(result.speed);
+        }
+        (result.stability.is_some()
+            || result.similarity_boost.is_some()
+            || result.style.is_some()
+            || result.use_speaker_boost.is_some()
+            || result.speed.is_some())
+        .then_some(result)
+    }
 }
 
 #[cfg(test)]
@@ -184,9 +251,11 @@ mod tests {
             },
         );
         let request = TtsProviderRequest {
+            fixture_voice: None,
             text: crate::domain::speech::SpeechText::new("hello".into())?,
             language: None,
             voice: Some(ProviderVoice::ElevenLabs(voice)),
+            options: crate::domain::tts_options::TtsProviderOptions::default(),
         };
         provider
             .synthesize(request, RequestId::new(uuid::Uuid::new_v4())?)
@@ -198,6 +267,96 @@ mod tests {
         let mut frame = vec![0_u8; 417];
         frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
         frame
+    }
+
+    #[tokio::test]
+    async fn tts_returns_provider_failure_without_retrying_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1/text-to-speech/voice-id"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({"detail":{"code":"quota_exceeded","message":"Private upstream detail"}})))
+            .expect(1).mount(&server).await;
+        let provider = ElevenLabsProvider::new(
+            reqwest::Client::new(),
+            SecretString::from("test-key"),
+            ElevenLabsConfig {
+                http: ProviderHttpConfig::new(server.uri().parse()?),
+                model: ELEVENLABS_MODEL.into(),
+                voice_id: "voice-id".into(),
+                enable_logging: false,
+            },
+        );
+        let error = provider
+            .synthesize_audio("Hello.", None, None)
+            .await
+            .err()
+            .ok_or("expected provider failure")?;
+        assert_eq!(error.kind, super::super::ProviderErrorKind::RateLimited);
+        assert_eq!(error.status, Some(429));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_controls_override_selected_profile_and_preserve_its_other_settings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/text-to-speech/custom-voice"))
+            .and(body_json(serde_json::json!({
+                "text":"Hello.","model_id":"eleven_flash_v2_5",
+                "voice_settings":{"stability":0.2,"similarity_boost":0.75,"style":0.6,"use_speaker_boost":false,"speed":0.8},
+                "seed":42,"previous_text":"Before.","next_text":"After.","apply_text_normalization":"off"
+            })))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type","audio/mpeg").set_body_bytes(valid_mp3_frame()))
+            .expect(1).mount(&server).await;
+        let provider = ElevenLabsProvider::new(
+            reqwest::Client::new(),
+            SecretString::from("test-key"),
+            ElevenLabsConfig {
+                http: ProviderHttpConfig::new(server.uri().parse()?),
+                model: ELEVENLABS_MODEL.into(),
+                voice_id: "server-default".into(),
+                enable_logging: false,
+            },
+        );
+        provider
+            .synthesize(
+                TtsProviderRequest {
+                    fixture_voice: None,
+                    text: crate::domain::speech::SpeechText::new("Hello.".into())?,
+                    language: None,
+                    voice: Some(ProviderVoice::ElevenLabs(ElevenLabsVoice {
+                        voice_id: "profile-voice".into(),
+                        model_id: ELEVENLABS_MODEL.into(),
+                        voice_settings: ElevenLabsVoiceSettings {
+                            stability: 0.5,
+                            similarity_boost: 0.75,
+                            style: 0.0,
+                            use_speaker_boost: true,
+                            speed: 1.0,
+                        },
+                    })),
+                    options: crate::domain::tts_options::TtsProviderOptions {
+                        elevenlabs: Some(ElevenLabsTtsOptions {
+                            voice_id: Some("custom-voice".into()),
+                            model_id: Some("eleven_flash_v2_5".into()),
+                            stability: Some(0.2),
+                            style: Some(0.6),
+                            use_speaker_boost: Some(false),
+                            speed: Some(0.8),
+                            seed: Some(42),
+                            previous_text: Some("Before.".into()),
+                            next_text: Some("After.".into()),
+                            apply_text_normalization: Some("off".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                },
+                RequestId::new(uuid::Uuid::new_v4())?,
+            )
+            .await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -237,7 +396,7 @@ mod tests {
                 },
             );
 
-            let result = provider.synthesize_audio("hello", None).await;
+            let result = provider.synthesize_audio("hello", None, None).await;
 
             assert!(result.is_ok());
         }

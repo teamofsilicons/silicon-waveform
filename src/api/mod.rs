@@ -467,6 +467,9 @@ fn header_error(error: &HeaderError, request_id: RequestId) -> ApiError {
 
 fn body_error(error: &RequestBodyError, request_id: RequestId) -> ApiError {
     match error {
+        RequestBodyError::InvalidProviderOptions(message) => {
+            ApiError::invalid_options(message, request_id)
+        }
         RequestBodyError::Speech(SpeechValidationError::TextTooLong { .. }) => {
             ApiError::payload_too_large(request_id)
         }

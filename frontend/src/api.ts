@@ -1,6 +1,34 @@
 import { createSignal } from "solid-js";
 export type Provider = "gemini" | "elevenlabs" | "openai" | "deepgram";
 export type Operation = "tts" | "stt";
+export interface TtsProviderOptions {
+  gemini?: {
+    voice?: string;
+    scene?: string;
+    audio_profile?: string;
+    director_notes?: string;
+    sample_context?: string;
+  };
+  elevenlabs?: {
+    voice_id?: string;
+    model_id?: string;
+    stability?: number;
+    similarity_boost?: number;
+    style?: number;
+    speed?: number;
+    use_speaker_boost?: boolean;
+    seed?: number;
+    previous_text?: string;
+    next_text?: string;
+    apply_text_normalization?: "auto" | "on" | "off";
+  };
+  openai?: {
+    voice?: string;
+    model?: "tts-1" | "tts-1-hd" | "gpt-4o-mini-tts";
+    instructions?: string;
+    speed?: number;
+  };
+}
 export interface Identity {
   principal_id: string;
   public_id: string;
@@ -92,6 +120,9 @@ export class ApiError extends Error {
     public code: string,
     public requestId?: string,
     public retryAfter?: string,
+    public provider?: Provider,
+    public reason?: string,
+    public providerStatus?: number,
   ) {
     super(message);
   }
@@ -133,6 +164,9 @@ export async function api<T>(
         response.headers.get("x-request-id") ||
         undefined,
       response.headers.get("retry-after") || undefined,
+      body?.error?.provider,
+      body?.error?.reason,
+      body?.error?.provider_status,
     );
   return body as T;
 }

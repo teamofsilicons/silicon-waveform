@@ -84,13 +84,21 @@ pub enum ProviderErrorKind {
 #[derive(Clone, Copy, Debug, Error)]
 #[error("provider request failed: {kind:?}")]
 pub struct ProviderError {
+    /// Upstream HTTP status, if present.
+    pub status: Option<u16>,
+    /// Allowlisted reason code from a bounded error response.
+    pub reason: Option<&'static str>,
     /// Stable failure category used by fallback policy.
     pub kind: ProviderErrorKind,
 }
 
 impl ProviderError {
     pub(crate) const fn new(kind: ProviderErrorKind) -> Self {
-        Self { kind }
+        Self {
+            kind,
+            status: None,
+            reason: None,
+        }
     }
 
     pub(crate) const fn invalid_response() -> Self {
@@ -186,7 +194,11 @@ impl ProviderRuntime {
 
     pub(crate) fn try_acquire(&self) -> Result<OwnedSemaphorePermit, ProviderError> {
         if self.api_key.expose_secret().is_empty() {
-            return Err(ProviderError::new(ProviderErrorKind::Configuration));
+            return Err(ProviderError {
+                kind: ProviderErrorKind::Configuration,
+                status: None,
+                reason: Some("key_not_configured"),
+            });
         }
         Arc::clone(&self.semaphore)
             .try_acquire_owned()
@@ -302,10 +314,13 @@ impl ProviderRuntime {
             .map_err(AttemptFailure::new)?;
         let status = response.status();
         if !status.is_success() {
-            return Err(AttemptFailure {
-                error: classify_status(status),
-                retry_after: retry_after(response.headers()),
-            });
+            let retry_after = retry_after(response.headers());
+            let mut error = classify_status(status);
+            // Error strings can echo text or credentials. Retain only known codes.
+            if let Ok(body) = read_response_body(response, 16 * 1024).await {
+                error.reason = safe_error_reason(&body);
+            }
+            return Err(AttemptFailure { error, retry_after });
         }
         let headers = response.headers().clone();
         let body = read_response_body(response, self.config.max_response_bytes)
@@ -377,7 +392,41 @@ fn classify_status(status: StatusCode) -> ProviderError {
         value if value.is_server_error() => ProviderErrorKind::Unavailable,
         _ => ProviderErrorKind::Rejected,
     };
-    ProviderError::new(kind)
+    ProviderError {
+        kind,
+        status: Some(status.as_u16()),
+        reason: None,
+    }
+}
+
+fn safe_error_reason(body: &[u8]) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    [
+        "/error/code",
+        "/error/status",
+        "/error/type",
+        "/detail/code",
+        "/detail/status",
+        "/detail/type",
+    ]
+    .into_iter()
+    .filter_map(|path| value.pointer(path).and_then(serde_json::Value::as_str))
+    .find_map(|code| match code {
+        "quota_exceeded" | "insufficient_quota" | "insufficient_credits" => Some("quota_exceeded"),
+        "RESOURCE_EXHAUSTED" | "rate_limit_exceeded" => Some("rate_limited"),
+        "invalid_api_key" | "invalid_api_key_error" | "key_not_found" | "UNAUTHENTICATED" => {
+            Some("invalid_api_key")
+        }
+        "model_not_found" | "model_not_available" | "invalid_model_id" => Some("model_not_found"),
+        "voice_not_found" | "voice_does_not_exist" => Some("voice_not_found"),
+        "content_policy_violation" | "safety_violation" | "content_blocked" => {
+            Some("content_blocked")
+        }
+        "missing_permissions" | "permission_denied" | "PERMISSION_DENIED" => {
+            Some("missing_permissions")
+        }
+        _ => None,
+    })
 }
 
 async fn read_response_body(
@@ -409,6 +458,27 @@ async fn read_response_body(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_reasons_never_echo_private_error_messages() {
+        assert_eq!(
+            super::safe_error_reason(
+                br#"{"error":{"code":"insufficient_quota","message":"private text and key"}}"#
+            ),
+            Some("quota_exceeded")
+        );
+        assert_eq!(
+            super::safe_error_reason(
+                br#"{"detail":{"status":"voice_not_found","message":"private text"}}"#
+            ),
+            Some("voice_not_found")
+        );
+        assert_eq!(
+            super::safe_error_reason(
+                br#"{"error":{"code":"secret-api-key","message":"invalid_api_key"}}"#
+            ),
+            None
+        );
+    }
     use std::sync::Arc;
 
     use secrecy::SecretString;
@@ -455,7 +525,8 @@ mod tests {
         assert!(matches!(
             result,
             Err(ProviderError {
-                kind: ProviderErrorKind::InvalidResponse
+                kind: ProviderErrorKind::InvalidResponse,
+                ..
             })
         ));
     }
@@ -492,7 +563,8 @@ mod tests {
         assert!(matches!(
             result,
             Err(ProviderError {
-                kind: ProviderErrorKind::Unavailable
+                kind: ProviderErrorKind::Unavailable,
+                ..
             })
         ));
     }
@@ -529,7 +601,8 @@ mod tests {
         assert!(matches!(
             result,
             Err(ProviderError {
-                kind: ProviderErrorKind::Unavailable
+                kind: ProviderErrorKind::Unavailable,
+                ..
             })
         ));
     }

@@ -4,7 +4,8 @@ mod daemon;
 mod updater;
 
 use silicon_waveform_client::{
-    Auth, Client, CreateTestEnvironment, SttRequest, TestEnvironmentKey, TtsRequest,
+    Auth, Client, CreateTestEnvironment, ProviderKeys, SttRequest, TestEnvironmentKey,
+    TtsProviderOptions, TtsRequest,
 };
 use std::{
     fs,
@@ -100,8 +101,23 @@ enum Command {
         #[arg(long)]
         lang: Option<String>,
         /// Comma-separated providers for this request, in preferred order.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "provider")]
         provider_order: Option<String>,
+        /// Provider to use for synthesis. With fallback off, only this provider runs.
+        #[arg(long, value_parser = ["gemini", "elevenlabs", "openai"])]
+        provider: Option<String>,
+        /// Try the remaining providers after failure (off by default).
+        #[arg(long, conflicts_with_all = ["provider_options", "provider_options_file"])]
+        auto_fallback: bool,
+        /// Provider-specific JSON controls, for example {"gemini":{"scene":"Quiet room"}}.
+        #[arg(long, conflicts_with = "provider_options_file")]
+        provider_options: Option<String>,
+        /// Read provider-specific JSON controls from a file (use - for stdin).
+        #[arg(long)]
+        provider_options_file: Option<PathBuf>,
+        /// Request-only provider key, in provider=path form; repeat for multiple providers.
+        #[arg(long, value_name = "PROVIDER=PATH")]
+        provider_key_file: Vec<String>,
         #[arg(long)]
         idempotency: Option<String>,
         /// Known job UUID for polling while this synchronous call is running.
@@ -120,6 +136,9 @@ enum Command {
         /// Comma-separated providers for this request, in preferred order.
         #[arg(long)]
         provider_order: Option<String>,
+        /// Request-only provider key, in provider=path form; repeat for multiple providers.
+        #[arg(long, value_name = "PROVIDER=PATH")]
+        provider_key_file: Vec<String>,
         #[arg(long)]
         idempotency: Option<String>,
         /// Known job UUID for polling while this synchronous call is running.
@@ -175,7 +194,12 @@ enum Command {
         #[arg(long)]
         actor: String,
         provider: String,
-        api_key: String,
+        /// Legacy positional key; prefer --key-file to keep secrets out of process arguments.
+        #[arg(required_unless_present = "key_file", conflicts_with = "key_file")]
+        api_key: Option<String>,
+        /// Read the provider key from a file (use - for stdin).
+        #[arg(long)]
+        key_file: Option<PathBuf>,
     },
     /// Remove a personal provider key.
     ProviderKeyDelete {
@@ -376,36 +400,17 @@ fn read_local_test_key(base: &str, id: &str) -> Option<String> {
         serde_json::from_str(&fs::read_to_string(test_environments_path(base)).ok()?).ok()?;
     value.get(id)?.as_str().map(str::to_owned)
 }
-fn write_local_test_key(base: &str, id: &str, key: &str) -> Result<(), String> {
-    let dir = dirs_fallback();
-    fs::create_dir_all(&dir).map_err(|_| "cannot create ~/.waveform".to_owned())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .map_err(|_| "cannot secure session directory".to_owned())?;
-    }
+async fn write_local_test_key(base: &str, id: &str, key: &str) -> Result<(), String> {
     let path = test_environments_path(base);
+    let _lock = session_lock(&path).await?;
     let mut map: serde_json::Map<String, serde_json::Value> = fs::read_to_string(&path)
         .ok()
-        .and_then(|v| serde_json::from_str(&v).ok())
+        .and_then(|value| serde_json::from_str(&value).ok())
         .unwrap_or_default();
     map.insert(id.to_owned(), serde_json::Value::String(key.to_owned()));
-    let tmp = path.with_extension("json.tmp");
-    fs::write(
-        &tmp,
-        serde_json::to_vec_pretty(&map)
-            .map_err(|_| "cannot encode test environment state".to_owned())?,
-    )
-    .map_err(|_| "cannot write test environment state".to_owned())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-            .map_err(|_| "cannot secure test environment state".to_owned())?;
-    }
-    fs::rename(tmp, path).map_err(|_| "cannot commit test environment state".to_owned())
+    write_session(&path, &serde_json::Value::Object(map))
 }
+
 fn configure_home(location: &std::path::Path) -> Result<(), String> {
     if !location.is_dir() {
         return Err(format!("not a directory: {}", location.display()));
@@ -453,12 +458,80 @@ fn configure_home_at(
 struct Session {
     access_token: String,
     refresh_token: Option<String>,
+    #[serde(default)]
+    expires_at: u64,
 }
 fn read_session(path: &std::path::Path) -> Option<Session> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
-fn bearer(client: &Client, path: &std::path::Path) -> Result<Client, String> {
-    let session = read_session(path).ok_or("not logged in for this server and environment; run waveform login with the same --url and --test options".to_owned())?;
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn session_lock(path: &std::path::Path) -> Result<fs::File, String> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || -> std::io::Result<fs::File> {
+        let directory = path.parent().expect("session path has a parent");
+        fs::create_dir_all(directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(path.with_extension("lock"))?;
+        file.lock()?;
+        Ok(file)
+    })
+    .await
+    .map_err(|_| "cannot acquire session lock".to_owned())?
+    .map_err(|_| "cannot lock session".to_owned())
+}
+
+async fn refresh_session(
+    client: &Client,
+    path: &std::path::Path,
+    force: bool,
+) -> Result<Session, silicon_waveform_client::Error> {
+    use silicon_waveform_client::Error;
+    let _lock = session_lock(path).await.map_err(Error::Invalid)?;
+    let mut session = read_session(path).ok_or_else(|| Error::Invalid("not logged in for this server and environment; run waveform login with the same --url and --test options".to_owned()))?;
+    if !force && session.expires_at > now().saturating_add(60) {
+        return Ok(session);
+    }
+    let refresh = session.refresh_token.as_ref().ok_or_else(|| {
+        Error::Invalid("session has no refresh token; run waveform login".to_owned())
+    })?;
+    use sha2::{Digest as _, Sha256};
+    let key = format!("waveform-refresh-{:x}", Sha256::digest(refresh.as_bytes()));
+    let tokens = client.refresh_with_key(refresh, &key).await?;
+    let value = saved_tokens(&tokens).map_err(Error::Invalid)?;
+    write_session(path, &value).map_err(Error::Invalid)?;
+    session = serde_json::from_value(value)?;
+    Ok(session)
+}
+
+fn saved_tokens(
+    tokens: &silicon_iam_client::models::OAuthTokenResponse,
+) -> Result<serde_json::Value, String> {
+    let mut value = serde_json::to_value(tokens).map_err(|error| error.to_string())?;
+    value["expires_at"] = serde_json::json!(now().saturating_add(tokens.expires_in.max(0) as u64));
+    Ok(value)
+}
+
+async fn bearer(client: &Client, path: &std::path::Path) -> Result<Client, String> {
+    let session = refresh_session(client, path, false)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(client.with_bearer(session.access_token))
 }
 fn list_arg(value: Option<String>) -> Option<Vec<String>> {
@@ -469,6 +542,101 @@ fn list_arg(value: Option<String>) -> Option<Vec<String>> {
             .map(str::to_owned)
             .collect()
     })
+}
+
+fn read_bounded_file(path: &std::path::Path, limit: usize, label: &str) -> Result<String, String> {
+    use std::io::Read as _;
+    let reader: Box<dyn io::Read> = if path.as_os_str() == "-" {
+        Box::new(io::stdin())
+    } else {
+        Box::new(fs::File::open(path).map_err(|_| format!("cannot read {label} file"))?)
+    };
+    let mut value = String::new();
+    reader
+        .take(limit as u64 + 1)
+        .read_to_string(&mut value)
+        .map_err(|_| format!("cannot read {label} file as UTF-8"))?;
+    if value.len() > limit {
+        return Err(format!("{label} file exceeds {limit} bytes"));
+    }
+    Ok(value)
+}
+
+fn read_provider_key(path: &std::path::Path) -> Result<String, String> {
+    let value = read_bounded_file(path, 16386, "provider key")?;
+    let value = value.trim_end_matches(['\r', '\n']).to_owned();
+    if value.is_empty() || value.len() > 16384 || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(
+            "provider key must contain 1-16384 ASCII bytes without whitespace or control characters".into(),
+        );
+    }
+    Ok(value)
+}
+
+fn read_provider_keys(files: &[String]) -> Result<ProviderKeys, String> {
+    let mut keys = ProviderKeys::default();
+    let mut providers = std::collections::BTreeSet::new();
+    for entry in files {
+        let (provider, path) = entry
+            .split_once('=')
+            .filter(|(_, path)| !path.is_empty())
+            .ok_or("--provider-key-file requires PROVIDER=PATH (use - for stdin)")?;
+        if !matches!(provider, "gemini" | "elevenlabs" | "openai" | "deepgram") {
+            return Err("provider must be gemini, elevenlabs, openai, or deepgram".into());
+        }
+        if !providers.insert(provider) {
+            return Err("provide at most one key file for each provider".into());
+        }
+        keys.insert(provider, read_provider_key(std::path::Path::new(path))?)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(keys)
+}
+
+fn read_provider_options(
+    value: Option<String>,
+    file: Option<PathBuf>,
+) -> Result<TtsProviderOptions, String> {
+    let value = match (value, file) {
+        (Some(value), _) => value,
+        // Match the API body bound so valid Unicode guidance and JSON escapes fit.
+        (None, Some(path)) => read_bounded_file(&path, 327_680, "provider options")?,
+        (None, None) => return Ok(TtsProviderOptions::default()),
+    };
+    serde_json::from_str(&value).map_err(|error| {
+        format!("invalid provider options JSON at line {}, column {}; check the provider control fields and types", error.line(), error.column())
+    })
+}
+
+fn validate_stdin_sources(args: &Args) -> Result<(), String> {
+    let is_stdin = |path: &Option<PathBuf>| {
+        usize::from(path.as_ref().is_some_and(|path| path.as_os_str() == "-"))
+    };
+    let key_stdin = |files: &[String]| {
+        files
+            .iter()
+            .filter(|entry| entry.split_once('=').is_some_and(|(_, path)| path == "-"))
+            .count()
+    };
+    let sources = is_stdin(&args.app_secret_file)
+        + match &args.command {
+            Command::Tts {
+                provider_options_file,
+                provider_key_file,
+                ..
+            } => is_stdin(provider_options_file) + key_stdin(provider_key_file),
+            Command::Stt {
+                provider_key_file, ..
+            } => key_stdin(provider_key_file),
+            Command::ProviderKeySet { key_file, .. } => is_stdin(key_file),
+            _ => 0,
+        };
+    if sources > 1 {
+        Err("only one input may read stdin; use files for the remaining inputs".into())
+    } else {
+        Ok(())
+    }
 }
 fn print_json<T: serde::Serialize>(value: &T) -> Result<(), String> {
     println!(
@@ -572,6 +740,7 @@ async fn main() -> Result<(), String> {
             std::process::exit(code);
         }
     };
+    validate_stdin_sources(&args)?;
     if let Some(path) = args.app_secret_file.take() {
         let value = if path.as_os_str() == "-" {
             std::io::read_to_string(std::io::stdin())
@@ -727,7 +896,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                 if let Some(key) = read_local_test_key(&args.url, selector) {
                     TestEnvironmentKey::new(key).map_err(|e| e.to_string())?
                 } else {
-                    let production = bearer(&client, &session_file)?;
+                    let production = bearer(&client, &session_file).await?;
                     let organization = args
                         .organization
                         .as_deref()
@@ -741,7 +910,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                         .get("key")
                         .and_then(serde_json::Value::as_str)
                         .ok_or("environment key response did not contain key")?;
-                    write_local_test_key(&args.url, selector, key)?;
+                    write_local_test_key(&args.url, selector, key).await?;
                     TestEnvironmentKey::new(key.to_owned()).map_err(|e| e.to_string())?
                 }
             }
@@ -756,7 +925,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         if let Some(id) = metadata.get("id").and_then(serde_json::Value::as_str) {
             let value: String = serde_json::from_str(&encoded_key).map_err(|e| e.to_string())?;
-            write_local_test_key(&args.url, id, &value)?;
+            write_local_test_key(&args.url, id, &value).await?;
         }
         *banner = Some(format!(
             "Test environment: {} ({})",
@@ -773,7 +942,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             pr,
             idempotency,
         } => {
-            let c = bearer(&client, &session_file)?;
+            let c = bearer(&client, &session_file).await?;
             let key = idempotency.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             eprintln!("Report retry key: {key}");
             print_json(
@@ -788,7 +957,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             }
         }
         Command::Telemetry { enabled } => {
-            let c = bearer(&client, &session_file)?;
+            let c = bearer(&client, &session_file).await?;
             let me = c.me().await.map_err(|e| e.to_string())?;
             print_json(
                 &c.set_telemetry(
@@ -807,7 +976,13 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             ..
         } => {
             let selected = match read_session(&session_file) {
-                Some(session) => client.with_bearer(session.access_token),
+                Some(_) => match refresh_session(&client, &session_file, false).await {
+                    Ok(session) => client.with_bearer(session.access_token),
+                    Err(silicon_waveform_client::Error::Api {
+                        status: 401 | 403, ..
+                    }) => client,
+                    Err(error) => return Err(error.to_string()),
+                },
                 None => client,
             };
             let status = selected.login_status().await.map_err(|e| e.to_string())?;
@@ -835,42 +1010,39 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             slt_flag,
             command: None,
         } => {
-            let tokens = client
-                .login(&read_slt(slt.or(slt_flag))?)
-                .await
-                .map_err(|e| e.to_string())?;
-            write_session(
-                &session_file,
-                &serde_json::to_value(&tokens).map_err(|e| e.to_string())?,
-            )?;
+            let slt = read_slt(slt.or(slt_flag))?;
+            let _lock = session_lock(&session_file).await?;
+            let tokens = client.login(&slt).await.map_err(|e| e.to_string())?;
+            write_session(&session_file, &saved_tokens(&tokens)?)?;
             print_status(
                 "logged in; session saved for this server and environment",
                 args.json,
             )?;
         }
         Command::Refresh => {
-            let session = read_session(&session_file).ok_or("not logged in; run waveform login")?;
-            let refresh = session
-                .refresh_token
-                .ok_or("session has no refresh token; run waveform login")?;
-            let tokens = client.refresh(&refresh).await.map_err(|e| e.to_string())?;
-            write_session(
-                &session_file,
-                &serde_json::to_value(&tokens).map_err(|e| e.to_string())?,
-            )?;
+            refresh_session(&client, &session_file, true)
+                .await
+                .map_err(|error| error.to_string())?;
             print_status("session refreshed", args.json)?;
         }
         Command::Logout => {
+            let _lock = session_lock(&session_file).await?;
             let session = read_session(&session_file).ok_or("not logged in; run waveform login")?;
             client
-                .logout(&session.access_token)
+                .logout(
+                    session
+                        .refresh_token
+                        .as_deref()
+                        .unwrap_or(&session.access_token),
+                )
                 .await
                 .map_err(|e| e.to_string())?;
             let _ = fs::remove_file(&session_file);
             print_status("logged out", args.json)?;
         }
         Command::Me => print_json(
-            &bearer(&client, &session_file)?
+            &bearer(&client, &session_file)
+                .await?
                 .me()
                 .await
                 .map_err(|e| e.to_string())?,
@@ -889,7 +1061,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             timeout_ms,
             poll_ms,
         } => {
-            let c = bearer(&client, &session_file)?;
+            let c = bearer(&client, &session_file).await?;
             if let Some(job_id) = job_id {
                 let value = if wait {
                     c.wait_for_job(
@@ -921,7 +1093,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             tts_order,
             stt_order,
         } => {
-            let c = bearer(&client, &session_file)?;
+            let c = bearer(&client, &session_file).await?;
             let value = if tts_order.is_none() && stt_order.is_none() && voice_profile.is_none() {
                 c.preferences(&org, &actor).await
             } else {
@@ -937,13 +1109,15 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             print_json(&value.map_err(|e| e.to_string())?)?;
         }
         Command::VoiceProfiles { org, actor } => print_json(
-            &bearer(&client, &session_file)?
+            &bearer(&client, &session_file)
+                .await?
                 .voice_profiles(&org, &actor)
                 .await
                 .map_err(|e| e.to_string())?,
         )?,
         Command::ProviderKeys { org, actor } => print_json(
-            &bearer(&client, &session_file)?
+            &bearer(&client, &session_file)
+                .await?
                 .provider_keys(&org, &actor)
                 .await
                 .map_err(|e| e.to_string())?,
@@ -953,8 +1127,15 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             actor,
             provider,
             api_key,
+            key_file,
         } => {
-            bearer(&client, &session_file)?
+            let api_key = match (api_key, key_file) {
+                (Some(key), _) => key,
+                (None, Some(path)) => read_provider_key(&path)?,
+                (None, None) => return Err("provide --key-file or a provider key".into()),
+            };
+            bearer(&client, &session_file)
+                .await?
                 .put_provider_key(&org, &actor, &provider, &api_key)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -965,7 +1146,8 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             actor,
             provider,
         } => {
-            bearer(&client, &session_file)?
+            bearer(&client, &session_file)
+                .await?
                 .delete_provider_key(&org, &actor, &provider)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -976,15 +1158,23 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             voice_profile,
             lang,
             provider_order,
+            provider,
+            auto_fallback,
+            provider_options,
+            provider_options_file,
+            provider_key_file,
             idempotency,
             request_id,
             org,
             actor,
         } => {
+            let provider_options = read_provider_options(provider_options, provider_options_file)?;
+            let provider_keys = read_provider_keys(&provider_key_file)?;
             let idempotency =
                 idempotency.unwrap_or_else(|| format!("waveform-cli-{}", uuid::Uuid::new_v4()));
             let request_id = request_id.unwrap_or_else(uuid::Uuid::new_v4);
-            let c = bearer(&client, &session_file)?
+            let c = bearer(&client, &session_file)
+                .await?
                 .with_speech_request_id(request_id)
                 .map_err(|e| e.to_string())?;
             eprintln!(
@@ -998,7 +1188,12 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                         text,
                         voice_profile,
                         lang,
-                        provider_order: list_arg(provider_order),
+                        provider_order: provider
+                            .map(|provider| vec![provider])
+                            .or_else(|| list_arg(provider_order)),
+                        auto_fallback,
+                        provider_options,
+                        provider_keys,
                     },
                     &idempotency,
                 )
@@ -1013,15 +1208,18 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             file_url,
             language,
             provider_order,
+            provider_key_file,
             idempotency,
             request_id,
             org,
             actor,
         } => {
+            let provider_keys = read_provider_keys(&provider_key_file)?;
             let idempotency =
                 idempotency.unwrap_or_else(|| format!("waveform-cli-{}", uuid::Uuid::new_v4()));
             let request_id = request_id.unwrap_or_else(uuid::Uuid::new_v4);
-            let c = bearer(&client, &session_file)?
+            let c = bearer(&client, &session_file)
+                .await?
                 .with_speech_request_id(request_id)
                 .map_err(|e| e.to_string())?;
             eprintln!(
@@ -1035,6 +1233,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                         file_url,
                         language,
                         provider_order: list_arg(provider_order),
+                        provider_keys,
                     },
                     &idempotency,
                 )
@@ -1058,7 +1257,8 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                 if test_selector.is_some() {
                     return Err("test-env create must run without --test".into());
                 }
-                let created = bearer(&client, &session_file)?
+                let created = bearer(&client, &session_file)
+                    .await?
                     .create_test_environment(
                         &org,
                         &CreateTestEnvironment {
@@ -1077,7 +1277,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                     encoded.get("id").and_then(serde_json::Value::as_str),
                     encoded.get("key").and_then(serde_json::Value::as_str),
                 ) {
-                    write_local_test_key(&args.url, id, key)?;
+                    write_local_test_key(&args.url, id, key).await?;
                 }
                 print_json(&encoded)?;
             }
@@ -1086,7 +1286,8 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                     return Err("test-env list must run without --test".into());
                 }
                 print_json(
-                    &bearer(&client, &session_file)?
+                    &bearer(&client, &session_file)
+                        .await?
                         .test_environments(&org)
                         .await
                         .map_err(|e| e.to_string())?,
@@ -1096,7 +1297,8 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                 org,
                 environment_id,
             } => print_json(
-                &bearer(&client, &session_file)?
+                &bearer(&client, &session_file)
+                    .await?
                     .test_environment_detail(&org, &environment_id)
                     .await
                     .map_err(|e| e.to_string())?,
@@ -1105,12 +1307,13 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                 org,
                 environment_id,
             } => {
-                let value = bearer(&client, &session_file)?
+                let value = bearer(&client, &session_file)
+                    .await?
                     .test_environment_key(&org, &environment_id)
                     .await
                     .map_err(|e| e.to_string())?;
                 if let Some(key) = value.get("key").and_then(serde_json::Value::as_str) {
-                    write_local_test_key(&args.url, &environment_id, key)?;
+                    write_local_test_key(&args.url, &environment_id, key).await?;
                 }
                 print_json(&value)?;
             }
@@ -1118,12 +1321,13 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                 org,
                 environment_id,
             } => {
-                let value = bearer(&client, &session_file)?
+                let value = bearer(&client, &session_file)
+                    .await?
                     .rotate_test_environment_key(&org, &environment_id)
                     .await
                     .map_err(|e| e.to_string())?;
                 if let Some(key) = value.get("key").and_then(serde_json::Value::as_str) {
-                    write_local_test_key(&args.url, &environment_id, key)?;
+                    write_local_test_key(&args.url, &environment_id, key).await?;
                 }
                 print_json(&value)?;
             }
@@ -1131,7 +1335,8 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                 org,
                 environment_id,
             } => print_json(
-                &bearer(&client, &session_file)?
+                &bearer(&client, &session_file)
+                    .await?
                     .delete_test_environment(&org, &environment_id)
                     .await
                     .map_err(|e| e.to_string())?,
@@ -1140,7 +1345,8 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                 org,
                 environment_id,
             } => print_json(
-                &bearer(&client, &session_file)?
+                &bearer(&client, &session_file)
+                    .await?
                     .restore_test_environment(&org, &environment_id)
                     .await
                     .map_err(|e| e.to_string())?,
@@ -1176,6 +1382,119 @@ mod tests {
     use super::{Command, configure_home_at, read_slt};
     use clap::Parser as _;
     use std::fs;
+
+    #[test]
+    fn tts_defaults_to_one_provider_and_controls_conflict_with_fallback() {
+        let base = [
+            "waveform", "tts", "Hello", "--org", "tos", "--actor", "actor",
+        ];
+        let args = super::Args::try_parse_from(base).expect("default synthesis");
+        assert!(matches!(
+            args.command,
+            Command::Tts {
+                auto_fallback: false,
+                ..
+            }
+        ));
+        let with = |extra: &[&str]| {
+            super::Args::try_parse_from(base.iter().copied().chain(extra.iter().copied()))
+        };
+        assert!(
+            with(&[
+                "--provider",
+                "elevenlabs",
+                "--provider-options",
+                r#"{"elevenlabs":{"stability":0.3}}"#
+            ])
+            .is_ok()
+        );
+        assert!(with(&["--provider", "gemini", "--provider-order", "openai"]).is_err());
+        assert!(with(&["--auto-fallback", "--provider-options", "{}"]).is_err());
+        assert!(
+            with(&[
+                "--auto-fallback",
+                "--provider-options-file",
+                "controls.json"
+            ])
+            .is_err()
+        );
+        assert!(
+            with(&[
+                "--provider-options",
+                "{}",
+                "--provider-options-file",
+                "controls.json"
+            ])
+            .is_err()
+        );
+        assert!(with(&["--provider-key", "private-key"]).is_err());
+    }
+
+    #[test]
+    fn provider_keys_are_read_from_files_without_appearing_in_diagnostics() {
+        let root = std::env::temp_dir().join(format!("waveform-keys-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("temporary directory");
+        let path = root.join("gemini.key");
+        fs::write(&path, "private-request-key\n").expect("key fixture");
+        let input = format!("gemini={}", path.display());
+        let keys = super::read_provider_keys(std::slice::from_ref(&input)).expect("read key");
+        assert_eq!(
+            serde_json::to_value(&keys).unwrap()["gemini"],
+            "private-request-key"
+        );
+        assert!(!format!("{keys:?}").contains("private-request-key"));
+        assert!(super::read_provider_keys(&[input.clone(), input]).is_err());
+        fs::write(&path, "private-request-key\ninvalid").expect("invalid fixture");
+        let error = super::read_provider_key(&path).unwrap_err();
+        assert!(!error.contains("private-request-key"));
+        assert!(super::read_provider_keys(&["gemini".into()]).is_err());
+        fs::remove_dir_all(root).expect("remove key fixture");
+    }
+
+    #[test]
+    fn only_one_secret_or_controls_input_may_use_stdin() {
+        let args = super::Args::try_parse_from([
+            "waveform",
+            "tts",
+            "Hello",
+            "--org",
+            "tos",
+            "--actor",
+            "actor",
+            "--provider-options-file",
+            "-",
+            "--provider-key-file",
+            "gemini=-",
+        ])
+        .expect("stdin flags");
+        assert!(super::validate_stdin_sources(&args).is_err());
+        let args = super::Args::try_parse_from([
+            "waveform",
+            "provider-key-set",
+            "--org",
+            "tos",
+            "--actor",
+            "actor",
+            "gemini",
+            "--key-file",
+            "-",
+        ])
+        .expect("saved key stdin support");
+        assert!(super::validate_stdin_sources(&args).is_ok());
+        assert!(
+            super::Args::try_parse_from([
+                "waveform",
+                "provider-key-set",
+                "--org",
+                "tos",
+                "--actor",
+                "actor",
+                "gemini",
+                "legacy-key",
+            ])
+            .is_ok()
+        );
+    }
 
     #[test]
     fn scoped_sessions_keep_production_other_servers_and_test_planes_separate() {

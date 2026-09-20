@@ -326,3 +326,118 @@ async fn environment_selects_test_requests_and_explicit_flag_overrides_it() {
     assert!(output.status.success());
     assert!(!String::from_utf8_lossy(&output.stdout).contains(env_key));
 }
+
+fn saved_session(home: &Home, server: &MockServer, test_key: Option<&str>) -> PathBuf {
+    use sha2::{Digest as _, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(server.uri().as_bytes());
+    digest.update([0]);
+    let encoded = test_key.map(|key| serde_json::to_string(key).unwrap());
+    digest.update(encoded.as_deref().unwrap_or("production").as_bytes());
+    home.0
+        .join(".waveform/dir")
+        .join(format!("session-{:x}.json", digest.finalize()))
+}
+
+#[tokio::test]
+async fn legacy_session_refresh_is_automatic_serialized_and_environment_bound() {
+    for test_key in [None, Some("abcdefghijklmnopqrstuvwxyz123456")] {
+        let home = Home::new();
+        let server = MockServer::start().await;
+        let selection: Vec<_> = test_key.map(|key| vec!["--test", key]).unwrap_or_default();
+        Mock::given(path("/api/v1/testing-environment"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"id":"00000000-0000-0000-0000-000000000099","name":"sandbox"}),
+            ))
+            .mount(&server)
+            .await;
+        login(&home, &server, &selection).await;
+        let session_path = saved_session(&home, &server, test_key);
+        let mut saved: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
+        saved.as_object_mut().unwrap().remove("expires_at");
+        fs::write(&session_path, saved.to_string()).unwrap();
+        Mock::given(method("POST")).and(path("/api/v1/auth/refresh"))
+            .and(body_json(json!({"refresh_token":"ort_private"})))
+            .and(move |r: &wiremock::Request| {
+                r.headers.contains_key("idempotency-key") && !r.headers.contains_key("authorization")
+                    && r.headers.get("x-testing-environment-key").and_then(|v| v.to_str().ok()) == test_key
+            })
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(100))
+                .set_body_json(json!({"access_token":"oat_new", "refresh_token":"ort_new", "expires_in":1800,
+                    "token_type":"Bearer", "scope":"self.identity.read", "actor":{"principal_id":"00000000-0000-0000-0000-000000000001","type":"carbon","public_id":"12345678"}})))
+            .expect(1).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/auth/me"))
+            .and(header("authorization", "Bearer oat_new"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(authority("carbon")))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let args: Vec<_> = selection
+            .iter()
+            .copied()
+            .chain(["login", "status", "--json"])
+            .collect();
+        let url = server.uri();
+        let (first, second) = tokio::join!(home.run(&url, &args), home.run(&url, &args));
+        assert_eq!(output_json(first)["authenticated"], true);
+        assert_eq!(output_json(second)["authenticated"], true);
+        let saved: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
+        assert_eq!(saved["refresh_token"], "ort_new");
+        assert!(
+            saved["expires_at"].as_u64().unwrap()
+                > std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+        );
+        if test_key.is_some() {
+            assert!(!saved_session(&home, &server, None).exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_refresh_preserves_session_and_retry_key_and_reports_revocation() {
+    for status in [401, 503] {
+        let home = Home::new();
+        let server = MockServer::start().await;
+        login(&home, &server, &[]).await;
+        let session_path = saved_session(&home, &server, None);
+        let mut saved: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
+        saved["expires_at"] = json!(1);
+        let original = saved.to_string();
+        fs::write(&session_path, &original).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_json(json!({"error":{"code":"fixture_error"}})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        for _ in 0..2 {
+            let output = home
+                .run(&server.uri(), &["login", "status", "--json"])
+                .await;
+            if status == 401 {
+                assert_eq!(output_json(output)["authenticated"], false);
+            } else {
+                assert!(!output.status.success());
+            }
+            assert_eq!(fs::read_to_string(&session_path).unwrap(), original);
+        }
+        let requests: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/api/v1/auth/refresh")
+            .collect();
+        assert_eq!(
+            requests[0].headers["idempotency-key"],
+            requests[1].headers["idempotency-key"]
+        );
+    }
+}

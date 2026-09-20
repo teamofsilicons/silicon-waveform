@@ -34,8 +34,8 @@ subsequent API requests identify the active workspace; they do not scope login.
 
 | Screen               | Supported operations                                                                                                                                                                                              |
 | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Text to speech       | Text, optional BCP 47 language, account order or per-request ordering, synchronous progress, safe retries, Briefcase audio link, link copying, optional playback when a temporary media URL is returned           |
-| Speech to text       | Permanent Briefcase file URL, optional language, per-request ordering, transcript, detected language, duration, copy and text download                                                                            |
+| Text to speech       | Text, optional language and voice profile, provider order, opt-in automatic fallback, provider-specific voice controls, per-request API key, synchronous progress, safe retries, and Briefcase audio links      |
+| Speech to text       | Permanent Briefcase file URL, optional language, per-request ordering and API key, automatic fallback, transcript, detected language, duration, copy and text download                                         |
 | Job history          | TTS/STT filtering, opaque-cursor pagination, refresh, automatic polling of running jobs, job detail, duration, first line, provider, timestamps, error codes and request ID                                       |
 | Provider settings    | Account TTS/STT ordering, restore workspace defaults, connect/replace/remove all four provider keys and configured status                                                                                         |
 | Testing environments | Create with IAM ID/key, test app secret and Briefcase key; list/detail; retrieve and copy root key; rotate; soft delete; restore; connect an existing key; clear test data; switch between production and testing |
@@ -47,6 +47,28 @@ fallback. The backend remains authoritative for permissions. A test root alone
 allows current-environment inspection and cleanup; speech and account actions
 still require a login from the paired IAM environment. Production credentials
 are never reused in a test plane. Management operations belong to production.
+
+TTS uses only the first provider by default and reports its failure reason so
+the caller can choose another. **Automatic fallback** can be enabled per request;
+it disables provider-specific controls and uses the shared voice profile
+mappings across the provider order. STT keeps automatic fallback enabled.
+
+With TTS fallback off, optional controls are available for the first provider:
+
+- Gemini: voice, scene, audio profile, director notes, and sample context.
+- ElevenLabs: voice/model IDs, stability, similarity, style, speed, speaker boost,
+  seed, surrounding text, and text normalization.
+- OpenAI: voice, model, speed, and delivery instructions for `gpt-4o-mini-tts`.
+
+Blank fields preserve the voice profile or provider defaults. Gemini scene and
+direction fields provide prompt guidance; individual providers remain
+authoritative about supported model/voice combinations.
+
+**Bring your own keys** in Provider settings saves encrypted account keys for
+Gemini, ElevenLabs, OpenAI, and Deepgram. Saved keys are used automatically.
+The optional request-key field overrides only the selected provider for one
+submission; it clears immediately on send and whenever the selected provider
+changes. Request keys are never written to browser storage or retry signatures.
 
 STT accepts a **previously uploaded Briefcase URL**, matching the backend
 contract; the interface links to Briefcase for uploading. A permanent Briefcase
@@ -63,8 +85,8 @@ The small Node gateway uses only Node built-ins. Access tokens, refresh tokens,
 and connected testing keys remain in a bounded, expiring server-side session
 map. The browser gets an opaque `HttpOnly`, `SameSite=Lax` cookie (`Secure` and
 `__Host-` prefixed when the public origin uses HTTPS). Neither localStorage nor
-sessionStorage is used for secrets. Provider-key forms clear their values after
-save/close. There is no analytics or credential logging.
+sessionStorage is used for secrets. Saved-key forms clear their values after
+save/close, and request-key forms clear on submission. There is no credential logging.
 
 All non-GET requests require the configured exact origin. The gateway only
 forwards an allowlist of public Waveform routes to a fixed backend origin and
@@ -74,7 +96,10 @@ refresh is single-flight. Private requests include the current context ID, so a
 stale tab cannot silently send a production request into a newly selected test
 environment (or vice versa). Public health/capability probes do not replace
 session cookies. Speech requests retain the same idempotency key and request ID
-when retrying the same payload after an uncertain failure.
+when retrying the same payload after an uncertain failure. A submission with a
+request key always gets fresh IDs, and subsequent submissions cannot reuse that
+attempt after its key has been cleared. Check job history before submitting
+again if a key-bearing request had an uncertain outcome.
 
 Sessions last at most 24 hours of inactivity and live in memory. Restarting the
 frontend signs its sessions out locally. Run a **single process** for this small
@@ -128,7 +153,9 @@ Automated tests cover private credential handling, CSRF, proxy restrictions,
 production/test isolation, failed connections, idempotent retry, pagination
 forwarding, provider settings, key lifecycle, environment lifecycle, cleanup,
 callback replay rejection, refresh concurrency, upstream errors, stale-tab
-protection, and public-probe cookie isolation. Browser verification and live
+protection, public-probe cookie isolation, TTS fallback and provider-option
+payloads, STT fallback preservation, and exclusion of request keys from retry
+signatures. Browser verification and live
 integration evidence are recorded in `../docs/frontend-verification-2026-09-08.md`.
 
 ## Voice profiles
@@ -137,6 +164,7 @@ Text to speech has a profile selector with an account-default option and
 expandable provider mappings. Provider settings saves the account default;
 request overrides leave it unchanged. Results and history show the profile
 used. The initial catalog has 30 profiles; fallback mappings are visibly marked
-as awaiting listening review. No raw provider tuning controls are exposed.
+as awaiting listening review. Provider controls can override the selected
+provider's mapping when automatic fallback is off.
 Deploy the backend's `0009_voice_profiles.sql` migration before this frontend.
 See [profile API and catalog management](../docs/voice-profiles.md).

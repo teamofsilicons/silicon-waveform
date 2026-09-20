@@ -39,7 +39,42 @@ the previous service and route; the valid IAM credential remains available to
 the restored backend. The old container and database are not deleted.
 
 Inspect `/etc/waveform/native-release.json` for the deployed artifact and backup.
-Subsequent upgrades should stage a new verified bundle and preserve the prior
-native release before switching the `current` symlink; this initial migration
-tool deliberately refuses an already-native host. The legacy Docker installer
-also refuses to overwrite a native deployment.
+For subsequent native upgrades, use `upgrade.py` on the host as root:
+
+```sh
+python3 upgrade.py \
+  --archive /path/to/waveform-backend-REVISION-linux-aarch64.tar.gz \
+  --sha256 ARCHIVE_SHA256 \
+  --source-revision FULL_40_CHARACTER_GIT_REVISION \
+  --backup-bucket EXISTING_ENCRYPTED_BACKUP_BUCKET
+```
+
+The upgrade requires a healthy existing native deployment. It verifies the
+archive digest, full source revision, every file checksum, ARM64 ELF format,
+static backend linkage and FFmpeg audio processing before stopping the API.
+It retains the old release, symlink target, unit, private environment and receipt
+under `/var/backups/waveform/upgrade-*`. A PostgreSQL custom-format dump is checked
+with `pg_restore --list` and uploaded with an explicit SHA-256 checksum and S3
+server-side encryption before cutover. The upload response must confirm both;
+the host only needs its existing backup `PutObject` permission. Dumps must be
+smaller than 5 GiB. Use `--backup-kms-key-id` if the bucket requires a particular
+KMS key and the host already has permission to use it.
+
+All existing `native.env` credentials, database settings, encryption keys and
+other values remain byte-for-byte unchanged. The sole automatic configuration
+update replaces an explicit old `WAVEFORM_JSON_BODY_LIMIT_BYTES=65536` setting
+with `327680`; absent or custom limits are preserved. The existing private bind
+and FFmpeg path must already match the native deployment layout.
+
+The script atomically switches `/opt/waveform/current`, installs the verified
+bundle's unit, and checks both private and public readiness. Failure restores
+the previous symlink, environment and unit, restarts the old release, and checks
+readiness again. Supporting containers and Caddy configuration remain unchanged.
+This rollback does not restore the database: use this workflow only for releases
+with no schema changes or separately verified backward-compatible migrations.
+The provider-controls/BYOK release introduces no new migrations.
+
+Run `python3 deploy/native/test_upgrade.py` for local checks, including simulated
+public-readiness failure and restoration of the prior release and private files.
+The initial `install.py` and legacy Docker installer continue to refuse an
+already-native host.

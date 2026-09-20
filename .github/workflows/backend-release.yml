@@ -29,3 +29,22 @@ jobs:
           name: waveform-backend-linux-aarch64
           path: dist/backend/*
           if-no-files-found: error
+  frontend:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check application manifest
+        run: python3 scripts/sync-honeycomb.py --check
+      - name: Build ARM64 frontend image
+        run: docker build --label org.opencontainers.image.revision="$GITHUB_SHA" --tag waveform-frontend:release frontend
+      - name: Verify image and save deployment artifact
+        run: |
+          docker run --rm --entrypoint cat waveform-frontend:release /usr/share/waveform/honeycomb.yaml | cmp honeycomb.yaml -
+          mkdir -p dist/frontend
+          docker save waveform-frontend:release | gzip > dist/frontend/waveform-frontend-linux-aarch64.tar.gz
+          sha256sum dist/frontend/waveform-frontend-linux-aarch64.tar.gz > dist/frontend/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: waveform-frontend-linux-aarch64
+          path: dist/frontend/*
+          if-no-files-found: error

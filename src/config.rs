@@ -395,7 +395,7 @@ fn load_server(
         json_body_limit: usize_in_range(
             source,
             "WAVEFORM_JSON_BODY_LIMIT_BYTES",
-            65_536,
+            327_680,
             1_024,
             1_048_576,
         )?,
@@ -1305,7 +1305,7 @@ mod tests {
         assert_eq!(settings.limits.max_text_chars, 4_096);
         assert_eq!(settings.limits.max_media_bytes, 25 * 1_024 * 1_024);
         assert_eq!(settings.idempotency.ttl, Duration::from_hours(24));
-        assert_eq!(settings.server.json_body_limit, 65_536);
+        assert_eq!(settings.server.json_body_limit, 327_680);
         assert_eq!(settings.providers.gemini.max_concurrency.get(), 16);
         assert!(!settings.providers.elevenlabs.enable_logging);
         assert!(settings.providers.deepgram.mip_opt_out);

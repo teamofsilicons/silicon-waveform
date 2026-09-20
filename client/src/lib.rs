@@ -7,6 +7,7 @@ use reqwest::{Client as HttpClient, Method};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -16,7 +17,11 @@ use url::Url;
 /// Optional local Space Station integration, supported on Unix hosts only.
 #[cfg(unix)]
 pub mod telemetry;
+mod tts_options;
 pub mod update;
+pub use tts_options::{
+    ElevenLabsTtsOptions, GeminiTtsOptions, OpenAiTtsOptions, TtsProviderOptions,
+};
 
 /// A bounded client failure that never includes bearer or app-secret material.
 #[derive(Debug, Error)]
@@ -25,8 +30,16 @@ pub enum Error {
     Invalid(String),
     #[error("Waveform transport failed: {0}")]
     Transport(#[from] reqwest::Error),
-    #[error("Waveform returned HTTP {status}: {code}")]
-    Api { status: u16, code: String },
+    #[error("Waveform returned HTTP {status}: {code}: {message}")]
+    Api {
+        status: u16,
+        code: String,
+        message: String,
+        request_id: Option<Box<str>>,
+        provider: Option<Box<str>>,
+        reason: Option<Box<str>>,
+        provider_status: Option<u16>,
+    },
     #[error("Waveform returned an invalid response: {0}")]
     Decode(#[from] serde_json::Error),
     #[error("IAM request failed: {0}")]
@@ -130,7 +143,7 @@ pub struct VoiceProfileRef {
 }
 
 /// Request for synthesis.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct TtsRequest {
     pub text: String,
     /// Optional catalog profile; omitted uses the account default.
@@ -140,15 +153,74 @@ pub struct TtsRequest {
     pub lang: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_order: Option<Vec<String>>,
+    /// Try later providers after a failure. Defaults to false.
+    pub auto_fallback: bool,
+    /// Provider-specific controls, available only with auto-fallback disabled.
+    #[serde(skip_serializing_if = "TtsProviderOptions::is_empty")]
+    pub provider_options: TtsProviderOptions,
+    /// Request-only keys that override saved personal and deployment keys.
+    #[serde(skip_serializing_if = "ProviderKeys::is_empty")]
+    pub provider_keys: ProviderKeys,
 }
 /// Request for transcription.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct SttRequest {
     pub file_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_order: Option<Vec<String>>,
+    /// Request-only keys. STT retains its automatic provider fallback.
+    #[serde(skip_serializing_if = "ProviderKeys::is_empty")]
+    pub provider_keys: ProviderKeys,
+}
+
+/// In-memory, request-only provider credentials. Debug output redacts every key.
+#[derive(Clone, Default)]
+pub struct ProviderKeys(BTreeMap<String, SecretString>);
+
+impl ProviderKeys {
+    /// Add or replace one provider credential without persisting it.
+    pub fn insert(&mut self, provider: impl Into<String>, key: impl Into<String>) -> Result<()> {
+        let provider = provider.into();
+        validate_provider(&provider)?;
+        let key = key.into();
+        if key.is_empty() || key.len() > 16384 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(Error::Invalid(
+                "provider key must contain 1-16384 ASCII bytes without whitespace or control characters".into(),
+            ));
+        }
+        self.0.insert(provider, SecretString::from(key));
+        Ok(())
+    }
+
+    /// Whether this request uses only saved personal or deployment credentials.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for ProviderKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|key| (key, "[REDACTED]")))
+            .finish()
+    }
+}
+
+impl Serialize for ProviderKeys {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (provider, key) in &self.0 {
+            map.serialize_entry(provider, key.expose_secret())?;
+        }
+        map.end()
+    }
 }
 /// Normalized TTS response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -207,11 +279,28 @@ pub struct JobPage {
 pub struct Capabilities {
     pub tts: TtsCapabilities,
     pub stt: SttCapabilities,
+    /// Provider-key support; absent on older servers.
+    #[serde(default)]
+    pub byok: Option<ByokCapabilities>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TtsCapabilities {
     pub output_format: String,
     pub languages: Vec<String>,
+    /// Default synthesis fallback policy; absent on older servers.
+    #[serde(default)]
+    pub auto_fallback_default: Option<bool>,
+    /// Supported control field names grouped by provider.
+    #[serde(default)]
+    pub provider_options: BTreeMap<String, Vec<String>>,
+}
+/// Advertised personal and request-only provider credential support.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ByokCapabilities {
+    pub saved: bool,
+    pub per_request: bool,
+    /// Credential sources from highest to lowest priority.
+    pub precedence: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SttCapabilities {
@@ -424,6 +513,32 @@ impl Client {
             None,
         )
         .await
+    }
+
+    /// Rotates a refresh token with a retry key retained across uncertain responses.
+    pub async fn refresh_with_key(
+        &self,
+        refresh_token: &str,
+        idempotency_key: &str,
+    ) -> Result<silicon_iam_client::models::OAuthTokenResponse> {
+        if !(8..=200).contains(&idempotency_key.len())
+            || !idempotency_key.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(Error::Invalid("invalid refresh idempotency key".into()));
+        }
+        let mut request = self
+            .http
+            .post(
+                self.base
+                    .join("api/v1/auth/refresh")
+                    .map_err(|_| Error::Invalid("invalid refresh URL".into()))?,
+            )
+            .header("idempotency-key", idempotency_key)
+            .json(&serde_json::json!({"refresh_token": refresh_token}));
+        if let Some(environment) = &self.environment {
+            request = request.header("x-testing-environment-key", environment.0.expose_secret());
+        }
+        self.send_response(request).await
     }
     /// Generates speech synchronously.
     pub async fn tts(
@@ -1195,19 +1310,40 @@ fn validate_provider(provider: &str) -> Result<()> {
 }
 
 async fn decode_empty_response(response: reqwest::Response) -> Result<()> {
-    let status = response.status();
-    if status.is_success() {
+    if response.status().is_success() {
         Ok(())
     } else {
-        let bytes = response.bytes().await?;
-        let code = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|v| v["error"]["code"].as_str().map(str::to_owned))
-            .unwrap_or_else(|| "unstructured_response".into());
-        Err(Error::Api {
-            status: status.as_u16(),
-            code,
-        })
+        decode_response::<serde_json::Value>(response)
+            .await
+            .map(|_| ())
+    }
+}
+
+fn api_error(status: u16, bytes: &[u8]) -> Error {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).unwrap_or_default();
+    let error = &value["error"];
+    // Backend messages are safe public explanations, bounded again at the SDK edge.
+    let field = |name: &str, limit: usize| {
+        error[name]
+            .as_str()
+            .map(|text| {
+                text.chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(limit)
+                    .collect::<String>()
+            })
+            .filter(|text| !text.is_empty())
+    };
+    Error::Api {
+        status,
+        code: field("code", 128).unwrap_or_else(|| "unstructured_response".into()),
+        message: field("message", 512).unwrap_or_else(|| "request failed".into()),
+        request_id: field("request_id", 128).map(String::into_boxed_str),
+        provider: field("provider", 32).map(String::into_boxed_str),
+        reason: field("reason", 128).map(String::into_boxed_str),
+        provider_status: error["provider_status"]
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok()),
     }
 }
 
@@ -1228,14 +1364,7 @@ async fn decode_response<R: DeserializeOwned>(mut response: reqwest::Response) -
         bytes.extend_from_slice(&chunk);
     }
     if !status.is_success() {
-        let code = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|v| v["error"]["code"].as_str().map(str::to_owned))
-            .unwrap_or_else(|| "unstructured_response".into());
-        return Err(Error::Api {
-            status: status.as_u16(),
-            code,
-        });
+        return Err(api_error(status.as_u16(), &bytes));
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
@@ -1243,6 +1372,81 @@ async fn decode_response<R: DeserializeOwned>(mut response: reqwest::Response) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_controls_and_request_keys_are_typed_and_redacted()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let options: TtsProviderOptions = serde_json::from_value(serde_json::json!({
+            "gemini": {"voice":"Kore", "scene":"A private rehearsal"}
+        }))?;
+        assert!(
+            serde_json::from_value::<TtsProviderOptions>(serde_json::json!({
+                "gemini": {"unknown_control": true}
+            }))
+            .is_err()
+        );
+        let mut keys = ProviderKeys::default();
+        keys.insert("gemini", "private-request-key")?;
+        assert!(keys.insert("unknown-provider", "secret").is_err());
+        let request = TtsRequest {
+            text: "hello".into(),
+            provider_order: Some(vec!["gemini".into()]),
+            provider_options: options,
+            provider_keys: keys,
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&request)?;
+        assert_eq!(encoded["auto_fallback"], false);
+        assert_eq!(encoded["provider_keys"]["gemini"], "private-request-key");
+        assert_eq!(
+            encoded["provider_options"]["gemini"]["scene"],
+            "A private rehearsal"
+        );
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("private-request-key"));
+        assert!(!debug.contains("A private rehearsal"));
+        assert!(
+            !serde_json::to_value(SttRequest::default())?
+                .as_object()
+                .unwrap()
+                .contains_key("provider_keys")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn api_failures_explain_the_provider_reason_without_raw_response_fields() {
+        let error = api_error(502, br#"{"error":{"code":"provider_failed","message":"elevenlabs request failed: invalid credentials. Try another provider.","request_id":"fixture","provider":"elevenlabs","reason":"invalid_credentials","provider_status":401,"raw_body":"secret-provider-response"}}"#);
+        assert!(error.to_string().contains("invalid credentials"));
+        assert!(!format!("{error:?}").contains("secret-provider-response"));
+        assert!(
+            matches!(error, Error::Api { provider: Some(provider), reason: Some(reason), provider_status: Some(401), .. } if provider.as_ref() == "elevenlabs" && reason.as_ref() == "invalid_credentials")
+        );
+        let legacy = api_error(401, br#"{"error":{"code":"unauthenticated"}}"#);
+        assert!(legacy.to_string().contains("unauthenticated"));
+    }
+
+    #[test]
+    fn capabilities_support_control_discovery_and_older_servers()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut value = serde_json::json!({
+            "tts":{"output_format":"mp3","languages":["en"]},
+            "stt":{"languages":["en"],"accepted_media_types":["audio/mpeg"]}
+        });
+        let old: Capabilities = serde_json::from_value(value.clone())?;
+        assert!(old.tts.auto_fallback_default.is_none());
+        assert!(old.tts.provider_options.is_empty());
+        assert!(old.byok.is_none());
+        value["tts"]["auto_fallback_default"] = serde_json::json!(false);
+        value["tts"]["provider_options"] = serde_json::json!({"gemini":["scene"]});
+        value["byok"] = serde_json::json!({"saved":true,"per_request":true,"precedence":["request","saved","shared"]});
+        let current: Capabilities = serde_json::from_value(value)?;
+        assert_eq!(current.tts.auto_fallback_default, Some(false));
+        assert_eq!(current.tts.provider_options["gemini"], vec!["scene"]);
+        assert!(current.byok.is_some_and(|byok| byok.per_request));
+        Ok(())
+    }
+
     #[test]
     fn voice_profile_serialization_and_legacy_response_compatibility()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -1251,10 +1455,11 @@ mod tests {
             lang: None,
             provider_order: None,
             voice_profile: Some("puck".into()),
+            ..TtsRequest::default()
         };
         assert_eq!(
             serde_json::to_value(request)?,
-            serde_json::json!({"text":"hello", "voice_profile":"puck"})
+            serde_json::json!({"text":"hello", "voice_profile":"puck", "auto_fallback":false})
         );
         let legacy = serde_json::json!({"request_id":"fixture", "file_url":"https://example.test/audio", "media_type":"audio/mpeg", "provider":"gemini", "duration_ms":100});
         assert!(
@@ -1389,6 +1594,7 @@ mod tests {
             voice_profile: None,
             lang: None,
             provider_order: None,
+            ..TtsRequest::default()
         };
         let id_text = id.to_string();
         let (response, job) = tokio::join!(

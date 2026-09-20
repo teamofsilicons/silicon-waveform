@@ -158,6 +158,7 @@ export default function Settings(props: { signin: () => void; connect: () => voi
             <div class="two-columns">
               <div>
                 <h3>Text to speech</h3>
+                <p class="hint">Uses your first provider. Automatic fallback is off unless enabled for a request.</p>
                 <Order
                   operation="tts"
                   value={tts() || prefs()!.tts_order}
@@ -167,6 +168,7 @@ export default function Settings(props: { signin: () => void; connect: () => voi
               </div>
               <div>
                 <h3>Speech to text</h3>
+                <p class="hint">Automatically tries the next provider if a request fails.</p>
                 <Order
                   operation="stt"
                   value={stt() || prefs()!.stt_order}
@@ -200,10 +202,10 @@ export default function Settings(props: { signin: () => void; connect: () => voi
         <section class="panel settings-panel">
           <div class="panel-heading">
             <div>
-              <h2>Connected API keys</h2>
+              <h2>Bring your own keys</h2>
               <p class="hint">
-                Waveform provides shared keys. Connect your own to use your
-                provider accounts.
+                Connect your own provider accounts. Your saved keys are used
+                automatically for speech requests; providers without a saved key use Waveform’s shared key.
               </p>
             </div>
           </div>
@@ -213,7 +215,7 @@ export default function Settings(props: { signin: () => void; connect: () => voi
                 const configured = () =>
                   keys.error
                     ? undefined
-                    : keys()?.items.find((k) => k.provider === provider);
+                    : keys()?.items.find((k) => k.provider === provider && k.configured);
                 return (
                   <div class="provider-row">
                     <div class="provider-initial">
@@ -260,7 +262,7 @@ export default function Settings(props: { signin: () => void; connect: () => voi
           </div>
           <p class="hint key-note">
             Keys are encrypted by the backend and are never returned after
-            saving.
+            saving. Gemini and OpenAI support both speech tasks, ElevenLabs supports text to speech, and Deepgram supports speech to text. You can also override a key for a single request in the speech workspace.
           </p>
         </section>
       </Show>

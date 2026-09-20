@@ -3,6 +3,7 @@ import {
   createResource,
   createSignal,
   For,
+  on,
   onCleanup,
   Show,
 } from "solid-js";
@@ -20,10 +21,13 @@ import {
   type Preferences,
   type Provider,
   type SpeechResult,
+  type TtsProviderOptions,
 } from "./api";
 import { Copy, Empty, Heading, Icon, Notice, Order } from "./ui";
 import VoiceProfilePicker from "./VoiceProfilePicker";
 import type { VoiceProfile } from "./api";
+import ProviderControls from "./ProviderControls";
+import { publicRequestSignature, speechRequest } from "./speech-request";
 export default function Speech(props: {
   operation: Operation;
   signin: () => void;
@@ -33,6 +37,11 @@ export default function Speech(props: {
     [language, setLanguage] = createSignal("");
   const [custom, setCustom] = createSignal(false),
     [order, setOrder] = createSignal<Provider[]>([]);
+  const [autoFallback, setAutoFallback] = createSignal(false),
+    [providerOptions, setProviderOptions] = createSignal<TtsProviderOptions>({}),
+    [requestKey, setRequestKey] = createSignal("");
+  const selectedProvider = () => order()[0];
+  createEffect(on(selectedProvider, () => setRequestKey(""), { defer: true }));
   const [busy, setBusy] = createSignal(false),
     [error, setError] = createSignal<unknown>(),
     [result, setResult] = createSignal<SpeechResult>();
@@ -84,27 +93,28 @@ export default function Speech(props: {
         return;
       }
     }
-    const body =
-      props.operation === "tts"
-        ? {
-            text: text(),
-            ...(voice() ? { voice_profile: voice() } : {}),
-            ...(language() ? { lang: language() } : {}),
-            ...(custom() ? { provider_order: order() } : {}),
-          }
-        : {
-            file_url: url().trim(),
-            ...(language() ? { language: language() } : {}),
-            ...(custom() ? { provider_order: order() } : {}),
-          };
-    const signature = JSON.stringify(body);
-    if (!attempt || attempt.signature !== signature)
+    const body = speechRequest({
+      operation: props.operation,
+      text: text(),
+      url: url(),
+      language: language(),
+      voice: voice(),
+      order: order(),
+      customOrder: custom(),
+      autoFallback: autoFallback(),
+      providerOptions: providerOptions(),
+      requestKey: requestKey(),
+    });
+    const usesRequestKey = !!body.provider_keys;
+    const signature = publicRequestSignature(body);
+    if (usesRequestKey || !attempt || attempt.signature !== signature)
       attempt = {
         signature,
         key: crypto.randomUUID(),
         id: crypto.randomUUID(),
       };
     setRequestId(attempt.id);
+    setRequestKey("");
     setBusy(true);
     setElapsed(0);
     const started = performance.now();
@@ -133,6 +143,8 @@ export default function Speech(props: {
         attempt = undefined;
     } finally {
       clearInterval(timer);
+      // Never retry a key-bearing attempt with different or cleared credentials.
+      if (usesRequestKey) attempt = undefined;
       if (mounted) setBusy(false);
     }
   }
@@ -239,7 +251,7 @@ export default function Speech(props: {
               </label>
               <div class="option-description">
                 {props.operation === "tts"
-                  ? "Language hints apply to Gemini. Fallback providers infer the language from your text."
+                  ? "Language hints apply to Gemini. Other providers infer the language from your text."
                   : "Leave blank to let the provider detect the language."}
               </div>
             </div>
@@ -260,6 +272,38 @@ export default function Speech(props: {
                   />
                 </Show>
               </div>
+            </Show>
+            <Show when={props.operation === "tts" && selectedProvider()}>
+              <Show
+                when={!autoFallback()}
+                fallback={<p class="provider-controls-note hint">Automatic fallback is on. Provider voice controls are unavailable because each provider handles them differently. Your voice profile is used across providers.</p>}
+              >
+                <ProviderControls
+                  provider={selectedProvider()}
+                  options={providerOptions()}
+                  change={setProviderOptions}
+                  disabled={busy()}
+                />
+              </Show>
+            </Show>
+            <Show when={session()?.authenticated && selectedProvider()}>
+              <details class="request-key">
+                <summary>Use your own API key for this request <span class="label-note">optional</span></summary>
+                <label>
+                  {providerNames[selectedProvider()]} API key
+                  <input
+                    type="password"
+                    autocomplete="off"
+                    spellcheck={false}
+                    value={requestKey()}
+                    onInput={(e) => setRequestKey(e.currentTarget.value)}
+                    maxlength={16384}
+                    disabled={busy()}
+                    placeholder="Use a saved key or Waveform’s shared key"
+                  />
+                </label>
+                <p class="hint">Used only for {providerNames[selectedProvider()]} on this request and cleared after you submit. Leave blank to use your saved key, or Waveform’s shared key if none is saved. <a class="text-link" href="#settings">Manage saved keys</a></p>
+              </details>
             </Show>
             <Notice error={error()} />
             <Show when={busy()}>
@@ -309,9 +353,22 @@ export default function Speech(props: {
             </span>
           </div>
           <p class="hint">
-            Your first choice runs first. If it fails, Waveform tries the next
-            provider.
+            {props.operation === "tts" && !autoFallback()
+              ? "Only your first provider runs. If it fails, you’ll get the reason and can choose another provider."
+              : "Your first choice runs first. If it fails, Waveform tries the next provider."}
           </p>
+          <Show when={props.operation === "tts"}>
+            <label class="check-label">
+              <input
+                type="checkbox"
+                checked={autoFallback()}
+                onChange={(e) => setAutoFallback(e.currentTarget.checked)}
+                disabled={busy()}
+              />
+              Automatic fallback
+            </label>
+            <p class="hint">Off by default for text to speech. Turn on to try other providers automatically.</p>
+          </Show>
           <Show
             when={!prefs.error && prefs()}
             fallback={
@@ -384,7 +441,7 @@ export default function Speech(props: {
                 <span class="badge completed">Completed</span>
                 <span>{providerNames[value().provider]}</span>
                 <Show when={value().voice_profile}>
-                  {(profile) => <span>Voice · {profile().id}</span>}
+                  {(profile) => <span>Voice profile · {profile().id}</span>}
                 </Show>
                 <span>{duration(value().duration_ms)}</span>
                 <Show when={value().detected_language}>

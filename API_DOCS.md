@@ -10,7 +10,7 @@ This document explains every operation in the Silicon Waveform OpenAPI contract.
 https://waveform.teamofsilicons.com/api/v1
 ```
 
-Waveform provides a provider-independent interface for text-to-speech and speech-to-text. Provider selection and fallback are internal; callers receive one normalized response shape.
+Waveform provides a provider-independent interface for text-to-speech and speech-to-text. TTS uses the selected provider with automatic fallback off by default. STT keeps automatic fallback. Callers receive normalized response shapes and safe provider failure details.
 
 ### Authentication
 
@@ -53,10 +53,12 @@ Converts text into speech and stores the final MP3 in Briefcase.
   a provider-name array. The array is a preferred prefix; unlisted providers
   follow the caller's account order for bearer requests. OBO requests use the
   configured default order until IAM-backed account lookup is available.
+  `auto_fallback` is false by default; `provider_options` controls the selected provider.
+  `provider_keys` supplies request-only BYOK credentials.
 - **Required header:** `Idempotency-Key`.
 - **Returns:** Request ID, permanent Briefcase URL, nullable temporary URL, provider, media type, and duration.
 
-Waveform attempts its configured provider chain in order. Provider failures are internal implementation details unless every provider fails. The output is normalized to `audio/mpeg` regardless of the provider that succeeds.
+TTS attempts only the first resolved provider by default. Set `auto_fallback: true` to try the remaining configured providers. With fallback off, use `provider_options` for the selected provider; a failure returns `502 provider_failed` with the provider, safe reason, optional upstream status, and guidance to correct the request or choose another provider. TTS does not retry a provider generation internally. The output is normalized to `audio/mpeg`.
 
 Waveform creates the file in the represented actor's Briefcase application
 folder using a name based on the canonical operation start time established by
@@ -83,6 +85,7 @@ Transcribes an audio or video file referenced by a permanent Briefcase URL.
   provider-name array. The array is a preferred prefix; unlisted providers
   follow the caller's account order for bearer requests. OBO requests use the
   configured default order until IAM-backed account lookup is available.
+  `provider_keys` supplies request-only BYOK credentials.
 - **Required header:** `Idempotency-Key`.
 - **Returns:** Request ID, transcript, detected language, provider, and source duration when available.
 
@@ -151,7 +154,7 @@ replay authorization audit calls. Errors use the common `error.code`,
 - `413` synchronous text/media/audio limit exceeded.
 - `415` unsupported source media.
 - `429` local admission limit reached.
-- `502` every provider failed or returned an invalid result.
+- `502 provider_failed` the selected TTS provider failed with fallback off; `502 providers_exhausted` all providers failed with fallback enabled or for STT.
 - `503` IAM, Briefcase, PostgreSQL, or a required dependency-contract capability is unavailable.
 - `504` the bounded synchronous workflow exceeded its deadline.
 
@@ -207,3 +210,67 @@ DM uploads voice file to Briefcase
 `PATCH /api/v1/preferences` accepts `voice_profile` to change the account default.
 TTS responses and job history include a nullable `voice_profile: {id, revision}`
 for the mapping used. See [voice profiles](docs/voice-profiles.md) for fallback semantics.
+
+## Provider controls and bring your own key
+
+TTS `auto_fallback` defaults to `false`, including requests from existing clients
+that omit the field. To retain the previous behavior, explicitly send `true`.
+`provider_order` still selects the first provider and the optional fallback order.
+Existing account preferences, encrypted provider keys and completed jobs remain
+valid. Existing idempotent TTS jobs can replay with `auto_fallback: true` and no new
+controls/keys. Use a new idempotency key when changing the provider, fallback mode,
+controls or request credentials. No saved-key migration is needed.
+
+```json
+{
+  "text": "Welcome back. Your table is ready.",
+  "provider_order": ["gemini"],
+  "auto_fallback": false,
+  "provider_options": {
+    "gemini": {
+      "scene": "A quiet restaurant in the evening",
+      "audio_profile": "A friendly host",
+      "director_notes": "Warm and unhurried, with a pause after the greeting"
+    }
+  }
+}
+```
+
+Only controls belonging to the selected provider are accepted, and nonempty
+controls require fallback off. Omitted settings inherit the chosen voice profile.
+
+| Provider | Controls |
+| --- | --- |
+| Gemini | `voice`, `scene`, `audio_profile`, `director_notes`, `sample_context` |
+| ElevenLabs | `voice_id`, `model_id`, `stability`, `similarity_boost`, `style`, `speed`, `use_speaker_boost`, `seed`, `previous_text`, `next_text`, `apply_text_normalization` |
+| OpenAI | `voice`, `model`, `instructions`, `speed` |
+
+Gemini scene/profile/direction become labeled prompt sections before the transcript;
+they are guidance, not guarantees about delivery. ElevenLabs stability, similarity
+and style accept 0–1; speed accepts 0.7–1.2; normalization accepts `auto`, `on`, `off`.
+OpenAI speed accepts 0.25–4. Instructions require explicit `gpt-4o-mini-tts`;
+`tts-1` and `tts-1-hd` reject instructions. Unknown or mismatched controls fail
+validation before generation. See OpenAPI for complete bounds.
+
+For saved BYOK, use the existing write-only `PUT /provider-keys/{provider}` with
+`{"api_key":"<private-key>"}`. Keys are encrypted and scoped to environment,
+organization and actor; listing returns metadata only. Delete a saved key to
+return to the deployment key. For a single TTS or STT request, supply
+`provider_keys: {"gemini":"<private-key>"}` or another supported provider.
+Selection is request key → saved actor key → deployment key, independently for
+each provider. A rejected personal key never silently retries using Waveform's
+key. Request keys are not saved, returned, or logged; only a keyed request digest
+binds them to idempotency. Providers charge the account owning the chosen key.
+
+Test environments validate the same request fields but always use prerecorded
+profile audio or the fixed transcript, including every selected TTS provider.
+Saved or request keys never invoke a paid provider in a test environment.
+
+`GET /capabilities` exposes supported control names, the default fallback mode
+and BYOK precedence. Failures only expose allowlisted reasons and status codes;
+provider response bodies, speech text and credentials are never reflected.
+
+Provider documentation verified for these mappings:
+- [Gemini speech generation](https://ai.google.dev/gemini-api/docs/speech-generation)
+- [ElevenLabs speech endpoint](https://elevenlabs.io/docs/api-reference/text-to-speech/convert)
+- [OpenAI speech endpoint](https://developers.openai.com/api/reference/resources/audio/subresources/speech/methods/create)

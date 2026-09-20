@@ -43,3 +43,25 @@ After changing the root manifest, run `python3 scripts/sync-honeycomb.py` to
 refresh the copy in `frontend/public/` used by its isolated Docker build context.
 CI rejects stale copies. The docs build copies the root manifest directly.
 Builds and artifact uploads do not roll out services or publish an application.
+
+## 0.2.0 — Provider controls and BYOK
+
+Backend, Rust client, CLI and Honeycomb package versions are 0.2.0. The public
+HTTP path remains `/api/v1`; contract discovery includes the 0.2.x clients.
+TTS automatic fallback now defaults off, with explicit opt-in for the provider
+chain. STT fallback is unchanged. Provider-specific synthesis controls and
+request-only keys are available in the API, Rust client, CLI and website; saved
+personal keys remain encrypted and write-only. Provider failures include safe
+provider and reason metadata.
+
+Rust consumers upgrading to 0.2.0 must account for the new TTS/STT request fields
+and the additional `Error::Api` metadata. Prefer `..Default::default()` for TTS
+requests and explicitly set `auto_fallback: true` where the old fallback behavior
+is required. Existing completed legacy TTS jobs can still be replayed by sending
+that flag without new controls or request keys.
+
+Publish `silicon-waveform-client` before `waveform-cli`, because Cargo resolves
+the CLI's versioned client dependency from crates.io when packaging. Tag the
+release `v0.2.0` to build the six native Honeycomb targets. Confirm the combined
+archive, registry versions and public application release after publication;
+local package checks and CI artifacts alone do not establish publication.

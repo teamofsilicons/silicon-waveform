@@ -85,3 +85,56 @@ the saved voice. TTS responses and jobs expose optional `VoiceProfileRef` metada
 `report(message, pr, idempotency_key)` submits an authenticated report, with simulated delivery in sandboxes. `set_telemetry(org, actor, enabled)` controls the account opt-out. On Unix, `telemetry::from_environment()` provides an optional Space Station sender for embedding programs; only record safe action labels and outcomes.
 
 `client.contracts().await?` reads version negotiation and compatibility information.
+
+`refresh_with_key(refresh_token, idempotency_key)` retains a caller-supplied retry key across uncertain refresh responses. Persist the returned token pair before using it again; concurrent rotations must be serialized by the caller. The CLI does this automatically.
+
+## Request-specific synthesis controls and BYOK
+
+`TtsRequest` implements `Default`; its `auto_fallback` defaults to false. Only the
+first provider resolved from `provider_order` and account preferences is tried.
+Set `auto_fallback: true` to restore the provider fallback sequence. STT fallback
+is unchanged.
+
+`TtsProviderOptions` has optional `gemini: GeminiTtsOptions`,
+`elevenlabs: ElevenLabsTtsOptions`, and `openai: OpenAiTtsOptions` fields. Provider
+controls require fallback to be disabled and must match the selected provider.
+Gemini accepts scene, audio profile, director notes, sample context and voice;
+ElevenLabs accepts model, voice and delivery controls; OpenAI accepts model,
+voice, instructions and speed. OpenAI instructions require explicit
+`model: Some("gpt-4o-mini-tts".into())`. Unknown JSON fields are rejected.
+
+```rust,ignore
+let mut keys = silicon_waveform_client::ProviderKeys::default();
+keys.insert("gemini", std::env::var("MY_GEMINI_KEY")?)?;
+let request = silicon_waveform_client::TtsRequest {
+    text: "Welcome home.".into(),
+    provider_order: Some(vec!["gemini".into()]),
+    provider_options: silicon_waveform_client::TtsProviderOptions {
+        gemini: Some(silicon_waveform_client::GeminiTtsOptions {
+            scene: Some("A quiet evening at home".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    },
+    provider_keys: keys,
+    ..Default::default()
+};
+```
+
+Both `TtsRequest.provider_keys` and `SttRequest.provider_keys` accept `ProviderKeys`.
+This wrapper redacts `Debug` output and serializes a map of provider names to keys
+only when sending a request. Request keys override saved personal keys, which
+override deployment keys. A supplied invalid key fails for that provider; it is
+not retried using another credential for the same provider. Request keys are not
+saved. Existing `put_provider_key` remains available to save a personal key.
+
+`Error::Api` includes the safe backend `message`, `request_id`, `provider`,
+`reason`, and `provider_status` when available. Its display includes the backend
+message so callers can distinguish provider rejection, rate limiting and other
+failures and select another provider. Legacy error bodies without these fields
+remain supported.
+
+`capabilities().tts` exposes optional `auto_fallback_default` and a provider-to-field
+`provider_options` map. Top-level `byok: Option<ByokCapabilities>` reports saved
+and per-request support plus credential precedence. Older servers may omit this
+metadata; optional fields remain `None` and the options map remains empty.

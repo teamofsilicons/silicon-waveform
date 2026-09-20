@@ -47,7 +47,7 @@ fn speech_app(state: Arc<ControlState>) -> Result<Router, Box<dyn std::error::Er
         state.briefcase_settings.cdn_origin.clone(),
         FixtureUploadLedger::default(),
     )?);
-    let (tts, stt) = crate::infrastructure::testing::database_provider_chains(state.pool.clone());
+    let (tts, stt) = crate::infrastructure::testing::database_provider_chains(&state.pool);
     let policy = ServicePolicy::new(
         Duration::from_secs(60),
         MediaSizeLimit::default(),
@@ -109,7 +109,6 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
         .await;
     let root = format!("ask_{}", "W".repeat(43));
     super::mock_discovery(&iam, iam_plane, &root, 1, None).await;
-    let created = json!({"id":iam_plane});
     let mut test_snapshot = snapshot(actor);
     test_snapshot["authorization"]["testing_environment_id"] = json!(iam_plane);
     test_snapshot["authorization"]["scopes"] = json!([
@@ -127,14 +126,15 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "application":{"app_id":"tos>briefcase","org_id":"tos"},
             "endpoints":[{"critical":false,"endpoint_id":"briefcase.files.create","path":"/api/v1/obo/files","metadata":{"path":{"type":"string"},"name":{"type":"string"},"content_type":{"type":"string"}}}, {"critical":false,"endpoint_id":"briefcase.entries.list","path":"/api/v1/obo/entries/list","metadata":{}}, {"critical":false,"endpoint_id":"briefcase.files.read","path":"/api/v1/obo/files/read","metadata":{}}]
-        }))).expect(4).mount(&iam).await;
+        }))).expect(5).mount(&iam).await;
     let read_ledger = Arc::new(Mutex::new(ReadLedger::default()));
     let minted_reads = read_ledger.clone();
     let uploads = Arc::new(Mutex::new(Vec::<String>::new()));
     let exchange_names = uploads.clone();
-    let expected_clips: [&[u8]; 2] = [
+    let expected_clips: [&[u8]; 3] = [
         include_bytes!("../infrastructure/test-audio/kore.mp3"),
         include_bytes!("../infrastructure/test-audio/puck.mp3"),
+        include_bytes!("../infrastructure/test-audio/kore.mp3"),
     ];
     Mock::given(method("POST")).and(path("/api/v1/obo-access/exchanges"))
         .and(header("x-testing-application", basic_test(&root)))
@@ -154,7 +154,7 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
             assert!(request.headers.contains_key("x-obo-signature"));
             exchange_names.lock().unwrap_or_else(|_| panic!("exchange lock")).push(body["metadata"]["name"].as_str().unwrap_or_else(|| panic!("upload name")).to_owned());
             ResponseTemplate::new(201).set_body_json(json!({"testing_context":{"app_id":"tos>briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)},"access_proof":"obo_paired_upload","proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
-        }).expect(4).mount(&iam).await;
+        }).expect(5).mount(&iam).await;
     let operations = briefcase_client::OPERATIONS
         .iter()
         .map(|o| json!({"id":o.id,"version":o.version,"method":o.method,"path":o.path}))
@@ -162,7 +162,7 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
     Mock::given(path("/api/version"))
         .respond_with(ResponseTemplate::new(200).insert_header("briefcase-api-version","v1").set_body_json(json!({
             "service":"silicon-briefcase", "selected_api_version":"v1", "supported_api_versions":["v1"], "contract_version":"1.0.0", "build":"local-test", "operations":operations
-        }))).expect(5).mount(&storage).await;
+        }))).expect(6).mount(&storage).await;
     let stored_names = uploads.clone();
     Mock::given(method("POST")).and(path("/api/v1/obo/files"))
         .and(header("x-briefcase-app-secret", format!("ask_{}","B".repeat(43))))
@@ -179,7 +179,7 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
                 "permanent_url":format!("https://briefcase.example.test/org/tos/private/actor/apps/tos>waveform/{name}"), "origin_app_id":"tos>waveform", "effective_access":["read"],
                 "created_at":"2026-09-08T00:00:00Z", "updated_at":"2026-09-08T00:00:00Z", "deleted_at":null
             }))
-        }).expect(2).mount(&storage).await;
+        }).expect(3).mount(&storage).await;
     let read_names = uploads.clone();
     let list_proofs = read_ledger.clone();
     let replay_entry_id = Uuid::new_v4();
@@ -218,11 +218,35 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
         .await;
     let first_key = Uuid::new_v4().to_string();
     let second_key = Uuid::new_v4().to_string();
+    let third_key = Uuid::new_v4().to_string();
+    let request_keys = [
+        "ephemeral-gemini-provider-key",
+        "ephemeral-elevenlabs-provider-key",
+        "ephemeral-openai-provider-key",
+    ];
+    let providers = ["gemini", "elevenlabs", "openai"];
+    let controls = [
+        json!({"gemini":{"scene":"A private quiet room","director_notes":"Read calmly"}}),
+        json!({"elevenlabs":{"voice_id":"byok-custom-voice","stability":0.2,"speed":0.8}}),
+        json!({"openai":{"model":"gpt-4o-mini-tts","voice":"marin","instructions":"A private direction","speed":0.75}}),
+    ];
     let mut first_result = Value::Null;
-    for (index, key) in [&first_key, &second_key, &first_key]
+    for (index, key) in [&first_key, &second_key, &third_key, &first_key]
         .into_iter()
         .enumerate()
     {
+        let selected = if index == 3 { 0 } else { index };
+        let mut input = json!({
+            "text":"use the deterministic fixture",
+            "voice_profile": if selected == 1 { Some("puck") } else { None },
+            "provider_order":[providers[selected]],
+            "provider_options":controls[selected],
+            "provider_keys":{(providers[selected]):request_keys[selected]}
+        });
+        // Omission and explicit false both mean exactly the selected provider.
+        if selected != 0 {
+            input["auto_fallback"] = json!(false);
+        }
         let request = Request::builder()
             .method("POST")
             .uri("/api/v1/tts")
@@ -231,26 +255,25 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
             .header("x-org-id", "tos")
             .header("x-testing-environment-key", &root)
             .header("idempotency-key", key)
-            .body(Body::from(
-                json!({"text":"use the deterministic fixture", "voice_profile": if index == 1 { Some("puck") } else { None }}).to_string(),
-            ))?;
+            .body(Body::from(input.to_string()))?;
         let response = app.clone().oneshot(request).await?;
         let status = response.status();
         let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["temporary_url"].is_null());
+        assert_eq!(body["provider"], providers[selected]);
         assert_eq!(
             body["voice_profile"]["id"],
-            if index == 1 { "puck" } else { "kore" }
+            if selected == 1 { "puck" } else { "kore" }
         );
         assert_eq!(
             body["duration_ms"],
-            crate::infrastructure::audio::mp3_duration_ms(expected_clips[usize::from(index == 1)])?
+            crate::infrastructure::audio::mp3_duration_ms(expected_clips[selected])?
         );
         if index == 0 {
             first_result = body.clone();
         }
-        if index == 2 {
+        if index == 3 {
             assert_eq!(body, first_result);
         }
         assert!(body["file_url"].as_str().is_some_and(|url| url.starts_with(
@@ -261,20 +284,107 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
         .lock()
         .unwrap_or_else(|_| panic!("upload lock"))
         .clone();
-    assert_eq!(names.len(), 2);
+    assert_eq!(names.len(), 3);
     assert_ne!(names[0], names[1]);
     let count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM waveform_jobs WHERE plane_id=$1 AND status='completed'",
     )
-    .bind(
-        created["id"]
-            .as_str()
-            .ok_or("missing plane")?
-            .parse::<Uuid>()?,
-    )
+    .bind(iam_plane)
     .fetch_one(&pool)
     .await?;
-    assert_eq!(count, 2);
+    assert_eq!(count, 3);
+    // Entire durable rows must contain neither request-only keys nor provider prompts.
+    let persisted: Vec<String> = sqlx::query_scalar(
+        "SELECT to_jsonb(j)::text FROM waveform_jobs j WHERE plane_id=$1 UNION ALL SELECT to_jsonb(i)::text FROM waveform_idempotency_records i WHERE plane_id=$1",
+    ).bind(iam_plane).fetch_all(&pool).await?;
+    assert_eq!(persisted.len(), 6);
+    for row in persisted {
+        for secret in request_keys {
+            assert!(!row.contains(secret), "ephemeral key was persisted");
+        }
+        assert!(!row.contains("A private quiet room"));
+        assert!(!row.contains("A private direction"));
+    }
+    let saved_keys: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM waveform_provider_keys WHERE plane_id=$1")
+            .bind(iam_plane)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        saved_keys, 0,
+        "request-only keys must not create saved keys"
+    );
+    for upstream in [&iam, &storage] {
+        for request in upstream
+            .received_requests()
+            .await
+            .ok_or("missing upstream requests")?
+        {
+            for secret in request_keys {
+                assert!(
+                    !String::from_utf8_lossy(&request.body).contains(secret),
+                    "provider key reached IAM or storage"
+                );
+                assert!(!format!("{:?}", request.headers).contains(secret));
+            }
+        }
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn tts_rejects_fallback_with_provider_controls_before_creating_a_job() -> TestResult {
+    let (pool, schema) = database().await?;
+    let iam = MockServer::start().await;
+    let mut state = fixture(pool.clone(), &iam)?;
+    let settings = &mut Arc::get_mut(&mut state)
+        .ok_or("shared test state")?
+        .briefcase_settings;
+    settings.permanent_origin = "https://briefcase.example.test".parse()?;
+    settings.cdn_origin = settings.permanent_origin.clone();
+    let app = speech_app(state)?;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/tts")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer oat_fixture")
+        .header("x-org-id", "tos")
+        .header("idempotency-key", Uuid::new_v4().to_string())
+        .body(Body::from(
+            json!({
+                "text":"Hello.", "auto_fallback":true,
+                "provider_order":["gemini"],
+                "provider_options":{"gemini":{"scene":"A quiet room"}}
+            })
+            .to_string(),
+        ))?;
+    let response = app.oneshot(request).await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("auto_fallback=false"))
+    );
+    for query in [
+        "SELECT count(*) FROM waveform_jobs",
+        "SELECT count(*) FROM waveform_idempotency_records",
+    ] {
+        let count: i64 = sqlx::query_scalar(query).fetch_one(&pool).await?;
+        assert_eq!(count, 0);
+    }
+    assert!(
+        iam.received_requests()
+            .await
+            .ok_or("missing upstream requests")?
+            .is_empty()
+    );
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&pool)
         .await?;
@@ -316,8 +426,10 @@ async fn cli_command(
         .arg(url)
         .args(args)
         .env("HOME", home)
+        .env("SILICON_HOME", home)
         .env("WAVEFORM_AUTO_UPDATE", "off")
         .env_remove("WAVEFORM_ORG")
+        .env_remove("WAVEFORM_TEST")
         .kill_on_drop(true)
         .output()
         .await?;
@@ -360,7 +472,8 @@ async fn real_cli_keeps_production_and_test_logins_separate() -> TestResult {
         }).mount(&iam).await;
     Mock::given(path("/api/v1/oauth/revoke"))
         .and(header("x-testing-environment-key", "I".repeat(32)))
-        .and(body_string_contains("token=oat_test"))
+        // Logout revokes the refresh token so the whole saved session is ended.
+        .and(body_string_contains("token=ort_test"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&iam)

@@ -69,6 +69,12 @@ impl fmt::Debug for SpeechText {
 /// Validated public text-to-speech request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TtsRequest {
+    /// Try later providers only when explicitly enabled. Defaults to false.
+    pub auto_fallback: bool,
+    /// Controls for the selected provider; available only without fallback.
+    pub provider_options: super::tts_options::TtsProviderOptions,
+    /// Ephemeral keys used only for this request.
+    pub provider_keys: super::provider_keys::ProviderApiKeys,
     /// Private source text.
     pub text: SpeechText,
     /// Optional profile override; absent uses the account default.
@@ -102,6 +108,9 @@ impl TtsRequest {
         }
         Ok(Self {
             text,
+            auto_fallback: false,
+            provider_options: super::tts_options::TtsProviderOptions::default(),
+            provider_keys: super::provider_keys::ProviderApiKeys::default(),
             voice_profile: None,
             resolved_voice: None,
             language,
@@ -120,6 +129,10 @@ impl TtsRequest {
 /// Provider-ready TTS input with language policy already applied.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TtsProviderRequest {
+    /// Prerecorded sandbox clip selected by the resolved account voice profile.
+    pub fixture_voice: Option<String>,
+    /// Validated controls for this provider only.
+    pub options: super::tts_options::TtsProviderOptions,
     /// Private text to synthesize.
     pub text: SpeechText,
     /// Mapping for this provider only.
@@ -134,6 +147,11 @@ impl TtsProviderRequest {
     pub fn for_provider(request: &TtsRequest, provider: ProviderName) -> Self {
         Self {
             text: request.text.clone(),
+            fixture_voice: request
+                .resolved_voice
+                .as_ref()
+                .map(|voice| voice.gemini_voice.clone()),
+            options: request.provider_options.for_provider(provider),
             voice: request
                 .resolved_voice
                 .as_ref()
@@ -186,6 +204,8 @@ impl TtsResult {
 /// Validated public speech-to-text request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SttRequest {
+    /// Ephemeral keys used only for this request.
+    pub provider_keys: super::provider_keys::ProviderApiKeys,
     /// Stable authenticated Briefcase source URL.
     pub source_url: BriefcaseFileUrl,
     /// Optional supported BCP 47 hint.
@@ -213,6 +233,7 @@ impl SttRequest {
         }
         Ok(Self {
             source_url,
+            provider_keys: super::provider_keys::ProviderApiKeys::default(),
             language,
             provider_order: None,
         })

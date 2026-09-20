@@ -39,8 +39,8 @@ export default function VoiceProfilePicker(props: {
         {(profile) => (
           <div class="voice-description">
             <p class="hint">
-              {profile().description}. Fallback uses this profile’s saved voice
-              mappings.
+              {profile().description}. Each provider uses this profile’s saved
+              voice mapping unless you override its controls.
             </p>
             <details>
               <summary>Provider voices</summary>

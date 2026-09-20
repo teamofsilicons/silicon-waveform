@@ -30,7 +30,8 @@ Override that choice for one generation with `POST /api/v1/tts`:
 Omitting or sending null for `voice_profile` uses the saved account default.
 An override never changes that default. An unknown ID is rejected before any
 speech provider runs. Raw `voice_id` and `voice_settings` fields are not accepted
-on this endpoint; they belong to the catalog mapping.
+at the top level. With automatic fallback off, use the selected provider’s
+`provider_options` to override voice/model/delivery settings for this generation.
 
 Provider order remains an independent preference. Waveform resolves the profile
 once and supplies the appropriate mapping to each attempted provider. ElevenLabs
@@ -81,7 +82,8 @@ voice migration page:
 Initial similarity boost is 0.75 and speaker boost is true. Similarity boost
 preserves the chosen ElevenLabs voice; it does not match an arbitrary Gemini or
 OpenAI voice. The active API key must have access to the mapped library voice.
-Provider failures still advance to the next configured fallback.
+Provider failures advance only when `auto_fallback: true` is explicitly requested.
+The default is off. See [per-provider controls and BYOK](api.md).
 
 Operators can tune `waveform_voice_profiles.profile` in the selected plane after
 listening to samples. Every edit automatically increments the profile revision.

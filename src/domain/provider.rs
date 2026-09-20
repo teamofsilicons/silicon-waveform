@@ -112,6 +112,22 @@ pub enum ProviderFailureKind {
 }
 
 impl ProviderFailureKind {
+    /// Actionable explanation safe to return without upstream private content.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Saturated => "The provider's concurrent request limit is reached.",
+            Self::Timeout => "The provider did not respond before the request deadline.",
+            Self::Network => "Waveform could not connect to the provider.",
+            Self::RateLimited => "The provider rate or quota limit was reached.",
+            Self::Unavailable => "The provider service is unavailable.",
+            Self::Authentication => "The provider rejected the API key or its access permissions.",
+            Self::RejectedRequest => {
+                "The provider rejected the request. Check the selected model, voice and options."
+            }
+            Self::InvalidResponse => "The provider returned empty, malformed or unsupported audio.",
+        }
+    }
     /// Stable privacy-safe label for structured attempt telemetry.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -132,6 +148,10 @@ impl ProviderFailureKind {
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[error("{provider} {kind:?} failure")]
 pub struct ProviderError {
+    /// Provider HTTP status when an upstream response was received.
+    pub status: Option<u16>,
+    /// Allowlisted provider reason; never contains an upstream response body.
+    pub reason: Option<&'static str>,
     /// Provider that failed.
     pub provider: ProviderName,
     /// Stable failure category; private response bodies are never retained.
@@ -142,7 +162,37 @@ impl ProviderError {
     /// Constructs a redacted failure.
     #[must_use]
     pub const fn new(provider: ProviderName, kind: ProviderFailureKind) -> Self {
-        Self { provider, kind }
+        Self {
+            provider,
+            kind,
+            status: None,
+            reason: None,
+        }
+    }
+
+    /// A safe reason and recovery hint for the caller.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self.reason {
+            Some("key_not_configured") => {
+                "No API key is configured for this provider. Connect your own key or select another provider."
+            }
+            Some("quota_exceeded") => "The provider account has insufficient quota or credits.",
+            Some("invalid_api_key") => "The provider API key is invalid or expired.",
+            Some("model_not_found") => {
+                "The selected model does not exist or is not available to this API key."
+            }
+            Some("voice_not_found") => {
+                "The selected voice does not exist or is not available to this API key."
+            }
+            Some("content_blocked") => {
+                "The provider blocked this content under its content policy."
+            }
+            Some("missing_permissions") => {
+                "The provider API key does not have the required permissions."
+            }
+            _ => self.kind.message(),
+        }
     }
 }
 

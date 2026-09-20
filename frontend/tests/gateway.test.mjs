@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createGateway } from "../server/gateway.mjs";
+import { createGateway, MAX_REQUEST_BODY_BYTES } from "../server/gateway.mjs";
 import { fixture } from "./fixture.mjs";
 const origin = "http://localhost:4325";
 function setup(extra = {}) {
@@ -184,6 +184,45 @@ test("account preferences and write-only keys support save and remove", async ()
     0,
   );
 });
+test("expanded TTS controls and BYOK fit the gateway body limit", async () => {
+  const s = setup();
+  await s.login();
+  const content = "😀".repeat(4096);
+  const key = "x".repeat(16384);
+  const payload = {
+    text: content,
+    auto_fallback: false,
+    provider_options: {
+      gemini: {
+        scene: content,
+        audio_profile: content,
+        director_notes: content,
+        sample_context: content,
+      },
+    },
+    provider_keys: { gemini: key, elevenlabs: key, openai: key },
+  };
+  const bytes = Buffer.byteLength(JSON.stringify(payload));
+  assert.ok(bytes > 128 * 1024);
+  assert.ok(bytes < MAX_REQUEST_BODY_BYTES);
+  const response = await s.call("/api/v1/tts", payload, "POST", {
+    "idempotency-key": "expanded-tts-request",
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(s.fake.requests.at(-1).body, payload);
+});
+test("gateway rejects JSON above the expanded body limit before forwarding", async () => {
+  const s = setup();
+  await s.login();
+  assert.equal(MAX_REQUEST_BODY_BYTES, 327680);
+  const before = s.fake.requests.length;
+  const response = await s.call("/api/v1/tts", {
+    text: "x".repeat(MAX_REQUEST_BODY_BYTES),
+  });
+  assert.equal(response.status, 413);
+  assert.equal((await response.json()).error.code, "request_too_large");
+  assert.equal(s.fake.requests.length, before);
+});
 test("environment create, list, inspect, retrieve key, rotate, delete and restore use the complete contract", async () => {
   const s = setup();
   await s.login();
@@ -285,7 +324,10 @@ test("upstream failures return safe errors without credential leakage", async ()
   });
   const result = await s.call("/health/ready");
   assert.equal(result.status, 502);
-  assert.ok(!(await result.text()).includes("private-api-key"));
+  const body = await result.text();
+  assert.ok(!body.includes("private-api-key"));
+  assert.match(body, /check job history before retrying/);
+  assert.ok(!body.includes("retried safely"));
 });
 
 test("stale tabs cannot send a request into a newly selected environment", async () => {

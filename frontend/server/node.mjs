@@ -2,7 +2,7 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { resolve, extname } from "node:path";
 import { pathToFileURL } from "node:url";
-import { createGateway } from "./gateway.mjs";
+import { createGateway, MAX_REQUEST_BODY_BYTES } from "./gateway.mjs";
 export function startServer({
   port = Number(process.env.PORT || 4325),
   host = process.env.HOST || "127.0.0.1",
@@ -28,7 +28,7 @@ export function startServer({
         let size = 0;
         for await (const chunk of req) {
           size += chunk.length;
-          if (size > 128 * 1024) {
+          if (size > MAX_REQUEST_BODY_BYTES) {
             res.writeHead(413);
             res.end();
             return;
