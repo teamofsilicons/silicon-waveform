@@ -40,10 +40,20 @@ provider-key listing matched the pre-upgrade responses exactly. Production
 readiness, liveness, capabilities and contract discovery return 200; anonymous
 identity and history requests return 401. No paid speech request was made.
 
-This verification used the preceding IAM deployment, before its canonical
-cutover. Canonical-only response handling, retained account-key resolution,
-revocation, testing isolation and retry behavior passed the local API/database
-and native CLI integration tests.
+The consumer deployment checks above preceded the IAM canonical cutover.
+After IAM 3.0.0 (`deea75e3d8f9b331bf9ef25e5d39c6546ed5a9fd`) went live,
+Maharaj's same pre-cutover session authenticated and refreshed normally through
+CLI 0.3.1 without another login. The actor remained `chef:bricks` in `bricks`.
+Both existing jobs matched every captured response field; preferences and the
+provider-key listing were unchanged. Readiness returned 200. These checks used
+the existing saved refresh credentials and made no speech or configuration
+mutation. No personal BYOK record was present, so live provider-key verification
+covered listing and account ownership; ciphertext preservation was covered by
+the earlier local database tests.
+
+Canonical-only response handling, retained account-key resolution, revocation,
+testing isolation and retry behavior also passed the local API/database and
+native CLI integration tests.
 
 ## Published artifacts
 
