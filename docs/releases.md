@@ -44,6 +44,19 @@ refresh the copy in `frontend/public/` used by its isolated Docker build context
 CI rejects stale copies. The docs build copies the root manifest directly.
 Builds and artifact uploads do not roll out services or publish an application.
 
+## 0.3.2 — Durable sessions and refresh recovery
+
+CLI and Honeycomb package 0.3.2 preserve the original request time when recovering
+a refresh, so a cached response cannot silently extend an old access token's
+lifetime. Backend 0.3.1 keeps sessions during temporary IAM configuration failures.
+The browser gateway stores encrypted sessions on persistent disk and resumes
+rotation safely after a restart. The first upgrade from the previous memory-only
+gateway requires one fresh sign-in. Rust client 0.3.0 is unchanged.
+
+All six native CLI targets passed tests, and the source, backend and frontend
+builds passed. [Release artifacts](https://github.com/teamofsilicons/silicon-waveform/releases/tag/v0.3.2)
+include the validated Honeycomb package, checksums and exact native backend bundle.
+
 ## 0.3.1 — Portable Linux CLI
 
 CLI and Honeycomb package 0.3.1 use static musl binaries for Linux x86_64 and
