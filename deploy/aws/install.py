@@ -190,9 +190,17 @@ commands={
      '-v',str(data/'caddy-config')+':/config',*common,pinned['proxy']],
 }
 if frontend_image:
+    frontend_sessions = data/'frontend-sessions'
+    frontend_sessions.mkdir(mode=0o700, exist_ok=True)
+    if frontend_sessions.is_symlink():
+        raise RuntimeError('Frontend session directory must not be a symlink')
+    os.chown(frontend_sessions, 1000, 1000)
+    frontend_sessions.chmod(0o700)
     commands['frontend'] = ['docker','run','--name','waveform-frontend','--memory','192m',
         '--read-only','--cap-drop','ALL','--pids-limit','128',
         '--tmpfs','/tmp:rw,nosuid,noexec,size=16m',
+        '--mount',f'type=bind,src={frontend_sessions},dst=/var/lib/waveform/sessions',
+        '-e','WAVEFORM_SESSION_DIRECTORY=/var/lib/waveform/sessions',
         '-e','WAVEFORM_FRONTEND_ORIGIN=https://waveform.teamofsilicons.com',
         '-e','WAVEFORM_BACKEND_URL=https://backend.waveform.teamofsilicons.com',
         '-e','WAVEFORM_IAM_AUTH_ORIGIN=https://auth.iam.teamofsilicons.com',

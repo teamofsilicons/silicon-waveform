@@ -82,8 +82,9 @@ but are cleared on reload or identity/environment changes.
 ## Gateway and sessions
 
 The small Node gateway uses only Node built-ins. Access tokens, refresh tokens,
-and connected testing keys remain in a bounded, expiring server-side session
-map. The browser gets an opaque `HttpOnly`, `SameSite=Lax` cookie (`Secure` and
+and connected testing keys remain in a bounded, expiring server-side store.
+Production uses encrypted durable SQLite records in `WAVEFORM_SESSION_DIRECTORY`;
+separate production/testing slots and the selected context survive restarts. The browser gets an opaque `HttpOnly`, `SameSite=Lax` cookie (`Secure` and
 `__Host-` prefixed when the public origin uses HTTPS). Neither localStorage nor
 sessionStorage is used for secrets. Saved-key forms clear their values after
 save/close, and request-key forms clear on submission. There is no credential logging.
@@ -101,18 +102,42 @@ request key always gets fresh IDs, and subsequent submissions cannot reuse that
 attempt after its key has been cleared. Check job history before submitting
 again if a key-bearing request had an uncertain outcome.
 
-Sessions last at most 24 hours of inactivity and live in memory. Restarting the
-frontend signs its sessions out locally. Run a **single process** for this small
-deployment; use shared session storage before adding multiple replicas. Tokens
-remain subject to the backend's online IAM validation. Server restarts do not
-remove backend accounts, jobs, preferences, or environments.
+Signed-in sessions have a 900-day upper bound matching IAM refresh families, with
+cookies renewed for at most 400 days at a time; IAM revocation and expiry remain
+authoritative. Unauthenticated browsing state expires after one day. Run one
+process per persistent directory: SQLite owns an exclusive lock and refuses a
+second gateway. The store encrypts every record with AES-256-GCM, hashes opaque
+cookie IDs, and binds records to the configured origin/backend/app. Its directory
+must be owned by the runtime user with mode `0700`; the generated `session.key`
+and `sessions.sqlite` use `0600`. Keep both across deployments and back them up
+together while the gateway is stopped. Missing keys, invalid records and changed
+issuer configuration fail startup; they never silently reset credentials.
+
+A refresh records its retry key and original request time before dispatch, then
+persists the validated successor before dependent identity reads. A failed
+identity lookup resumes from that staged response after restart. Cached responses
+never restart the access-token clock; expired receipts recover one subsequent
+generation with a new key. In-flight refreshes share one operation, late `401`
+responses reuse credentials another request already renewed, and transport,
+configuration or malformed-response failures preserve recovery state. Only a
+definitive credential rejection clears the affected login. A disk failure restores
+the last durable credential state instead of using an unrecorded rotation.
+
+Login/logout/environment changes are serialized and recheck tab context. Logout
+commits the local removal before remote revocation; late refreshes cannot restore
+it. Production and test credentials always retain their respective selectors,
+including across restarts. The initial upgrade from the memory-only gateway needs
+one new login because that release never wrote credentials to recover. Later
+restarts/redeployments retain login. This is single-host continuity, not replica
+failover; backend accounts, jobs and preferences remain owned by the API.
 
 ## Build and host
 
 ```sh
 npm run build
 WAVEFORM_FRONTEND_ORIGIN=https://waveform.teamofsilicons.com \
-HOST=0.0.0.0 PORT=4325 npm start
+WAVEFORM_SESSION_DIRECTORY=/var/lib/waveform/sessions \
+NODE_ENV=production HOST=0.0.0.0 PORT=4325 npm start
 ```
 
 Serve the Node process behind HTTPS. The build is not a standalone static site:
@@ -127,13 +152,16 @@ Configuration (server-side environment variables):
 - `WAVEFORM_FRONTEND_ORIGIN`: defaults to `http://localhost:4325`.
 - `WAVEFORM_IAM_AUTH_ORIGIN`: defaults to `https://auth.iam.teamofsilicons.com`.
 - `WAVEFORM_APP_ID`: defaults to `tos>waveform`.
+- `WAVEFORM_SESSION_DIRECTORY`: required in production; absolute path on persistent storage.
 - `HOST`, `PORT`: production server bind address and port.
 
 The `.env.example` is a reference; export variables in the shell or use Node's
 `--env-file` option. The frontend does not read the repository's backend `.env`.
 A Dockerfile is included. The AWS installer hosts the frontend on the existing
 Waveform instance at https://waveform.teamofsilicons.com; see
-[deployment instructions](../deploy/aws/README.md).
+[deployment instructions](../deploy/aws/README.md). On the current native API host,
+use `deploy/native/install-frontend.py --image <immutable-digest>` for a frontend-only
+rollout; it preserves API, Caddy and PostgreSQL and mounts the durable session path.
 
 ## Verification
 

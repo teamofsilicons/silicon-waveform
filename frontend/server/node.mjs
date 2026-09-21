@@ -10,8 +10,19 @@ export function startServer({
   backend = process.env.WAVEFORM_BACKEND_URL,
   iam = process.env.WAVEFORM_IAM_AUTH_ORIGIN,
   appId = process.env.WAVEFORM_APP_ID,
+  sessionDirectory = process.env.WAVEFORM_SESSION_DIRECTORY,
 } = {}) {
-  const gateway = createGateway({ origin, backend, iam, appId });
+  if (process.env.NODE_ENV === "production" && !sessionDirectory)
+    throw new Error(
+      "WAVEFORM_SESSION_DIRECTORY is required in production on persistent storage.",
+    );
+  const gateway = createGateway({
+    origin,
+    backend,
+    iam,
+    appId,
+    sessionDirectory,
+  });
   const root = resolve(import.meta.dirname, "../dist");
   const types = {
     ".html": "text/html; charset=utf-8",
@@ -85,6 +96,7 @@ export function startServer({
     }
   });
   server.requestTimeout = 300_000;
+  server.once("close", gateway.close);
   server.listen(port, host, () =>
     console.log(`Waveform frontend listening at ${origin}`),
   );

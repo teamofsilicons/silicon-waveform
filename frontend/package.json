@@ -12,7 +12,7 @@
     "test:ui": "node tests/fixture-server.mjs"
   },
   "engines": {
-    "node": ">=22.12"
+    "node": ">=24"
   },
   "dependencies": {
     "solid-js": "1.9.15"

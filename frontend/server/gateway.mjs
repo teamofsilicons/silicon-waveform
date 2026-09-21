@@ -1,4 +1,9 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  SessionStore,
+  SESSION_TTL_MS,
+  COOKIE_TTL_MS,
+} from "./session-store.mjs";
 
 // Match the backend's expanded JSON contract for provider controls and BYOK.
 export const MAX_REQUEST_BODY_BYTES = 327_680;
@@ -28,12 +33,19 @@ const routes = [
   ["POST", /^\/api\/v1\/testing-environment\/clean$/],
 ];
 const id = () => randomBytes(32).toString("hex");
+class UpstreamFailure extends Error {
+  constructor(response) {
+    super("Upstream request failed");
+    this.response = response;
+  }
+}
 export function createGateway({
   backend = "https://backend.waveform.teamofsilicons.com",
   origin = "http://localhost:4325",
   iam = "https://auth.iam.teamofsilicons.com",
   appId = "tos>waveform",
   fetcher = fetch,
+  sessionDirectory,
 } = {}) {
   const sessions = new Map();
   const secure = new URL(origin).protocol === "https:";
@@ -51,6 +63,50 @@ export function createGateway({
     )
       throw new Error("Use HTTPS or a loopback URL.");
   }
+  const store = sessionDirectory
+    ? new SessionStore(sessionDirectory, { backend, origin, iam, appId })
+    : undefined;
+  try {
+    for (const session of store?.load() || []) {
+      if (session.until <= Date.now()) store.delete(session.id);
+      else sessions.set(session.id, session);
+    }
+  } catch (error) {
+    store?.close();
+    throw error;
+  }
+  const persist = (session) => {
+    if (sessions.get(session.id) === session) store?.save(session);
+  };
+  const updateSession = (session, changes) => {
+    const previous = { ...session };
+    Object.assign(session, changes);
+    try {
+      persist(session);
+    } catch (error) {
+      for (const key of Object.keys(session))
+        if (!Object.hasOwn(previous, key)) delete session[key];
+      Object.assign(session, previous);
+      throw error;
+    }
+  };
+  const currentSlot = (session, slot) =>
+    !slot.revoked && [session.production, session.test].includes(slot);
+  const clearSlot = (slot) => {
+    for (const key of [
+      "access",
+      "refresh",
+      "user",
+      "refreshKey",
+      "refreshStarted",
+      "pendingTokens",
+    ])
+      delete slot[key];
+  };
+  const identity = (value) =>
+    typeof value?.public_id === "string" &&
+    ["carbon", "silicon"].includes(value.actor_type) &&
+    typeof value.org_id === "string";
   async function upstream(path, slot, method = "GET", body, extra = {}) {
     const headers = new Headers({ accept: "application/json", ...extra });
     if (body !== undefined) headers.set("content-type", "application/json");
@@ -65,48 +121,201 @@ export function createGateway({
       signal: AbortSignal.timeout(240_000),
     });
   }
-  async function tokens(slot, payload) {
+  function tokens(slot, payload, started = Date.now()) {
     if (
       typeof payload.access_token !== "string" ||
-      typeof payload.refresh_token !== "string"
+      !payload.access_token ||
+      typeof payload.refresh_token !== "string" ||
+      !payload.refresh_token ||
+      !Number.isSafeInteger(payload.expires_in) ||
+      payload.expires_in <= 0 ||
+      !Number.isFinite(started + payload.expires_in * 1000)
     )
       throw new Error("Invalid token response");
     slot.access = payload.access_token;
     slot.refresh = payload.refresh_token;
-    slot.expires = Date.now() + (Number(payload.expires_in) || 3600) * 1000;
+    slot.expires = started + payload.expires_in * 1000;
   }
-  async function refresh(slot) {
-    if (!slot.refresh) return false;
+  async function refresh(session, slot, recover = true) {
+    if (!slot?.refresh || !currentSlot(session, slot)) return false;
     if (!slot.refreshing)
       slot.refreshing = (async () => {
-        const response = await upstream("/api/v1/auth/refresh", slot, "POST", {
-          refresh_token: slot.refresh,
-        });
-        if (!response.ok) {
-          if (response.status === 401) {
-            delete slot.access;
-            delete slot.refresh;
-            delete slot.user;
-          }
-          return false;
+        if (!slot.refreshKey) {
+          slot.refreshKey = id();
+          slot.refreshStarted = Date.now();
         }
-        await tokens(slot, await response.json());
+        persist(session);
+        if (!slot.pendingTokens) {
+          const response = await upstream(
+            "/api/v1/auth/refresh",
+            { ...slot, access: undefined },
+            "POST",
+            { refresh_token: slot.refresh },
+            { "idempotency-key": slot.refreshKey },
+          );
+          if (!response.ok) {
+            const error = await response
+              .clone()
+              .json()
+              .catch(() => ({}));
+            const clientFailure = [
+              "invalid_client",
+              "invalid_app_secret",
+              "invalid_application_secret",
+              "application_disabled",
+              "configuration_required",
+            ].includes(error.error?.code);
+            if (
+              (response.status === 401 && !clientFailure) ||
+              (response.status === 400 &&
+                [
+                  "invalid_grant",
+                  "invalid_refresh_token",
+                  "session_expired",
+                ].includes(error.error?.code))
+            ) {
+              clearSlot(slot);
+              persist(session);
+              return false;
+            }
+            throw new UpstreamFailure(response);
+          }
+          const pending = {};
+          // Persist the successor before dependent identity reads. Recovery must
+          // not depend on the issuer retaining its idempotent response forever.
+          tokens(pending, await response.json(), slot.refreshStarted ?? 0);
+          if (!currentSlot(session, slot)) return false;
+          slot.pendingTokens = pending;
+          try {
+            persist(session);
+          } catch (error) {
+            delete slot.pendingTokens;
+            throw error;
+          }
+        }
+        const next = { ...slot, ...slot.pendingTokens };
+        if (next.expires > Date.now() + 30_000) {
+          const me = await upstream("/api/v1/auth/me", next);
+          if (!me.ok) {
+            if (me.status !== 401) throw new UpstreamFailure(me);
+            if (!recover)
+              throw new UpstreamFailure(
+                failure(
+                  "verification_unavailable",
+                  "The renewed account could not be verified. Retry shortly.",
+                  503,
+                ),
+              );
+            // Access rejection does not revoke the refresh family. Keep the
+            // staged successor and renew it once before trying identity again.
+            next.expires = 0;
+          } else {
+            next.user = await me.json();
+            if (!identity(next.user))
+              throw new Error("Invalid account response");
+            if (
+              slot.user &&
+              (next.user.public_id !== slot.user.public_id ||
+                next.user.actor_type !== slot.user.actor_type ||
+                next.user.org_id !== slot.org)
+            ) {
+              clearSlot(slot);
+              persist(session);
+              throw new UpstreamFailure(
+                failure(
+                  "identity_mismatch",
+                  "The renewed login belongs to a different account. Sign in again.",
+                  401,
+                ),
+              );
+            }
+          }
+        }
+        if (!currentSlot(session, slot)) return false;
+        const previous = { ...slot };
+        Object.assign(slot, next, {
+          refreshKey: undefined,
+          refreshStarted: undefined,
+          pendingTokens: undefined,
+        });
+        try {
+          persist(session);
+        } catch (error) {
+          Object.assign(slot, previous);
+          throw error;
+        }
         return true;
       })().finally(() => {
         delete slot.refreshing;
       });
-    return slot.refreshing;
+    const result = await slot.refreshing;
+    if (result && slot.expires <= Date.now() + 30_000) {
+      if (recover) return refresh(session, slot, false);
+      throw new UpstreamFailure(
+        failure(
+          "refresh_unavailable",
+          "The renewed access has already expired. Retry shortly.",
+          503,
+        ),
+      );
+    }
+    return result;
   }
-  async function authorized(path, slot, method, body, headers) {
-    if (slot?.access && slot.expires < Date.now() + 30_000) await refresh(slot);
+  async function authorized(path, session, slot, method, body, headers) {
+    if (
+      slot?.access &&
+      (slot.refreshKey || slot.expires < Date.now() + 30_000) &&
+      !(await refresh(session, slot))
+    )
+      return failure(
+        "sign_in_required",
+        "Sign in with Silicon IAM to continue.",
+        401,
+      );
+    const usedAccess = slot?.access;
     let response = await upstream(path, slot, method, body, headers);
-    if (response.status === 401 && slot?.refresh && (await refresh(slot)))
-      response = await upstream(path, slot, method, body, headers);
+    if (response.status === 401 && slot?.refresh) {
+      await response.body?.cancel();
+      if (slot.access === usedAccess && !(await refresh(session, slot)))
+        return failure(
+          "sign_in_required",
+          "Sign in with Silicon IAM to continue.",
+          401,
+        );
+      if (!currentSlot(session, slot))
+        return failure(
+          "workspace_changed",
+          "Reload the current workspace.",
+          409,
+        );
+      if (
+        ["GET", "HEAD"].includes(method || "GET") ||
+        new Headers(headers).has("idempotency-key")
+      )
+        response = await upstream(path, slot, method, body, headers);
+      else
+        return failure(
+          "retry_same_operation",
+          "Your connection was renewed. Retry the same action.",
+          409,
+        );
+    }
     return response;
   }
-  async function login(slot, slt) {
-    if (typeof slt !== "string" || !(slot.key ? /^[!-~]{1,256}$/.test(slt) || /^oac_[!-~]{1,16380}$/.test(slt) : /^oac_[!-~]{1,16380}$/.test(slt)))
+  async function login(session, slot, slt) {
+    if (
+      typeof slt !== "string" ||
+      !(slot.key
+        ? /^[!-~]{1,256}$/.test(slt) || /^oac_[!-~]{1,16380}$/.test(slt)
+        : /^oac_[!-~]{1,16380}$/.test(slt))
+    )
       return failure("invalid_token", "Enter a valid short-lived IAM code.");
+    const fingerprint = createHash("sha256")
+      .update(JSON.stringify([slot.key || "production", slot.org, slt]))
+      .digest("hex");
+    if (session.loginAttempt?.fingerprint !== fingerprint)
+      session.loginAttempt = { fingerprint, key: id(), started: Date.now() };
+    persist(session);
     const response = await upstream(
       "/api/v1/auth/login",
       { ...slot, org: undefined },
@@ -114,13 +323,16 @@ export function createGateway({
       {
         slt,
       },
+      { "idempotency-key": session.loginAttempt.key },
     );
     if (!response.ok) return response;
-    await tokens(slot, await response.json());
+    tokens(slot, await response.json(), session.loginAttempt.started);
     const me = await upstream("/api/v1/auth/me", slot);
     if (!me.ok) return me;
     slot.user = await me.json();
+    if (!identity(slot.user)) throw new Error("Invalid account response");
     slot.org = slot.user.org_id;
+    delete session.loginAttempt;
     return null;
   }
   const snapshot = (s) => ({
@@ -133,8 +345,8 @@ export function createGateway({
     testAvailable: !!s.test?.key,
     context: s.context,
   });
-  return async function handle(request) {
-    let sessionId, session;
+  const handle = async function handle(request) {
+    let sessionId, session, releaseChange, changing;
     const finish = (response) => {
       const headers = new Headers(response.headers);
       // fetch has already decoded the body. Never forward transport framing or
@@ -155,10 +367,11 @@ export function createGateway({
       headers.set("cache-control", "no-store");
       headers.set("referrer-policy", "no-referrer");
       headers.set("x-content-type-options", "nosniff");
+      if (session) persist(session);
       if (sessionId)
         headers.set(
           "set-cookie",
-          `${cookieName}=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400${secure ? "; Secure" : ""}`,
+          `${cookieName}=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.max(0, Math.floor(Math.min(COOKIE_TTL_MS, session.until - Date.now()) / 1000))}${secure ? "; Secure" : ""}`,
         );
       return new Response(response.body, { status: response.status, headers });
     };
@@ -177,7 +390,10 @@ export function createGateway({
           ),
         );
       for (const [key, s] of sessions)
-        if (s.until < Date.now()) sessions.delete(key);
+        if (s.until < Date.now()) {
+          store?.delete(key);
+          sessions.delete(key);
+        }
       sessionId = request.headers
         .get("cookie")
         ?.split(";")
@@ -204,6 +420,7 @@ export function createGateway({
           return finish(failure("busy", "Please try again shortly.", 503));
         sessionId = id();
         session = {
+          id: sessionId,
           context: id(),
           active: "production",
           production: { org: "tos" },
@@ -211,7 +428,18 @@ export function createGateway({
         };
         sessions.set(sessionId, session);
       }
-      session.until = Date.now() + 86400_000;
+      // Serialize account/environment changes; resource calls retain their bound slot.
+      if (
+        path.startsWith("/auth/") ||
+        (path.startsWith("/api/session/") && request.method !== "GET")
+      ) {
+        const previous = session.changing;
+        changing = new Promise((resolve) => {
+          releaseChange = resolve;
+        });
+        session.changing = changing;
+        if (previous) await previous;
+      }
       const guarded =
         path.startsWith("/api/v1/") ||
         (path.startsWith("/api/session/") && request.method !== "GET");
@@ -247,13 +475,28 @@ export function createGateway({
       if (path === "/api/session" && request.method === "GET") {
         const slot = session[session.active];
         if (slot?.access) {
-          const me = await authorized("/api/v1/auth/me", slot);
-          if (me.status === 401) {
-            delete slot.access;
-            delete slot.refresh;
-            delete slot.user;
-          } else if (!me.ok) return finish(me);
-          else slot.user = await me.json();
+          const me = await authorized("/api/v1/auth/me", session, slot);
+          if (!me.ok && slot.refresh) return finish(me);
+          else if (!me.ok && me.status !== 401) return finish(me);
+          else if (me.ok) {
+            const user = await me.json();
+            if (
+              !identity(user) ||
+              (slot.user &&
+                (user.public_id !== slot.user.public_id ||
+                  user.actor_type !== slot.user.actor_type))
+            ) {
+              clearSlot(slot);
+              return finish(
+                failure(
+                  "identity_mismatch",
+                  "Sign in again to verify your account.",
+                  401,
+                ),
+              );
+            }
+            slot.user = user;
+          }
         }
         return finish(json(snapshot(session)));
       }
@@ -283,13 +526,22 @@ export function createGateway({
           error = "Sign-in expired. Please start again.";
         else {
           const slot = {};
-          const failed = await login(slot, url.searchParams.get("slt"));
+          const failed = await login(
+            session,
+            slot,
+            url.searchParams.get("slt"),
+          );
           if (failed)
             error = "IAM could not finish sign-in. Please try a fresh code.";
           else {
-            session.production = slot;
-            session.active = "production";
-            session.context = id();
+            const previous = session.production;
+            updateSession(session, {
+              production: slot,
+              until: Date.now() + SESSION_TTL_MS,
+              active: "production",
+              context: id(),
+            });
+            if (previous) previous.revoked = true;
           }
         }
         const destination = new URL("/", origin);
@@ -302,14 +554,21 @@ export function createGateway({
           return finish(
             failure("invalid_organization", "Enter an organization handle."),
           );
-        const slot = { ...session[session.active], org };
-        delete slot.access;
-        delete slot.refresh;
-        delete slot.user;
-        const failed = await login(slot, body.slt);
+        const previous = session[session.active];
+        const slot = {
+          org,
+          ...(previous?.key
+            ? { key: previous.key, environment: previous.environment }
+            : {}),
+        };
+        const failed = await login(session, slot, body.slt);
         if (failed) return finish(failed);
-        session[session.active] = slot;
-        session.context = id();
+        updateSession(session, {
+          [session.active]: slot,
+          until: Date.now() + SESSION_TTL_MS,
+          context: id(),
+        });
+        if (previous) previous.revoked = true;
         return finish(json(snapshot(session)));
       }
       if (path === "/api/session/environment" && request.method === "POST") {
@@ -324,9 +583,14 @@ export function createGateway({
         const response = await upstream("/api/v1/testing-environment", slot);
         if (!response.ok) return finish(response);
         slot.environment = await response.json();
-        session.test = slot;
-        session.active = "test";
-        session.context = id();
+        const previous = session.test;
+        updateSession(session, {
+          test: slot,
+          until: Date.now() + SESSION_TTL_MS,
+          active: "test",
+          context: id(),
+        });
+        if (previous) previous.revoked = true;
         return finish(json(snapshot(session)));
       }
       if (path === "/api/session/switch" && request.method === "POST") {
@@ -340,12 +604,11 @@ export function createGateway({
               "Connect a test environment first.",
             ),
           );
-        session.active = body.plane;
-        session.context = id();
+        updateSession(session, { active: body.plane, context: id() });
         return finish(json(snapshot(session)));
       }
       if (path === "/api/session/refresh" && request.method === "POST") {
-        if (!(await refresh(session[session.active])))
+        if (!(await refresh(session, session[session.active])))
           return finish(
             failure(
               "sign_in_required",
@@ -357,17 +620,25 @@ export function createGateway({
       }
       if (path === "/api/session/logout" && request.method === "POST") {
         const slot = session[session.active];
+        updateSession(session, {
+          ...(session.active === "test"
+            ? { test: undefined, active: "production" }
+            : { production: { org: slot?.org || "tos" } }),
+          context: id(),
+          pending: undefined,
+          loginAttempt: undefined,
+        });
+        if (slot) slot.revoked = true;
         if (slot?.refresh) {
-          const result = await upstream("/api/v1/auth/logout", slot, "POST", {
-            token: slot.refresh,
-          });
-          if (!result.ok && result.status !== 401) return finish(result);
+          // Local logout is durable even when remote revocation is unavailable.
+          await upstream(
+            "/api/v1/auth/logout",
+            slot,
+            "POST",
+            { token: slot.refresh },
+            { "idempotency-key": id() },
+          ).catch(() => {});
         }
-        if (session.active === "test") {
-          delete session.test;
-          session.active = "production";
-        } else session.production = { org: slot?.org || "tos" };
-        session.context = id();
         return finish(json(snapshot(session)));
       }
       if (
@@ -382,9 +653,11 @@ export function createGateway({
       const slot = session[session.active];
       const isPublic =
         path.startsWith("/health/") || path === "/api/v1/capabilities";
-      const rootOnly =
-        path === "/api/v1/testing-environment";
-      if (path === "/api/v1/testing-environment/clean" && !slot?.key) return finish(failure("test_environment_required","Select a sandbox first.",400));
+      const rootOnly = path === "/api/v1/testing-environment";
+      if (path === "/api/v1/testing-environment/clean" && !slot?.key)
+        return finish(
+          failure("test_environment_required", "Select a sandbox first.", 400),
+        );
       if (!isPublic && !rootOnly && !slot?.access)
         return finish(
           failure(
@@ -405,6 +678,7 @@ export function createGateway({
         if (request.headers.has(name)) extra[name] = request.headers.get(name);
       const response = await authorized(
         path + url.search,
+        session,
         isPublic ? undefined : slot,
         request.method,
         body,
@@ -423,7 +697,8 @@ export function createGateway({
       return finish(
         new Response(response.body, { status: response.status, headers }),
       );
-    } catch {
+    } catch (error) {
+      if (error instanceof UpstreamFailure) return finish(error.response);
       return finish(
         failure(
           "upstream_unavailable",
@@ -431,6 +706,13 @@ export function createGateway({
           502,
         ),
       );
+    } finally {
+      if (releaseChange) {
+        if (session.changing === changing) delete session.changing;
+        releaseChange();
+      }
     }
   };
+  handle.close = () => store?.close();
+  return handle;
 }

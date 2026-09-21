@@ -99,3 +99,17 @@ safe for old IAM. Caddy, PostgreSQL, Interface and frontend containers are untou
 Run `test_canonical_upgrade.py` for pause/restore ordering and
 `scripts/test-iam-canonical-migration.py --database-url ...` for PostgreSQL checks
 of atomic rollback, SQLx checksum validation and exact replay.
+
+## Frontend sessions
+
+`install-frontend.py --image <immutable Waveform ECR digest>` updates only the existing
+`waveform-frontend.service` container and performs a local `/api/session` readiness
+check. It does not invoke the Docker API installer or change the native API, Caddy,
+PostgreSQL or Interface. It preserves `/var/lib/waveform/frontend-sessions` on the
+host, owned by UID/GID 1000 with mode 0700, and mounts it at
+`/var/lib/waveform/sessions` with `WAVEFORM_SESSION_DIRECTORY` set. The runtime
+creates private `session.key` and `sessions.sqlite` files there; preserve them
+together. The old frontend unit is backed up and restored if readiness fails.
+The first upgrade from a memory-only frontend requires one new sign-in; subsequent
+container replacements preserve login. Back up the directory only while stopped,
+and never restore an older token snapshot over newer active rotations.
