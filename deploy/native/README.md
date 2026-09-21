@@ -78,3 +78,24 @@ Run `python3 deploy/native/test_upgrade.py` for local checks, including simulate
 public-readiness failure and restoration of the prior release and private files.
 The initial `install.py` and legacy Docker installer continue to refuse an
 already-native host.
+
+## IAM 3 identity cutover
+
+For migration 0013 use `canonical_upgrade.py` beside the pinned `upgrade.py`,
+with the same archive, checksum, source revision and backup bucket arguments,
+plus `--identity-map`, `--migration` and `--importer` paths. Supply the private
+refreshed IAM export, exact `migrations/0013_canonical_actor_keys.sql` from the
+runtime source, and `scripts/import-iam-identities.py` from this deployment.
+
+This bounded upgrade requires the old IAM contract while rollback is possible.
+It verifies application authentication, stops only Waveform API, creates and
+verifies a local/encrypted remote backup, then applies migration 0013 and the
+private actor bindings in one transaction before starting the new API. It records
+the exact SQLx migration checksum and retains all existing account rows and
+provider ciphertext. Runtime configuration is unchanged. Failure restores the old
+native release; the additive schema and imported private keys may remain and are
+safe for old IAM. Caddy, PostgreSQL, Interface and frontend containers are untouched.
+
+Run `test_canonical_upgrade.py` for pause/restore ordering and
+`scripts/test-iam-canonical-migration.py --database-url ...` for PostgreSQL checks
+of atomic rollback, SQLx checksum validation and exact replay.
