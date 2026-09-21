@@ -506,6 +506,15 @@ async fn refresh_session(
 ) -> Result<Session, silicon_waveform_client::Error> {
     use silicon_waveform_client::Error;
     let _lock = session_lock(path).await.map_err(Error::Invalid)?;
+    refresh_session_locked(client, path, force).await
+}
+
+async fn refresh_session_locked(
+    client: &Client,
+    path: &std::path::Path,
+    force: bool,
+) -> Result<Session, silicon_waveform_client::Error> {
+    use silicon_waveform_client::Error;
     let mut session = read_session(path).ok_or_else(|| Error::Invalid("not logged in for this server and environment; run waveform login with the same --url and --test options".to_owned()))?;
     if !force
         && session.expires_at > now().saturating_add(60)
@@ -548,11 +557,34 @@ fn saved_tokens(
     Ok(value)
 }
 
+/// Verify under the same lock as rotation, so concurrent login/logout cannot
+/// transfer queued work to another saved session. Never replay a user command.
+async fn verified_session(
+    client: &Client,
+    path: &std::path::Path,
+) -> Result<(Client, silicon_waveform_client::LoginStatus), silicon_waveform_client::Error> {
+    use silicon_waveform_client::Error;
+    let _lock = session_lock(path).await.map_err(Error::Invalid)?;
+    let session = refresh_session_locked(client, path, false).await?;
+    let selected = client.with_bearer(session.access_token);
+    let status = selected.login_status().await?;
+    if status.authenticated || session.refresh_token.is_none() {
+        return Ok((selected, status));
+    }
+    let session = refresh_session_locked(client, path, true).await?;
+    let selected = client.with_bearer(session.access_token);
+    let status = selected.login_status().await?;
+    Ok((selected, status))
+}
+
 async fn bearer(client: &Client, path: &std::path::Path) -> Result<Client, String> {
-    let session = refresh_session(client, path, false)
+    let (selected, status) = verified_session(client, path)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(client.with_bearer(session.access_token))
+    if !status.authenticated {
+        return Err("session was rejected; run waveform login".into());
+    }
+    Ok(selected)
 }
 fn list_arg(value: Option<String>) -> Option<Vec<String>> {
     value.map(|s| {
@@ -999,17 +1031,16 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             command: Some(LoginCommand::Status),
             ..
         } => {
-            let selected = match read_session(&session_file) {
-                Some(_) => match refresh_session(&client, &session_file, false).await {
-                    Ok(session) => client.with_bearer(session.access_token),
+            let status = match read_session(&session_file) {
+                Some(_) => match verified_session(&client, &session_file).await {
+                    Ok((_, status)) => status,
                     Err(silicon_waveform_client::Error::Api {
                         status: 401 | 403, ..
-                    }) => client,
+                    }) => silicon_waveform_client::LoginStatus::default(),
                     Err(error) => return Err(error.to_string()),
                 },
-                None => client,
+                None => silicon_waveform_client::LoginStatus::default(),
             };
-            let status = selected.login_status().await.map_err(|e| e.to_string())?;
             if args.json {
                 print_json(&status)?;
             } else if let Some(actor) = status.actor {

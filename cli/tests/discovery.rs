@@ -196,6 +196,14 @@ async fn status_distinguishes_rejected_tokens_from_server_failure() {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"error":{"code":"invalid_grant"}})),
+            )
+            .expect(if code == 503 { 0 } else { 1 })
+            .mount(&server)
+            .await;
         let result = home
             .run(&server.uri(), &["login", "status", "--json"])
             .await;
@@ -489,4 +497,60 @@ async fn delayed_refresh_replay_is_rotated_again_before_status() {
     let saved: Value = serde_json::from_slice(&fs::read(session_path).unwrap()).unwrap();
     assert_eq!(saved["refresh_token"], "ort_fresh");
     assert!(saved["refresh_started_at"].is_null());
+}
+
+#[tokio::test]
+async fn rejected_access_refreshes_before_local_expiry_and_persists_successor() {
+    let home = Home::new();
+    let server = MockServer::start().await;
+    login(&home, &server, &[]).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/me"))
+        .and(header("authorization", "Bearer oat_private"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_json(json!({"error":{"code":"unauthenticated"}})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/auth/refresh"))
+        .and(body_json(json!({"refresh_token":"ort_private"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token":"oat_new", "refresh_token":"ort_new", "expires_in":1800,
+            "token_type":"Bearer", "scope":"", "actor":{"type":"carbon","public_id":"12345678"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/me"))
+        .and(header("authorization", "Bearer oat_new"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(authority("carbon")))
+        .expect(2)
+        .mount(&server)
+        .await;
+    for _ in 0..2 {
+        assert_eq!(
+            output_json(
+                home.run(&server.uri(), &["login", "status", "--json"])
+                    .await
+            )["authenticated"],
+            true
+        );
+    }
+    let saved = fs::read_dir(home.0.join(".waveform/dir"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("session-")
+                && path.extension().is_some_and(|ext| ext == "json")
+        })
+        .unwrap();
+    let saved: Value = serde_json::from_slice(&fs::read(saved).unwrap()).unwrap();
+    assert_eq!(saved["refresh_token"], "ort_new");
 }
