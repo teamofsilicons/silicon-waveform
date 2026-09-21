@@ -1,0 +1,46 @@
+name: Verify Linux CLI on Amazon Linux 2023
+on:
+  workflow_dispatch:
+    inputs:
+      release_run:
+        description: Successful native binary workflow run
+        required: true
+        type: string
+      source_revision:
+        description: Expected full source revision of the artifacts
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  native-baseline:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            artifact: linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Verify artifact source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_RUN: ${{ inputs.release_run }}
+          SOURCE: ${{ inputs.source_revision }}
+        run: |
+          test "$(gh api "repos/$REPO/actions/runs/$RELEASE_RUN" --jq .head_sha)" = "$SOURCE"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: smoke
+          run-id: ${{ inputs.release_run }}
+          github-token: ${{ github.token }}
+      - name: Run exact artifact with the production Linux baseline
+        run: |
+          chmod +x smoke/waveform
+          docker run --rm --read-only --tmpfs /tmp:rw -e SILICON_HOME=/tmp -e WAVEFORM_AUTO_UPDATE=false \
+            -v "$PWD/smoke/waveform:/opt/waveform:ro" public.ecr.aws/amazonlinux/amazonlinux:2023 \
+            sh -c 'ldd --version | head -1; /opt/waveform --version; /opt/waveform iam --json'
