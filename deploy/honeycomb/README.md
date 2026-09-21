@@ -13,24 +13,25 @@ protected `~/.config/silicon/waveform/` directory for the later service rollout.
 
 ## Current published release
 
-Version **0.2.0** is public as of September 20, 2026. The application remains
-active at configuration revision 1; its earlier publication request is approved
-and published. The new release did not change permissions or app configuration.
+Version **0.3.1** is public as of September 21, 2026. The application remains
+active and public at configuration revision 1. This release preserves its
+permissions and application configuration.
 
-- Release ID: `d47400ab-4ab3-4e59-afef-e569c3946b68`
-- Archive size: 24,357,252 bytes
-- SHA-256: `7604e2e73b512e526846fdb1c89c9236b1517bd9017fbb3b4f121f26c3f5790a`
+- Release ID: `74f98b5d-9cbc-42f3-82d0-70542eb79b38`
+- Archive size: 24,578,414 bytes
+- SHA-256: `04e5e4db376a16b4b6f10fdc8a61628518b7be87b0b2a16c3561dec9b3545143`
 - Targets: Linux, Windows and macOS, each on x86_64 and aarch64
-- [Validated build artifacts](https://github.com/teamofsilicons/silicon-waveform/actions/runs/35522041395)
-- [GitHub release](https://github.com/teamofsilicons/silicon-waveform/releases/tag/v0.2.0)
+- [Validated builds](https://github.com/teamofsilicons/silicon-waveform/actions/runs/35581460319)
+- [GitHub release](https://github.com/teamofsilicons/silicon-waveform/releases/tag/v0.3.1)
 
-A fresh signed-out Honeycomb home installed the latest public release with an
-alias. Its native macOS ARM64 executable reported `waveform 0.2.0`, exposed the
-new controls/BYOK flags, and read the deployed API's compatible contract.
+Both Linux targets are static musl binaries. They were executed on Amazon Linux
+2023 with GLIBC 2.34 before publication. Use 0.3.1 instead of the GNU Linux CLI
+binaries in 0.3.0, which require GLIBC 2.39. The native backend remains 0.3.0 and
+was already static.
 
-The backend and website are deployed. Both `silicon-waveform-client` and
-`waveform-cli` 0.2.0 are published on crates.io. See
-[production verification](../../docs/deployment-verification-2026-09-20.md).
+A fresh signed-out Honeycomb home installed 0.3.1 successfully. Maharaj's existing
+installation was updated without a new login. Rust client 0.3.0 and CLI 0.3.1
+are published on crates.io. See [production verification](../../docs/deployment-verification-2026-09-21.md).
 
 ```sh
 honeycomb install 'tos>waveform'
