@@ -533,7 +533,19 @@ impl ControlError {
     }
     fn iam(error: silicon_iam_client::Error) -> Self {
         match error {
-            silicon_iam_client::Error::Api(api) if api.status == 401 || api.status == 400 => {
+            silicon_iam_client::Error::Api(api) if api.code == "invalid_client" => {
+                Self::unavailable("iam_unavailable")
+            }
+            silicon_iam_client::Error::Api(api)
+                if matches!(api.status, 400 | 401)
+                    && matches!(
+                        api.code.as_str(),
+                        "invalid_grant"
+                            | "refresh_token_reuse"
+                            | "unauthenticated"
+                            | "invalid_token"
+                    ) =>
+            {
                 Self::unauthorized()
             }
             silicon_iam_client::Error::Api(api) if api.status == 403 => Self::forbidden(),

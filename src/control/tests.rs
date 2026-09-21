@@ -1344,3 +1344,26 @@ async fn honeycomb_lifecycle_replays_fences_cleans_and_keeps_tombstones() -> Tes
 }
 #[path = "source_target_tests.rs"]
 mod source_target_tests;
+
+#[test]
+fn provider_failures_do_not_clear_application_sessions() {
+    for (status, code, expected) in [
+        (401, "invalid_client", StatusCode::SERVICE_UNAVAILABLE),
+        (403, "invalid_client", StatusCode::SERVICE_UNAVAILABLE),
+        (400, "invalid_request", StatusCode::SERVICE_UNAVAILABLE),
+        (401, "unknown_auth_failure", StatusCode::SERVICE_UNAVAILABLE),
+        (400, "invalid_grant", StatusCode::UNAUTHORIZED),
+        (401, "invalid_grant", StatusCode::UNAUTHORIZED),
+        (400, "refresh_token_reuse", StatusCode::UNAUTHORIZED),
+        (401, "unauthenticated", StatusCode::UNAUTHORIZED),
+    ] {
+        let error = silicon_iam_client::ApiError {
+            status,
+            code: code.to_owned(),
+            message: "provider response".to_owned(),
+            details: None,
+            request_id: None,
+        };
+        assert_eq!(ControlError::iam(error.into()).status, expected);
+    }
+}
