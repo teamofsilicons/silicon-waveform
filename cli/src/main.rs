@@ -460,6 +460,8 @@ struct Session {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_at: u64,
+    #[serde(default)]
+    refresh_started_at: Option<u64>,
 }
 fn read_session(path: &std::path::Path) -> Option<Session> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
@@ -505,19 +507,37 @@ async fn refresh_session(
     use silicon_waveform_client::Error;
     let _lock = session_lock(path).await.map_err(Error::Invalid)?;
     let mut session = read_session(path).ok_or_else(|| Error::Invalid("not logged in for this server and environment; run waveform login with the same --url and --test options".to_owned()))?;
-    if !force && session.expires_at > now().saturating_add(60) {
+    if !force
+        && session.expires_at > now().saturating_add(60)
+        && session.refresh_started_at.is_none()
+    {
         return Ok(session);
     }
-    let refresh = session.refresh_token.as_ref().ok_or_else(|| {
-        Error::Invalid("session has no refresh token; run waveform login".to_owned())
-    })?;
-    use sha2::{Digest as _, Sha256};
-    let key = format!("waveform-refresh-{:x}", Sha256::digest(refresh.as_bytes()));
-    let tokens = client.refresh_with_key(refresh, &key).await?;
-    let value = saved_tokens(&tokens).map_err(Error::Invalid)?;
-    write_session(path, &value).map_err(Error::Invalid)?;
-    session = serde_json::from_value(value)?;
-    Ok(session)
+    for _ in 0..2 {
+        let started_at = *session.refresh_started_at.get_or_insert_with(now);
+        // Retain all token metadata while recording the start before consuming the token.
+        let mut pending: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).map_err(|e| Error::Invalid(e.to_string()))?)?;
+        pending["refresh_started_at"] = serde_json::json!(started_at);
+        write_session(path, &pending).map_err(Error::Invalid)?;
+        let refresh = session.refresh_token.as_ref().ok_or_else(|| {
+            Error::Invalid("session has no refresh token; run waveform login".to_owned())
+        })?;
+        use sha2::{Digest as _, Sha256};
+        let key = format!("waveform-refresh-{:x}", Sha256::digest(refresh.as_bytes()));
+        let tokens = client.refresh_with_key(refresh, &key).await?;
+        let mut value = saved_tokens(&tokens).map_err(Error::Invalid)?;
+        value["expires_at"] =
+            serde_json::json!(started_at.saturating_add(tokens.expires_in.max(0) as u64));
+        write_session(path, &value).map_err(Error::Invalid)?;
+        session = serde_json::from_value(value)?;
+        if session.expires_at > now().saturating_add(60) {
+            return Ok(session);
+        }
+    }
+    Err(Error::Invalid(
+        "refreshed access token has no usable lifetime; retry the command".into(),
+    ))
 }
 
 fn saved_tokens(
@@ -678,6 +698,10 @@ fn write_session(path: &std::path::Path, value: &serde_json::Value) -> Result<()
     file.sync_all()
         .map_err(|_| "cannot sync session".to_owned())?;
     fs::rename(tmp, path).map_err(|_| "cannot commit session".to_owned())?;
+    #[cfg(unix)]
+    fs::File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "cannot sync session directory".to_owned())?;
     Ok(())
 }
 fn read_slt(value: Option<String>) -> Result<String, String> {

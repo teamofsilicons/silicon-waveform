@@ -430,7 +430,11 @@ async fn failed_refresh_preserves_session_and_retry_key_and_reports_revocation()
             } else {
                 assert!(!output.status.success());
             }
-            assert_eq!(fs::read_to_string(&session_path).unwrap(), original);
+            let retained: Value =
+                serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
+            assert_eq!(retained["access_token"], saved["access_token"]);
+            assert_eq!(retained["refresh_token"], saved["refresh_token"]);
+            assert!(retained["refresh_started_at"].is_u64());
         }
         let requests: Vec<_> = server
             .received_requests()
@@ -444,4 +448,45 @@ async fn failed_refresh_preserves_session_and_retry_key_and_reports_revocation()
             requests[1].headers["idempotency-key"]
         );
     }
+}
+
+#[tokio::test]
+async fn delayed_refresh_replay_is_rotated_again_before_status() {
+    let home = Home::new();
+    let server = MockServer::start().await;
+    login(&home, &server, &[]).await;
+    let session_path = saved_session(&home, &server, None);
+    let mut saved: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
+    saved["expires_at"] = json!(1);
+    saved["refresh_started_at"] = json!(1);
+    fs::write(&session_path, saved.to_string()).unwrap();
+    for (old, new) in [("private", "replayed"), ("replayed", "fresh")] {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/refresh"))
+            .and(body_json(json!({"refresh_token":format!("ort_{old}")})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token":format!("oat_{new}"), "refresh_token":format!("ort_{new}"),
+                "expires_in":1800,"token_type":"Bearer","scope":"",
+                "actor":{"type":"carbon","public_id":"12345678"}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/me"))
+        .and(header("authorization", "Bearer oat_fresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(authority("carbon")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        output_json(
+            home.run(&server.uri(), &["login", "status", "--json"])
+                .await
+        )["authenticated"],
+        true
+    );
+    let saved: Value = serde_json::from_slice(&fs::read(session_path).unwrap()).unwrap();
+    assert_eq!(saved["refresh_token"], "ort_fresh");
+    assert!(saved["refresh_started_at"].is_null());
 }
