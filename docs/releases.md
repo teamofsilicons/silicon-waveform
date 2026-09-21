@@ -44,6 +44,13 @@ refresh the copy in `frontend/public/` used by its isolated Docker build context
 CI rejects stale copies. The docs build copies the root manifest directly.
 Builds and artifact uploads do not roll out services or publish an application.
 
+## 0.3.1 — Portable Linux CLI
+
+CLI and Honeycomb package 0.3.1 use static musl binaries for Linux x86_64 and
+aarch64. The 0.3.0 GNU Linux artifacts require GLIBC 2.39; upgrade those installs
+to 0.3.1. CI rejects a Linux dynamic loader or GLIBC symbol requirement and runs
+each binary on its native architecture. Backend and Rust client remain 0.3.0.
+
 ## 0.3.0 — Canonical IAM identities and session refresh
 
 Backend, Rust client, CLI and Honeycomb package versions are 0.3.0. The public

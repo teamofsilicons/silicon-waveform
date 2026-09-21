@@ -16,11 +16,11 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: linux-x86_64
-            triple: x86_64-unknown-linux-gnu
+            triple: x86_64-unknown-linux-musl
             binary: waveform
           - runner: ubuntu-24.04-arm
             target: linux-aarch64
-            triple: aarch64-unknown-linux-gnu
+            triple: aarch64-unknown-linux-musl
             binary: waveform
           - runner: windows-2025
             target: windows-x86_64
@@ -42,12 +42,20 @@ jobs:
     defaults:
       run:
         working-directory: cli
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.0
           targets: ${{ matrix.triple }}
+      - name: Install static Linux toolchain
+        if: startsWith(matrix.target, 'linux-')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: cli
@@ -56,6 +64,22 @@ jobs:
       - run: cargo test --locked -p waveform-cli --target ${{ matrix.triple }}
       - run: cargo build --release --locked -p waveform-cli --target ${{ matrix.triple }}
       - run: ./target/${{ matrix.triple }}/release/${{ matrix.binary }} --version
+      - name: Reject dynamic Linux linkage
+        if: startsWith(matrix.target, 'linux-')
+        shell: bash
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, struct
+          executable = pathlib.Path('target') / os.environ['TRIPLE'] / 'release/waveform'
+          data = executable.read_bytes()
+          assert data[:6] == b'\x7fELF\x02\x01'
+          offset = struct.unpack_from('<Q', data, 32)[0]
+          size, count = struct.unpack_from('<HH', data, 54)
+          assert all(struct.unpack_from('<I', data, offset + size * index)[0] != 3 for index in range(count)), 'Linux executable requires a dynamic loader'
+          assert b'GLIBC_2.' not in data, 'Linux executable has a GLIBC requirement'
+          PY
       - name: Stage native artifact with its manifest
         shell: bash
         env:
