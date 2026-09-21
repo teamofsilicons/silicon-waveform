@@ -44,6 +44,22 @@ refresh the copy in `frontend/public/` used by its isolated Docker build context
 CI rejects stale copies. The docs build copies the root manifest directly.
 Builds and artifact uploads do not roll out services or publish an application.
 
+## 0.3.0 — Canonical IAM identities and session refresh
+
+Backend, Rust client, CLI and Honeycomb package versions are 0.3.0. The public
+HTTP path remains `/api/v1`. Identity responses and CLI login status expose only
+`public_id` with the actor type; membership IDs are canonical `actor[org]` strings.
+Rust users should replace `LoginActor.principal_id` with `LoginActor.public_id`.
+The CLI refreshes near-expiry sessions before authenticated commands and retains
+saved sessions across temporary refresh failures.
+
+Publish `silicon-waveform-client` before `waveform-cli`, then build and publish all
+six native CLI targets from `v0.3.0`. Upgrade installed 0.2 clients and CLIs before
+switching the backend: their old IAM SDK requires the removed UUID identity fields.
+Version 0.3 accepts old backend responses too, so clients can upgrade first.
+Backend rollout additionally requires the private actor-key import documented in
+`deploy/iam-3-cutover.md`; it preserves preferences, jobs and encrypted provider keys.
+
 ## 0.2.0 — Provider controls and BYOK
 
 Backend, Rust client, CLI and Honeycomb package versions are 0.2.0. The public

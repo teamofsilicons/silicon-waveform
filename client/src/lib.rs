@@ -62,8 +62,6 @@ pub struct IamInfo {
 /// Verified identity of the carbon or silicon using Waveform.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LoginActor {
-    /// Canonical IAM actor ID (the field name is retained for client compatibility).
-    pub principal_id: String,
     /// Carbon or silicon identity type.
     pub actor_type: silicon_iam_client::models::ApplicationAuthorizationActorType,
     /// Public carbon or silicon identifier.
@@ -745,7 +743,6 @@ impl Client {
         Ok(LoginStatus {
             authenticated: true,
             actor: Some(LoginActor {
-                principal_id: authority.public_id.clone().ok_or_else(|| Error::Invalid("IAM did not return an identity".into()))?,
                 actor_type: authority.actor_type.ok_or_else(|| {
                     Error::Invalid("IAM did not identify a Carbon or Silicon".into())
                 })?,

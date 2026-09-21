@@ -45,19 +45,22 @@ fn output_json(output: Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("stdout contains exactly one JSON document")
 }
 fn authority(kind: &str) -> Value {
-    json!({"principal_id":"00000000-0000-0000-0000-000000000001",
-        "actor_type":kind,"public_id":"12345678","organization_id":"00000000-0000-0000-0000-000000000002",
-        "org_id":"tos","membership_id":"00000000-0000-0000-0000-000000000003",
+    json!({"actor_type":kind,"public_id":"12345678","organization_id":"00000000-0000-0000-0000-000000000002",
+        "org_id":"tos","membership_id":"12345678[tos]",
         "membership_version":1,"authorization_epoch":1,"audience":"tos>waveform",
         "testing_environment_id":null,"scopes":[],"org_role":"member","tags":[]})
 }
 async fn login(home: &Home, server: &MockServer, selection: &[&str]) {
-    Mock::given(method("POST")).and(path("/api/v1/auth/login"))
+    Mock::given(method("POST"))
+        .and(path("/api/v1/auth/login"))
         .and(body_json(json!({"slt":"oac_fixture"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token":"oat_private","refresh_token":"ort_private","token_type":"Bearer",
-            "expires_in":1800,"scope":"","actor":{"principal_id":"00000000-0000-0000-0000-000000000001","type":"carbon","public_id":"12345678"}
-        }))).expect(1).mount(server).await;
+            "expires_in":1800,"scope":"","actor":{"type":"carbon","public_id":"12345678"}
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
     let args: Vec<_> = selection
         .iter()
         .copied()
@@ -159,6 +162,7 @@ async fn status_verifies_both_actor_types_and_hides_session_tokens() {
         assert_eq!(value["authenticated"], true);
         assert_eq!(value["actor"]["actor_type"], kind);
         assert_eq!(value["actor"]["public_id"], "12345678");
+        assert!(value["actor"].get("principal_id").is_none());
         assert_eq!(value["org_id"], "tos");
         assert!(!value.to_string().contains("private"));
         let result = home.run(&server.uri(), &["login", "status"]).await;
@@ -364,7 +368,7 @@ async fn legacy_session_refresh_is_automatic_serialized_and_environment_bound() 
             })
             .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(100))
                 .set_body_json(json!({"access_token":"oat_new", "refresh_token":"ort_new", "expires_in":1800,
-                    "token_type":"Bearer", "scope":"self.identity.read", "actor":{"principal_id":"00000000-0000-0000-0000-000000000001","type":"carbon","public_id":"12345678"}})))
+                    "token_type":"Bearer", "scope":"self.identity.read", "actor":{"type":"carbon","public_id":"12345678"}})))
             .expect(1).mount(&server).await;
         Mock::given(method("GET"))
             .and(path("/api/v1/auth/me"))

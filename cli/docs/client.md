@@ -1,6 +1,6 @@
 # Silicon Waveform Rust client
 
-Add the package with `cargo add silicon-waveform-client`. Production clients
+Add the package with `cargo add silicon-waveform-client@0.3`. Production clients
 use `https://backend.waveform.teamofsilicons.com` as their API origin.
 
 `silicon-waveform-client` is stateless. Construct it with `Auth::Anonymous`,
@@ -14,11 +14,14 @@ correctly accepts Waveform's `204 No Content` response.
 It requires no login and honors the selected test environment.
 
 `client.with_bearer(access_token).login_status().await?` returns typed
-`LoginStatus`: `authenticated`, optional `actor` (`principal_id`, `actor_type`,
-`public_id`), `org_id`, and `testing_environment_id`. It verifies the token via
+`LoginStatus`: `authenticated`, optional `actor` (`actor_type`, `public_id`), `org_id`, and `testing_environment_id`. It verifies the token via
 `auth/me`; anonymous clients return false without network access, and HTTP
 401/403 also return false. Other failures remain errors. No tokens are returned
 in status, and it does not refresh or persist them.
+
+Version 0.3 uses the immutable canonical `public_id` for Carbon and Silicon identities.
+There is no separate principal UUID. Upgrade older Waveform clients before the IAM 3
+cutover; version 0.3 also accepts responses from the preceding Waveform backend.
 
 The stateless client does not resolve home directories. The CLI uses
 `SILICON_HOME` as its default home when present, otherwise `~`, with an explicit

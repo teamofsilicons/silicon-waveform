@@ -2,6 +2,8 @@
 
 Waveform uses the published IAM 3 Rust client for server, client and CLI requests. Both current IAM responses with old extra UUID fields and new canonical responses are accepted. Authentication uses the immutable `public_id`; a private Waveform UUID continues to key history, preferences, idempotency and provider-key encryption contexts.
 
+Publish Rust client 0.3.0, then CLI 0.3.0 and all six native Honeycomb targets before changing the backend. Upgrade installed clients first: published 0.2.0 clients use an IAM SDK that requires the removed UUID identity fields. The 0.3.0 client accepts both old and new backend responses, but the new backend does not recreate removed IAM fields.
+
 Before starting this backend, pause API/worker requests, take a database backup, run migration 0013 and import the refreshed private pre-cutover IAM identity export:
 
 ```sh

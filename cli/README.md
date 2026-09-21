@@ -124,7 +124,7 @@ to discover another server.
 `GET /api/v1/auth/me`, then returns:
 
 ```json
-{"authenticated":true,"actor":{"principal_id":"00000000-0000-0000-0000-000000000001","actor_type":"carbon","public_id":"12345678"},"org_id":"tos","testing_environment_id":null}
+{"authenticated":true,"actor":{"actor_type":"carbon","public_id":"12345678"},"org_id":"tos","testing_environment_id":null}
 ```
 
 `actor_type` identifies a `carbon` or `silicon`. With no saved session, or a

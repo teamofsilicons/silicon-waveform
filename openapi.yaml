@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Silicon Waveform API
-  version: 0.2.0
+  version: 0.3.0
   summary: Provider-independent text-to-speech and speech-to-text
   description: |
     Synchronous speech operations for Carbons, Silicons, and IAM applications.
@@ -1099,22 +1099,21 @@ components:
         token: { type: string, minLength: 5, maxLength: 16384, pattern: '^o(at|rt)_[!-~]+$' }
     OAuthTokenResponse:
       type: object
-      required: [access_token, refresh_token, token_type, expires_in, refresh_expires_at, actor, session_id]
+      required: [access_token, refresh_token, token_type, expires_in, scope]
       properties:
         access_token: { type: string }
         refresh_token: { type: string }
         token_type: {}
         expires_in: { type: integer, format: int64 }
-        refresh_expires_at: { type: string, format: date-time }
+        scope: { type: string }
         actor: { $ref: '#/components/schemas/ActorRef' }
-        session_id: { type: string, format: uuid }
+        org_id: { type: string }
     ActorRef:
       type: object
-      required: [principal_id, type, public_id]
+      required: [type, public_id]
       properties:
-        principal_id: { type: string, format: uuid }
         type: { type: string }
-        public_id: { type: string }
+        public_id: { type: string, description: Immutable canonical Carbon or Silicon identity., example: saket }
     IamInfo:
       type: object
       additionalProperties: false
@@ -1128,14 +1127,13 @@ components:
           description: Upstream IAM test environment UUID, or null for production.
     ApplicationAuthorization:
       type: object
-      required: [principal_id, actor_type, public_id, organization_id, org_id, membership_id, membership_version, authorization_epoch, audience, scopes]
+      required: [actor_type, public_id, organization_id, org_id, membership_id, membership_version, authorization_epoch, audience, scopes]
       properties:
-        principal_id: { type: string, format: uuid }
         actor_type: { type: string }
-        public_id: { type: string }
+        public_id: { type: string, description: Immutable canonical Carbon or Silicon identity., example: saket }
         organization_id: { type: string, format: uuid }
         org_id: { type: string }
-        membership_id: { type: string, format: uuid }
+        membership_id: { type: string, description: Canonical actor membership in the selected organization., example: "saket[tos]" }
         membership_version: { type: integer, format: int64 }
         authorization_epoch: { type: integer, format: int64 }
         audience: { type: string }

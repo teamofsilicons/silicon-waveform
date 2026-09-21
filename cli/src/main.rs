@@ -990,13 +990,12 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                 print_json(&status)?;
             } else if let Some(actor) = status.actor {
                 println!(
-                    "Authenticated as {} {} (principal {}), organization {}",
+                    "Authenticated as {} {}, organization {}",
                     serde_json::to_value(actor.actor_type)
                         .map_err(|e| e.to_string())?
                         .as_str()
                         .ok_or("invalid actor type")?,
                     actor.public_id,
-                    actor.principal_id,
                     status.org_id.as_deref().unwrap_or("unknown")
                 );
             } else {
