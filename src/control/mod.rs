@@ -210,17 +210,30 @@ impl ControlState {
         {
             return Err(ControlError::forbidden());
         }
-        self.ensure_voice_default(plane.id, &authority.org_id, authority.principal_id)
+        let storage_actor_id = crate::infrastructure::actor_keys::resolve(
+            &self.pool,
+            plane.id,
+            authority
+                .public_id
+                .as_deref()
+                .ok_or_else(ControlError::forbidden)?,
+        )
+        .await?;
+        self.ensure_voice_default(plane.id, &authority.org_id, storage_actor_id)
             .await?;
         if plane.id.is_nil()
             && let Some(station) = &self.station
         {
-            let enabled: bool = sqlx::query_scalar("SELECT COALESCE((SELECT telemetry_enabled FROM waveform_account_preferences WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3),true)").bind(plane.id).bind(&authority.org_id).bind(authority.principal_id).fetch_one(&self.pool).await?;
+            let enabled: bool = sqlx::query_scalar("SELECT COALESCE((SELECT telemetry_enabled FROM waveform_account_preferences WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3),true)").bind(plane.id).bind(&authority.org_id).bind(storage_actor_id).fetch_one(&self.pool).await?;
             if enabled {
                 crate::telemetry::record(station, "backend", "iam_authorization", true, 0);
             }
         }
-        Ok(Identity { plane, authority })
+        Ok(Identity {
+            storage_actor_id,
+            plane,
+            authority,
+        })
     }
 
     pub(crate) async fn speech_fence(
@@ -317,7 +330,7 @@ impl ControlState {
         let row = sqlx::query("SELECT d.tts_order AS default_tts, d.stt_order AS default_stt, p.tts_order, p.stt_order FROM waveform_provider_defaults d LEFT JOIN waveform_account_preferences p ON p.plane_id=d.plane_id AND p.org_id=$2 AND p.actor_id=$3 WHERE d.plane_id=$1")
             .bind(identity.plane.id)
             .bind(&identity.authority.org_id)
-            .bind(identity.authority.principal_id)
+            .bind(identity.storage_actor_id)
             .fetch_one(&self.pool)
             .await?;
         let default: serde_json::Value = row.try_get(default_column)?;
@@ -344,7 +357,7 @@ impl ControlState {
                 return Err(ControlError::forbidden());
             }
         };
-        let actor_id = ActorId::new(identity.authority.principal_id)
+        let actor_id = ActorId::new(identity.storage_actor_id)
             .map_err(|_| ControlError::unavailable("invalid_actor"))?;
         Ok(AuthorizedActor {
             actor: Actor::new(actor_kind, actor_id),
@@ -380,6 +393,7 @@ struct Plane {
 }
 
 struct Identity {
+    storage_actor_id: Uuid,
     plane: Plane,
     authority: models::ApplicationAuthorization,
 }

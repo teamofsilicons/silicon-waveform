@@ -94,8 +94,11 @@ pub(super) async fn login(
         .await
         .map_err(ControlError::iam)?;
     if let (Some(org), Some(actor)) = (&tokens.org_id, &tokens.actor) {
+        let storage_actor_id =
+            crate::infrastructure::actor_keys::resolve(&state.pool, plane.id, &actor.public_id)
+                .await?;
         state
-            .ensure_voice_default(plane.id, org, actor.principal_id)
+            .ensure_voice_default(plane.id, org, storage_actor_id)
             .await?;
     }
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(tokens)).into_response())

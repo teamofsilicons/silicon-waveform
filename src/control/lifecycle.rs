@@ -250,6 +250,7 @@ async fn finish(state: &ControlState, op: &Instruction) -> Result<Value, Control
             "waveform_jobs",
             "waveform_webhook_events",
             "waveform_account_preferences",
+            "waveform_actor_keys",
             "waveform_provider_keys",
             "waveform_bug_reports",
             "waveform_provider_defaults",

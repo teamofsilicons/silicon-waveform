@@ -45,7 +45,7 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
-silicon-iam-client = "1.8.0"
+silicon-iam-client = "3.0.0"
 sqlx = { version = "0.9.0", default-features = false, features = [
   "json",
   "macros",

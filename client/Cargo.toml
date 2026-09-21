@@ -16,7 +16,7 @@ serde_json="1.0"
 thiserror="2.0"
 url="2.5"
 semver="1.0"
-silicon-iam-client="1.8.0"
+silicon-iam-client = "3.0.0"
 secrecy="0.10"
 uuid={version="1",features=["v4"]}
 tokio={version="1.53",features=["process","time"]}

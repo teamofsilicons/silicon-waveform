@@ -30,7 +30,6 @@ export interface TtsProviderOptions {
   };
 }
 export interface Identity {
-  principal_id: string;
   public_id: string;
   actor_type: string;
   org_id: string;

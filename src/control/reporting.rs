@@ -108,11 +108,11 @@ pub(super) async fn submit(
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,29))")
         .bind(format!(
             "report:{}:{}",
-            identity.plane.id, identity.authority.principal_id
+            identity.plane.id, identity.storage_actor_id
         ))
         .execute(&mut *tx)
         .await?;
-    let old = sqlx::query("SELECT id,payload,status FROM waveform_bug_reports WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3 AND idempotency_key=$4").bind(identity.plane.id).bind(&identity.authority.org_id).bind(identity.authority.principal_id).bind(key).fetch_optional(&mut *tx).await?;
+    let old = sqlx::query("SELECT id,payload,status FROM waveform_bug_reports WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3 AND idempotency_key=$4").bind(identity.plane.id).bind(&identity.authority.org_id).bind(identity.storage_actor_id).bind(key).fetch_optional(&mut *tx).await?;
     let (id, status): (Uuid, String) = if let Some(old) = old {
         if old.get::<Value, _>("payload") != payload {
             return Err(ControlError {
@@ -122,7 +122,7 @@ pub(super) async fn submit(
         }
         (old.get("id"), old.get("status"))
     } else {
-        let count:i64=sqlx::query_scalar("SELECT count(*) FROM waveform_bug_reports WHERE plane_id=$1 AND actor_id=$2 AND created_at>now()-interval '1 hour'").bind(identity.plane.id).bind(identity.authority.principal_id).fetch_one(&mut *tx).await?;
+        let count:i64=sqlx::query_scalar("SELECT count(*) FROM waveform_bug_reports WHERE plane_id=$1 AND actor_id=$2 AND created_at>now()-interval '1 hour'").bind(identity.plane.id).bind(identity.storage_actor_id).fetch_one(&mut *tx).await?;
         if count >= 10 {
             return Err(ControlError {
                 status: StatusCode::TOO_MANY_REQUESTS,
@@ -131,7 +131,7 @@ pub(super) async fn submit(
         }
         let id = Uuid::new_v4();
         let status = if simulated { "simulated" } else { "queued" };
-        sqlx::query("INSERT INTO waveform_bug_reports(id,plane_id,org_id,actor_id,idempotency_key,payload,status) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(id).bind(identity.plane.id).bind(&identity.authority.org_id).bind(identity.authority.principal_id).bind(key).bind(payload).bind(status).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO waveform_bug_reports(id,plane_id,org_id,actor_id,idempotency_key,payload,status) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(id).bind(identity.plane.id).bind(&identity.authority.org_id).bind(identity.storage_actor_id).bind(key).bind(payload).bind(status).execute(&mut *tx).await?;
         (id, status.into())
     };
     tx.commit().await?;

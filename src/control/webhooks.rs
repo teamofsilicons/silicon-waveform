@@ -103,7 +103,7 @@ pub(super) async fn receive(
         .aggregate
         .get("id")
         .and_then(serde_json::Value::as_str)
-        .and_then(|v| v.parse::<Uuid>().ok())
+        .filter(|v| !v.is_empty() && v.len() <= 255)
         .ok_or_else(ControlError::unauthorized)?;
     let aggregate_version = event
         .aggregate

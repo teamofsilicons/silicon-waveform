@@ -962,7 +962,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             print_json(
                 &c.set_telemetry(
                     me["org_id"].as_str().ok_or("IAM organization missing")?,
-                    me["principal_id"].as_str().ok_or("IAM identity missing")?,
+                    me["public_id"].as_str().ok_or("IAM identity missing")?,
                     enabled == "on",
                 )
                 .await

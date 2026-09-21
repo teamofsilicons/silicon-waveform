@@ -71,7 +71,7 @@ pub(super) async fn list(
     let cursor = parse_cursor(filters.cursor.as_deref())?;
     let (cursor_time, cursor_id) = cursor.map_or((None, None), |(time, id)| (Some(time), Some(id)));
     let rows = sqlx::query("SELECT id,operation,status,first_line,duration_ms,provider,error_code,created_at,finished_at,voice_profile FROM waveform_jobs WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3 AND ($4::text IS NULL OR operation=$4) AND ($5::timestamptz IS NULL OR created_at < $5 OR (created_at = $5 AND id < $6)) ORDER BY created_at DESC,id DESC LIMIT $7")
-        .bind(identity.plane.id).bind(identity.authority.org_id).bind(identity.authority.principal_id).bind(filters.operation).bind(cursor_time).bind(cursor_id).bind(limit + 1).fetch_all(&state.pool).await?;
+        .bind(identity.plane.id).bind(identity.authority.org_id).bind(identity.storage_actor_id).bind(filters.operation).bind(cursor_time).bind(cursor_id).bind(limit + 1).fetch_all(&state.pool).await?;
     let page_limit = usize::try_from(limit).unwrap_or(100);
     let has_more = rows.len() > page_limit;
     let rows = rows.into_iter().take(page_limit).collect::<Vec<_>>();
@@ -126,7 +126,7 @@ pub(super) async fn get(
         .bind(job_id)
         .bind(identity.plane.id)
         .bind(identity.authority.org_id)
-        .bind(identity.authority.principal_id)
+        .bind(identity.storage_actor_id)
         .fetch_optional(&state.pool)
         .await?
         .ok_or_else(ControlError::not_found)?;

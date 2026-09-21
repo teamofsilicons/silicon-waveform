@@ -62,7 +62,7 @@ pub struct IamInfo {
 /// Verified identity of the carbon or silicon using Waveform.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LoginActor {
-    /// IAM principal UUID.
+    /// Canonical IAM actor ID (the field name is retained for client compatibility).
     pub principal_id: String,
     /// Carbon or silicon identity type.
     pub actor_type: silicon_iam_client::models::ApplicationAuthorizationActorType,
@@ -745,7 +745,7 @@ impl Client {
         Ok(LoginStatus {
             authenticated: true,
             actor: Some(LoginActor {
-                principal_id: authority.principal_id.to_string(),
+                principal_id: authority.public_id.clone().ok_or_else(|| Error::Invalid("IAM did not return an identity".into()))?,
                 actor_type: authority.actor_type.ok_or_else(|| {
                     Error::Invalid("IAM did not identify a Carbon or Silicon".into())
                 })?,
@@ -771,7 +771,7 @@ impl Client {
         idempotency_key: &str,
     ) -> Result<serde_json::Value> {
         let identity = self.me().await?;
-        self.request(Method::POST, "reports", Some(serde_json::json!({"message":message,"pr":pr,"client_version":env!("CARGO_PKG_VERSION")})), Some((identity["org_id"].as_str().ok_or_else(||Error::Invalid("IAM organization missing".into()))?, identity["principal_id"].as_str().ok_or_else(||Error::Invalid("IAM identity missing".into()))?, idempotency_key))).await
+        self.request(Method::POST, "reports", Some(serde_json::json!({"message":message,"pr":pr,"client_version":env!("CARGO_PKG_VERSION")})), Some((identity["org_id"].as_str().ok_or_else(||Error::Invalid("IAM organization missing".into()))?, identity["public_id"].as_str().ok_or_else(||Error::Invalid("IAM identity missing".into()))?, idempotency_key))).await
     }
     /// Sets the signed-in account's diagnostic opt-out for the selected plane.
     pub async fn set_telemetry(

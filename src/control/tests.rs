@@ -298,7 +298,12 @@ async fn session_retries_preserve_the_iam_receipt_in_both_planes() -> TestResult
                 .ok_or("requests unavailable")?;
             assert_eq!(requests.len(), 2);
             assert_eq!(requests[0].body, requests[1].body);
-            assert_eq!(requests[0].headers, requests[1].headers);
+            // Request tracing may change; the retry receipt and authority must not.
+            let mut first_headers = requests[0].headers.clone();
+            let mut second_headers = requests[1].headers.clone();
+            first_headers.remove("x-request-id");
+            second_headers.remove("x-request-id");
+            assert_eq!(first_headers, second_headers);
             assert_eq!(
                 requests[0]
                     .headers
@@ -325,6 +330,12 @@ async fn login_settings_secrets_webhooks_and_online_revocation() -> TestResult {
     let state = fixture(pool.clone(), &iam)?;
     let app = router(state.clone());
     let actor = Uuid::new_v4();
+    // Pre-cutover import retains the private key and its encryption context.
+    sqlx::query("INSERT INTO waveform_actor_keys VALUES($1,'12345678',$2)")
+        .bind(Uuid::nil())
+        .bind(actor)
+        .execute(&pool)
+        .await?;
     Mock::given(method("POST")).and(path("/api/v1/app-auth/tokens"))
         .and(header("authorization", "Basic dG9zPndhdmVmb3JtOnRlc3QtYXBwLXNlY3JldA=="))
         .and(body_string_contains("slt=oac_fixture"))
@@ -342,7 +353,11 @@ async fn login_settings_secrets_webhooks_and_online_revocation() -> TestResult {
     Mock::given(method("POST"))
         .and(path("/api/v1/oauth/introspect"))
         .and(body_string_contains("token=oat_other"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(snapshot(Uuid::new_v4())))
+        .respond_with(ResponseTemplate::new(200).set_body_json({
+            let mut other = snapshot(Uuid::new_v4());
+            other["authorization"]["public_id"] = json!("different-carbon");
+            other
+        }))
         .mount(&iam)
         .await;
 

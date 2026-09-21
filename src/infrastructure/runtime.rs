@@ -216,7 +216,8 @@ async fn compose_and_serve(
     let iam: Arc<dyn IamPort> = Arc::new(
         IamHttpAdapter::new(&settings.iam)
             .map_err(|_| RuntimeError::IamConfiguration)?
-            .with_storage_audience(&settings.briefcase.audience),
+            .with_storage_audience(&settings.briefcase.audience)
+            .with_identity_store(pool.clone()),
     );
     let briefcase: Arc<dyn BriefcasePort> = Arc::new(
         FailClosedBriefcaseStore::new(&settings.briefcase)

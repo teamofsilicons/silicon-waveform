@@ -26,7 +26,7 @@ pub(super) async fn record(
     }
     let identity = state.identity(&headers).await?;
     if identity.plane.id.is_nil() {
-        let enabled:bool=sqlx::query_scalar("SELECT COALESCE((SELECT telemetry_enabled FROM waveform_account_preferences WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3),true)").bind(Uuid::nil()).bind(&identity.authority.org_id).bind(identity.authority.principal_id).fetch_one(&state.pool).await?;
+        let enabled:bool=sqlx::query_scalar("SELECT COALESCE((SELECT telemetry_enabled FROM waveform_account_preferences WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3),true)").bind(Uuid::nil()).bind(&identity.authority.org_id).bind(identity.storage_actor_id).fetch_one(&state.pool).await?;
         if enabled && let Some(station) = &state.station {
             crate::telemetry::record(
                 station,

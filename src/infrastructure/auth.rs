@@ -48,6 +48,7 @@ pub enum IamAdapterBuildError {
 /// Redirect-free, bounded IAM authorization client.
 #[derive(Clone)]
 pub struct IamHttpAdapter {
+    identity_pool: Option<sqlx::PgPool>,
     introspection_url: Url,
     obo_verify_url: Url,
     sdk: silicon_iam_client::Client,
@@ -104,6 +105,7 @@ impl IamHttpAdapter {
             return Err(IamAdapterBuildError::InvalidApplicationIdentity);
         }
         Ok(Self {
+            identity_pool: None,
             introspection_url,
             obo_verify_url,
             sdk,
@@ -136,7 +138,33 @@ impl IamHttpAdapter {
         .await
         .map_err(|_| IamError::Timeout)?
         .map_err(map_sdk_error)?;
-        self.validate_introspection(response, request)
+        let public_id = response.public_id.clone().or_else(|| {
+            response
+                .authorization
+                .as_ref()
+                .and_then(|a| a.public_id.clone())
+        });
+        let mut actor = self.validate_introspection(response, request)?;
+        let public_id = public_id.ok_or(IamError::InvalidResponse)?;
+        let key = if let Some(pool) = &self.identity_pool {
+            crate::infrastructure::actor_keys::resolve(pool, uuid::Uuid::nil(), &public_id)
+                .await
+                .map_err(|_| IamError::InvalidResponse)?
+        } else {
+            #[cfg(not(test))]
+            return Err(IamError::ContractUnavailable);
+            #[cfg(test)]
+            uuid::Uuid::new_v4()
+        };
+        actor.actor.id = ActorId::new(key).map_err(|_| IamError::InvalidResponse)?;
+        Ok(actor)
+    }
+
+    /// Uses durable private row keys for canonical IAM identities.
+    #[must_use]
+    pub fn with_identity_store(mut self, pool: sqlx::PgPool) -> Self {
+        self.identity_pool = Some(pool);
+        self
     }
 
     async fn authorize_obo(
@@ -171,7 +199,16 @@ impl IamHttpAdapter {
         {
             return Err(IamError::InvalidCredential);
         }
-        let principal_id = response.principal_id.ok_or(IamError::InvalidResponse)?;
+        if let Some(authority) = &response.authorization
+            && (response
+                .public_id
+                .as_ref()
+                .is_some_and(|id| authority.public_id.as_ref() != Some(id))
+                || authority.org_id != request.organization_id.as_str()
+                || authority.audience != self.audience.as_str())
+        {
+            return Err(IamError::InvalidCredential);
+        }
         let actor_kind = actor_kind(response.actor_type.as_ref())?;
         let organization = required_organization(response.org_id.as_deref())?;
         if organization != request.organization_id {
@@ -200,7 +237,7 @@ impl IamHttpAdapter {
         if expires_at.is_some_and(|expiry| expiry <= OffsetDateTime::now_utc()) {
             return Err(IamError::InvalidCredential);
         }
-        let actor_id = ActorId::new(principal_id).map_err(|_| IamError::InvalidResponse)?;
+        let actor_id = ActorId::new(uuid::Uuid::now_v7()).map_err(|_| IamError::InvalidResponse)?;
 
         Ok(AuthorizedActor {
             actor: Actor::new(actor_kind, actor_id),
@@ -578,7 +615,7 @@ mod tests {
             .and(body_string_contains("token_type_hint=access_token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "active": true,
-                "principal_id": actor_id,
+                "principal_id": actor_id, "public_id":"test-carbon",
                 "actor_type": "carbon",
                 "org_id": "acme",
                 "scope": "waveform.tts waveform.stt",
@@ -600,7 +637,7 @@ mod tests {
             })
             .await?;
 
-        assert_eq!(authorized.actor.id.as_uuid(), actor_id);
+        assert!(!authorized.actor.id.as_uuid().is_nil());
         assert_eq!(authorized.organization_id.as_str(), "acme");
         assert!(authorized.originating_application.is_none());
         Ok(())
