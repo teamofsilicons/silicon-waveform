@@ -88,3 +88,27 @@ local links, navigation anchors and canonical URLs passed checks. Vercel deploym
 `https://docs.waveform.teamofsilicons.com`. Public release notes and the 0.3.2
 manifest were verified. The downloadable source archive matches SHA-256
 `3fa81cb6f73768a047e9f1d9762c454d412e5fb952e34b993d93c6db00e4f9b6`.
+
+## Final CLI recovery patch
+
+CLI 0.3.3 supersedes 0.3.2 from source
+`c475f0e771fe7cf1de69f4df727313e5f71fd35d`. It verifies stored access under the
+session lock and performs one durable refresh if access is rejected before local
+expiry, then executes the command once. All 23 CLI tests and Clippy passed;
+[all six native jobs and package validation](https://github.com/teamofsilicons/silicon-waveform/actions/runs/35666095608)
+and the exact-source CI passed.
+
+[GitHub v0.3.3](https://github.com/teamofsilicons/silicon-waveform/releases/tag/v0.3.3)
+and Honeycomb release `ba361498-2384-4c29-a3ff-71695613fb3e` expose the same
+24,653,631-byte archive, SHA-256
+`28efc10aa8c36b5db5c27ee6452f2a4f419eb81f36995c5e39e34e3ece696a47`.
+All four GitHub assets were anonymously downloaded and compared with local bytes.
+The package was created with the current Honeycomb 0.3.2 packager from the exact
+six CI binaries. The static Linux binaries have no GLIBC dependency. The
+`waveform-cli 0.3.3` registry archive exactly matches the locally verified crate.
+
+A new anonymous Honeycomb install reports 0.3.3 and remains signed out. Its native
+ARM payload hash is `e7ea7d586df20d196a413ac65b468df151c0578f10cc09770e54caceb6bf2df3`.
+Maharaj was updated through Honeycomb to 0.3.3. The existing backend 0.3.1 and
+durable browser gateway remain the deployed images described above; this final
+patch changes the CLI only.
