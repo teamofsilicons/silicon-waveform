@@ -88,3 +88,37 @@ local links, navigation anchors and canonical URLs passed checks. Vercel deploym
 `https://docs.waveform.teamofsilicons.com`. Public release notes and the 0.3.2
 manifest were verified. The downloadable source archive matches SHA-256
 `3fa81cb6f73768a047e9f1d9762c454d412e5fb952e34b993d93c6db00e4f9b6`.
+
+## Final CLI follow-up: 0.3.3
+
+Source `c475f0e771fe7cf1de69f4df727313e5f71fd35d` adds saved-access validation and
+locked recovery on early authentication rejection. Backend 0.3.1, frontend 0.3.2
+and client 0.3.0 remain unchanged. All 23 CLI tests and Clippy passed, including
+future-expiry 401 recovery and credential retention after a 503. Source CI and
+[all six native targets plus package validation](https://github.com/teamofsilicons/silicon-waveform/actions/runs/35666095608)
+passed. Both Linux payloads are static musl binaries without a dynamic loader or
+GLIBC symbol dependency.
+
+[GitHub v0.3.3](https://github.com/teamofsilicons/silicon-waveform/releases/tag/v0.3.3)
+contains four assets, all anonymously downloaded and matched against the release
+artifacts. The official Honeycomb 0.3.2 operator packed the exact six CI binaries.
+The 24,653,631-byte catalog archive has SHA-256
+`28efc10aa8c36b5db5c27ee6452f2a4f419eb81f36995c5e39e34e3ece696a47`.
+Honeycomb release `ba361498-2384-4c29-a3ff-71695613fb3e` is accepted and public.
+The `waveform-cli 0.3.3` crate is published; downloaded bytes match SHA-256
+`9eef7bc2dd5cfb8f4d31bee26168f498d03e4498ce4f1855e8db29967c0b6d24`.
+
+A fresh anonymous install executed 0.3.3 and correctly reported signed out. Its
+native macOS ARM binary hash is
+`e7ea7d586df20d196a413ac65b468df151c0578f10cc09770e54caceb6bf2df3`.
+Maharaj's supported package update from 0.3.2 to 0.3.3 completed. The earlier saved
+login and two-job retention proof is recorded above; the final 0.3.3 retained-login
+recheck timed out because macOS file opens under Documents block before state can
+be read. No saved credentials were deleted or replaced to work around this.
+
+The 29-page documentation build and link checks passed. Vercel deployment
+`silicon-waveform-docs-c5batuyhg-saketdev12-5675s-projects.vercel.app` is aliased to
+`https://docs.waveform.teamofsilicons.com`. Public release notes and manifest both
+returned 200 and identified 0.3.3. This appendix was reconstructed in a clean
+checkout while the original local documentation commit was inaccessible; reconcile
+the original checkout after macOS file access recovers.
