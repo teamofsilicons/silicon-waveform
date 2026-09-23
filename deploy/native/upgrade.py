@@ -150,7 +150,7 @@ def stage(archive, release, revision):
                     destination.chmod(0o755 if member.mode & 0o111 else 0o644)
         manifest = json.loads((release / "build.json").read_text())
         require(manifest.get("source_revision") == revision, "Bundle source revision mismatch")
-        require(manifest.get("app_id") == "tos>waveform"
+        require(manifest.get("app_id") == "waveform"
                 and manifest.get("architecture") == "aarch64"
                 and manifest.get("backend_linkage") == "static-musl", "Unsupported bundle identity")
         expected = set()
@@ -212,7 +212,7 @@ def upgrade(args):
     require(env_path.is_file() and not env_path.is_symlink(), "A regular native.env is required")
     require(unit.is_file() and not unit.is_symlink(), "A regular native service unit is required")
     old_env = env_path.read_bytes()
-    require(env_value(old_env, "WAVEFORM_IAM_APP_ID") == "tos>waveform", "Unexpected native app identity")
+    require(env_value(old_env, "WAVEFORM_IAM_APP_ID") == "waveform", "Unexpected native app identity")
     bind = env_value(old_env, "WAVEFORM_BIND_ADDR")
     require(bind and bind.count(":") == 1, "An explicit private IPv4 bind is required")
     host, port = bind.rsplit(":", 1)

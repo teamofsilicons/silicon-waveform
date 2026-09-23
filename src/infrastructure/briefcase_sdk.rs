@@ -145,7 +145,7 @@ mod tests {
         let storage = MockServer::start().await;
         let delegated = crate::domain::auth::DelegatedAuthorization {
             testing_secret: None,
-            application_id: "tos>waveform".parse()?,
+            application_id: "waveform".parse()?,
             proof: crate::domain::auth::OboProof::new("obo_test_proof".to_owned())?,
             purpose: crate::domain::auth::DelegationPurpose::StoreGeneratedAudio,
             expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(1),
@@ -164,17 +164,17 @@ mod tests {
                 "service":"silicon-briefcase", "selected_api_version":"v1", "supported_api_versions":["v1"], "contract_version":"1.0.0", "build":"local-test", "operations":operations
             }))).expect(1).mount(&storage).await;
         Mock::given(method("POST")).and(path("/api/v1/obo/files"))
-            .and(header("x-app-id","tos>waveform")).and(header("x-iam-obo-access-proof","obo_test_proof"))
+            .and(header("x-app-id","waveform")).and(header("x-iam-obo-access-proof","obo_test_proof"))
             .and(body_bytes(audio.bytes().to_vec()))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-                "id":Uuid::new_v4(),"org_id":"tos","type":"file","visibility":"full","name":filename.as_str(),"path":format!("private/actor/apps/tos>waveform/{}",filename.as_str()),"root_type":"private","content_type":"audio/mpeg","size":audio.bytes().len(),"permanent_url":format!("{}/files/audio.mp3",storage.uri()),"origin_app_id":"tos>waveform","effective_access":["read"],"created_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z","deleted_at":null
+                "id":Uuid::new_v4(),"org_id":"tos","type":"file","visibility":"full","name":filename.as_str(),"path":format!("private/actor/apps/waveform/{}",filename.as_str()),"root_type":"private","content_type":"audio/mpeg","size":audio.bytes().len(),"permanent_url":format!("{}/files/audio.mp3",storage.uri()),"origin_app_id":"waveform","effective_access":["read"],"created_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z","deleted_at":null
             }))).expect(1).mount(&storage).await;
         let settings = BriefcaseSettings {
             base_url: storage.uri().parse()?,
             permanent_origin: storage.uri().parse()?,
             cdn_origin: storage.uri().parse()?,
-            app_id: "tos>waveform".to_owned(),
-            audience: "tos>briefcase".to_owned(),
+            app_id: "waveform".to_owned(),
+            audience: "briefcase".to_owned(),
             timeout: Duration::from_secs(5),
             download_timeout: Duration::from_secs(5),
             max_download_bytes: 1_000_000,
@@ -182,7 +182,7 @@ mod tests {
         let result = BriefcaseSdkUploader::new(settings)
             .upload(AudioUpload {
                 delegated_authorization: &delegated,
-                app_id: "tos>waveform",
+                app_id: "waveform",
                 organization: "tos",
                 environment: None,
                 filename: &filename,

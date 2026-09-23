@@ -62,13 +62,13 @@ env.update({
     'WAVEFORM_DATABASE_URL': 'postgres://waveform:' + urllib.parse.quote(secret['WAVEFORM_POSTGRES_PASSWORD'], safe='') + '@postgres/waveform?sslmode=verify-full&sslrootcert=/etc/waveform/db-ca.crt',
     'WAVEFORM_DATABASE_MAX_CONNECTIONS': '8',
     'WAVEFORM_IAM_BASE_URL': 'https://backend.iam.teamofsilicons.com',
-    'WAVEFORM_IAM_APP_ID': 'tos>waveform',
-    'WAVEFORM_IAM_AUDIENCE': 'tos>waveform',
+    'WAVEFORM_IAM_APP_ID': 'waveform',
+    'WAVEFORM_IAM_AUDIENCE': 'waveform',
     'WAVEFORM_BRIEFCASE_BASE_URL': 'https://backend.briefcase.teamofsilicons.com',
     'WAVEFORM_BRIEFCASE_PERMANENT_ORIGIN': 'https://briefcase.teamofsilicons.com',
     'WAVEFORM_BRIEFCASE_CDN_ORIGIN': 'https://briefcase.teamofsilicons.com',
-    'WAVEFORM_BRIEFCASE_APP_ID': 'tos>waveform',
-    'WAVEFORM_BRIEFCASE_AUDIENCE': 'tos>briefcase',
+    'WAVEFORM_BRIEFCASE_APP_ID': 'waveform',
+    'WAVEFORM_BRIEFCASE_AUDIENCE': 'briefcase',
     'WAVEFORM_WEBHOOK_PUBLIC_URL': 'https://backend.waveform.teamofsilicons.com/webhook/',
     'WAVEFORM_REQUIRE_FULL_PROVIDER_CHAIN': 'true',
     'WAVEFORM_LOG_JSON': 'true',
@@ -204,7 +204,7 @@ if frontend_image:
         '-e','WAVEFORM_FRONTEND_ORIGIN=https://waveform.teamofsilicons.com',
         '-e','WAVEFORM_BACKEND_URL=https://backend.waveform.teamofsilicons.com',
         '-e','WAVEFORM_IAM_AUTH_ORIGIN=https://auth.iam.teamofsilicons.com',
-        '-e','WAVEFORM_APP_ID=tos>waveform',*common,pinned['frontend']]
+        '-e','WAVEFORM_APP_ID=waveform',*common,pinned['frontend']]
 for name,command in commands.items():
     unit=f'''[Unit]
 Description=Waveform {name}

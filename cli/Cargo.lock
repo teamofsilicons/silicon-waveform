@@ -1584,9 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-iam-client"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66ae8c19bfc293cc4c5c1da432efd38bf5509e9772fda5bbf7fc0795a4f288e5"
+version = "4.0.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -1611,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-waveform-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "reqwest",
  "rustls",
@@ -2162,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "waveform-cli"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "clap",
  "rpassword",

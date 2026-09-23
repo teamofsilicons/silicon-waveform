@@ -30,8 +30,8 @@ required Briefcase endpoint registration.
 
 IAM's short-lived login token uses the `oac_` authorization-code prefix; the
 login request field is still named `slt`. Access and refresh tokens use `oat_`
-and `ort_`. The default TTS permission is `obo:tos>briefcase:briefcase.files.create`; STT
-requires `obo:tos>briefcase:briefcase.files.read`. Waveform checks these before
+and `ort_`. The default TTS permission is `obo:briefcase:briefcase.files.create`; STT
+requires `obo:briefcase:briefcase.files.read`. Waveform checks these before
 provider work. Current IAM uses explicit
 `app_scope.external` endpoint permissions for storage delegation; it no longer issues
 the old `obo.issue` scope. IAM checks the user’s consent and selected organization

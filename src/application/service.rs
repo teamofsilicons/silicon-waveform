@@ -1407,7 +1407,7 @@ mod tests {
             let mut request = tts_request();
             request.voice_profile = selected.map(str::to_owned);
             let context = if obo {
-                obo_context(request_id(78), "voice-profile", "tos>caller")
+                obo_context(request_id(78), "voice-profile", "caller")
             } else {
                 context(request_id(78), "voice-profile")
             };

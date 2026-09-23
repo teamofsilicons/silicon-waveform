@@ -43,7 +43,7 @@ export function createGateway({
   backend = "https://backend.waveform.teamofsilicons.com",
   origin = "http://localhost:4325",
   iam = "https://auth.iam.teamofsilicons.com",
-  appId = "tos>waveform",
+  appId = "waveform",
   fetcher = fetch,
   sessionDirectory,
 } = {}) {

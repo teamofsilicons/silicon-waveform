@@ -210,6 +210,18 @@ impl ControlState {
         {
             return Err(ControlError::forbidden());
         }
+        let public_id = authority
+            .public_id
+            .as_deref()
+            .ok_or_else(ControlError::forbidden)?;
+        let kind = match authority.actor_type {
+            Some(models::ApplicationAuthorizationActorType::Carbon) => ActorKind::Carbon,
+            Some(models::ApplicationAuthorizationActorType::Silicon) => ActorKind::Silicon,
+            _ => return Err(ControlError::forbidden()),
+        };
+        if crate::infrastructure::actor_keys::canonical_kind(public_id) != Some(kind) {
+            return Err(ControlError::forbidden());
+        }
         let storage_actor_id = crate::infrastructure::actor_keys::resolve(
             &self.pool,
             plane.id,

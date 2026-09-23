@@ -84,7 +84,7 @@ class NativeUpgradeTests(unittest.TestCase):
             current.symlink_to(previous)
             env = local_path("/etc/waveform/native.env")
             env.parent.mkdir(parents=True)
-            original_env = (b"WAVEFORM_IAM_APP_ID=tos>waveform\nWAVEFORM_BIND_ADDR=172.18.0.1:8080\n"
+            original_env = (b"WAVEFORM_IAM_APP_ID=waveform\nWAVEFORM_BIND_ADDR=172.18.0.1:8080\n"
                             b"WAVEFORM_FFMPEG_PATH=/opt/waveform/current/bin/ffmpeg\n"
                             b"WAVEFORM_JSON_BODY_LIMIT_BYTES=65536\nSECRET=preserve-exactly\n")
             env.write_bytes(original_env)

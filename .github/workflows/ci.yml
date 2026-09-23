@@ -66,13 +66,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build production image
-        run: docker build --tag silicon-waveform:test .
+        run: docker build --tag si:silicon-waveform .
       - name: Verify API image manifest
-        run: docker run --rm --entrypoint cat silicon-waveform:test /usr/share/waveform/honeycomb.yaml | cmp honeycomb.yaml -
+        run: docker run --rm --entrypoint cat si:silicon-waveform /usr/share/waveform/honeycomb.yaml | cmp honeycomb.yaml -
       - name: Build frontend image
-        run: docker build --tag silicon-waveform-frontend:test frontend
+        run: docker build --tag si:silicon-waveform-frontend frontend
       - name: Verify frontend image manifest
-        run: docker run --rm --entrypoint cat silicon-waveform-frontend:test /usr/share/waveform/honeycomb.yaml | cmp honeycomb.yaml -
+        run: docker run --rm --entrypoint cat si:silicon-waveform-frontend /usr/share/waveform/honeycomb.yaml | cmp honeycomb.yaml -
 
   web-builds:
     runs-on: ubuntu-latest

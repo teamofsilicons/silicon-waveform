@@ -5,7 +5,7 @@ Turn text into stored speech, or transcribe audio already in Briefcase. Start wi
 ## Install
 
 ```sh
-honeycomb install 'tos>waveform'
+honeycomb install 'waveform'
 ```
 
 Honeycomb installs the native CLI and manages updates. Then sign in with an IAM short-lived token.

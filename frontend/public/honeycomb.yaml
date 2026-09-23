@@ -1,6 +1,6 @@
 format_version: 1
-app_id: tos>waveform
-version: 0.3.3
+app_id: waveform
+version: 0.4.0
 bin:
   waveform: main
 targets:

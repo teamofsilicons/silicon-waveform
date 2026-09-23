@@ -771,7 +771,7 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_request_boundary_records_each_tts_upload() {
-        let app = ApplicationId::from_str("tos>briefcase").unwrap_or_else(|_| unreachable!());
+        let app = ApplicationId::from_str("briefcase").unwrap_or_else(|_| unreachable!());
         let iam = FixtureIam::new(ActorKind::Carbon, Uuid::from_u128(9), app.clone())
             .unwrap_or_else(|_| unreachable!());
         let ledger = FixtureUploadLedger::default();
@@ -853,8 +853,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn fixture_service_runs_tts_and_stt_request_workflows_without_network() {
-        let application =
-            ApplicationId::from_str("tos>briefcase").unwrap_or_else(|_| unreachable!());
+        let application = ApplicationId::from_str("briefcase").unwrap_or_else(|_| unreachable!());
         let iam = Arc::new(
             FixtureIam::new(ActorKind::Silicon, Uuid::from_u128(12), application.clone())
                 .unwrap_or_else(|_| unreachable!()),

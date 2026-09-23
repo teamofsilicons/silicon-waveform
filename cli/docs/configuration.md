@@ -15,7 +15,7 @@ CLI secrets are kept in private files under the selected home's `.waveform/dir`.
 
 ## Updates
 
-Install with `honeycomb install 'tos>waveform'`; update with `honeycomb update`.
+Install with `honeycomb install 'waveform'`; update with `honeycomb update`.
 The CLI does not run an updater. Stop a legacy updater with `waveform daemon stop`
 and remove its launchd/systemd registration. Rust clients never update dependencies
 at runtime; manage their versions in your application's Cargo manifest and lockfile.

@@ -1,6 +1,6 @@
 # Waveform CLI
 
-Install with `honeycomb install 'tos>waveform'`. Commands use
+Install with `honeycomb install 'waveform'`. Commands use
 `https://backend.waveform.teamofsilicons.com` by default. Set `WAVEFORM_URL` or
 pass `--url <backend>` before the command to select another server; for local
 development, use `--url http://127.0.0.1:8080`.
@@ -112,7 +112,7 @@ arguments, including `waveform login status --help`.
 without a saved login. Use the returned `app_id` when obtaining an IAM SLT:
 
 ```json
-{"app_id":"tos>waveform","iam_base_url":"https://backend.iam.teamofsilicons.com/","testing_environment_id":null}
+{"app_id":"waveform","iam_base_url":"https://backend.iam.teamofsilicons.com/","testing_environment_id":null}
 ```
 
 The IAM URL comes from server configuration. `testing_environment_id` is the

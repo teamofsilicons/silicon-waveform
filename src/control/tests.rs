@@ -54,22 +54,22 @@ pub(super) fn fixture(
         honeycomb_token: Some(SecretString::from(
             "test-only-honeycomb-service-token-123456",
         )),
-        tts_scope: "obo:tos>briefcase:briefcase.files.create".into(),
-        stt_scope: "obo:tos>briefcase:briefcase.files.read".into(),
+        tts_scope: "obo:briefcase:briefcase.files.create".into(),
+        stt_scope: "obo:briefcase:briefcase.files.read".into(),
         mail: None,
         station: None,
         pool,
         iam: Client::builder(&iam.uri())?
-            .credential(Credential::application("tos>waveform", "test-app-secret"))
+            .credential(Credential::application("waveform", "test-app-secret"))
             .auto_update(false)
             .build()?,
-        app_id: "tos>waveform".to_owned(),
+        app_id: "waveform".to_owned(),
         briefcase_settings: crate::config::BriefcaseSettings {
             base_url: iam.uri().parse()?,
             permanent_origin: iam.uri().parse()?,
             cdn_origin: iam.uri().parse()?,
-            app_id: "tos>waveform".to_owned(),
-            audience: "tos>briefcase".to_owned(),
+            app_id: "waveform".to_owned(),
+            audience: "briefcase".to_owned(),
             timeout: std::time::Duration::from_secs(5),
             download_timeout: std::time::Duration::from_secs(5),
             max_download_bytes: 1_000_000,
@@ -117,9 +117,9 @@ pub(super) async fn call(
 
 fn snapshot(actor: Uuid) -> Value {
     json!({"active": true, "authorization": {
-        "principal_id": actor, "actor_type": "carbon", "public_id": "12345678",
+        "principal_id": actor, "actor_type": "carbon", "public_id": "c:12345678",
         "organization_id": Uuid::from_u128(2), "org_id": "tos", "membership_id": Uuid::from_u128(3),
-        "membership_version": 1, "authorization_epoch": 1, "audience": "tos>waveform",
+        "membership_version": 1, "authorization_epoch": 1, "audience": "waveform",
         "testing_environment_id": null, "scopes": ["roles.read","memberships.read"], "org_role": "member", "tags": []
     }})
 }
@@ -139,7 +139,7 @@ async fn iam_discovery_is_public_and_exposes_only_public_configuration() -> Test
     assert_eq!(
         body,
         json!({
-            "app_id":"tos>waveform", "iam_base_url":format!("{}/", iam.uri()),
+            "app_id":"waveform", "iam_base_url":format!("{}/", iam.uri()),
             "testing_environment_id":null
         })
     );
@@ -252,7 +252,7 @@ async fn session_retries_preserve_the_iam_receipt_in_both_planes() -> TestResult
                 ResponseTemplate::new(200).set_body_json(json!({
                     "access_token":"oat_saved", "refresh_token":"ort_saved", "token_type":"Bearer",
                     "expires_in":1800, "scope":"self.identity.read", "org_id":null,
-                    "actor":{"principal_id":Uuid::new_v4(),"type":"carbon","public_id":"tester"}
+                    "actor":{"principal_id":Uuid::new_v4(),"type":"carbon","public_id":"c:tester"}
                 }))
             };
             // IAM has processed the operation, but the first response is unavailable.
@@ -331,17 +331,17 @@ async fn login_settings_secrets_webhooks_and_online_revocation() -> TestResult {
     let app = router(state.clone());
     let actor = Uuid::new_v4();
     // Pre-cutover import retains the private key and its encryption context.
-    sqlx::query("INSERT INTO waveform_actor_keys VALUES($1,'12345678',$2)")
+    sqlx::query("INSERT INTO waveform_actor_keys VALUES($1,'c:12345678',$2)")
         .bind(Uuid::nil())
         .bind(actor)
         .execute(&pool)
         .await?;
     Mock::given(method("POST")).and(path("/api/v1/app-auth/tokens"))
-        .and(header("authorization", "Basic dG9zPndhdmVmb3JtOnRlc3QtYXBwLXNlY3JldA=="))
+        .and(header("authorization", "Basic d2F2ZWZvcm06dGVzdC1hcHAtc2VjcmV0"))
         .and(body_string_contains("slt=oac_fixture"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "oat_fixture", "refresh_token": "ort_fixture", "token_type": "Bearer",
-            "expires_in": 1800, "scope": "roles.read memberships.read", "actor": {"principal_id": actor,"type":"carbon","public_id":"12345678"}, "org_id": "tos"
+            "expires_in": 1800, "scope": "roles.read memberships.read", "actor": {"principal_id": actor,"type":"carbon","public_id":"c:12345678"}, "org_id": "tos"
         }))).expect(1).mount(&iam).await;
     Mock::given(method("POST"))
         .and(path("/api/v1/oauth/introspect"))
@@ -355,7 +355,7 @@ async fn login_settings_secrets_webhooks_and_online_revocation() -> TestResult {
         .and(body_string_contains("token=oat_other"))
         .respond_with(ResponseTemplate::new(200).set_body_json({
             let mut other = snapshot(Uuid::new_v4());
-            other["authorization"]["public_id"] = json!("different-carbon");
+            other["authorization"]["public_id"] = json!("c:different-carbon");
             other
         }))
         .mount(&iam)
@@ -777,8 +777,8 @@ async fn unscoped_identity_uses_iam_workspace_and_rejects_wrong_audience() -> Te
     let mut authority = snapshot(Uuid::new_v4())["authorization"].clone();
     authority["org_id"] = json!("workspace");
     for (token, audience, expected) in [
-        ("oat_unscoped", "tos>waveform", StatusCode::OK),
-        ("oat_wrong", "tos>other", StatusCode::FORBIDDEN),
+        ("oat_unscoped", "waveform", StatusCode::OK),
+        ("oat_wrong", "other", StatusCode::FORBIDDEN),
     ] {
         authority["audience"] = json!(audience);
         Mock::given(method("POST"))
@@ -824,8 +824,8 @@ async fn mock_discovery(
 ) {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     Mock::given(path("/api/v1/application/testing-context"))
-      .and(header("x-testing-application",format!("Basic {}",STANDARD.encode(format!("tos>waveform:{secret}")))))
-      .respond_with(ResponseTemplate::new(200).set_body_json(json!({"environment_id":id,"application":{"app_id":"tos>waveform","base_url":"https://backend.waveform.example","app_scope":{"iam":[],"external":[]},"webhook_scope":[],"testing_idle_days":15},"environment":{"environment_id":id,"org_id":"tos","name":format!("Sandbox {version}"),"version":version,"key_generation":1,"cleaned_at":cleaned,"created_at":"2026-09-01T00:00:00Z","creator_type":"carbon","creator_id":"alice"},"webhook_key_digest":"00".repeat(32)}))).mount(iam).await;
+      .and(header("x-testing-application",format!("Basic {}",STANDARD.encode(format!("waveform:{secret}")))))
+      .respond_with(ResponseTemplate::new(200).set_body_json(json!({"environment_id":id,"application":{"app_id":"waveform","base_url":"https://backend.waveform.example","app_scope":{"iam":[],"external":[]},"webhook_scope":[],"testing_idle_days":15},"environment":{"environment_id":id,"org_id":"tos","name":format!("Sandbox {version}"),"version":version,"key_generation":1,"cleaned_at":cleaned,"created_at":"2026-09-01T00:00:00Z","creator_type":"carbon","creator_id":"c:alice"},"webhook_key_digest":"00".repeat(32)}))).mount(iam).await;
 }
 
 #[tokio::test]
@@ -944,7 +944,7 @@ async fn discovered_identity_reports_permissions_and_webhooks_are_isolated() -> 
         .mount(&iam)
         .await;
     Mock::given(path("/api/v1/app-auth/tokens")).and(body_string_contains("slt=test-carbon"))
-      .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"oat_sandbox","refresh_token":"ort_sandbox","token_type":"Bearer","expires_in":1800,"scope":"roles.read","actor":{"principal_id":actor,"type":"carbon","public_id":"test-carbon"},"org_id":"tos"}))).mount(&iam).await;
+      .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"oat_sandbox","refresh_token":"ort_sandbox","token_type":"Bearer","expires_in":1800,"scope":"roles.read","actor":{"principal_id":actor,"type":"carbon","public_id":"c:test-carbon"},"org_id":"tos"}))).mount(&iam).await;
     Mock::given(path("/api/v1/app-auth/tokens"))
         .and(body_string_contains("slt=inactive"))
         .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error":"invalid_grant"})))
@@ -1162,7 +1162,7 @@ async fn honeycomb_lifecycle_replays_fences_cleans_and_keeps_tombstones() -> Tes
     let app = router(state.clone());
     let id = Uuid::new_v4();
     let secret = format!("ask_{}", "H".repeat(43));
-    let mut op = json!({"operation_id":Uuid::new_v4(),"environment_id":id,"org_id":"tos","app_id":"tos>waveform","environment_revision":1,"generation":1,"key_version":1,"action":"prepare","testing_key":"never-persist-this-root-key","snapshot":{}});
+    let mut op = json!({"operation_id":Uuid::new_v4(),"environment_id":id,"org_id":"tos","app_id":"waveform","environment_revision":1,"generation":1,"key_version":1,"action":"prepare","testing_key":"never-persist-this-root-key","snapshot":{}});
     let route = |op: &Value| {
         format!(
             "/internal/honeycomb/organizations/tos/testing-environments/{id}/operations/{}",

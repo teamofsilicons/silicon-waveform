@@ -35,7 +35,7 @@ fn speech_app(state: Arc<ControlState>) -> Result<Router, Box<dyn std::error::Er
     let audio = Arc::new(crate::infrastructure::audio::FfmpegAudioNormalizer::new(
         crate::infrastructure::audio::AudioNormalizerConfig::new("ffmpeg"),
     ));
-    let app_id: crate::domain::identity::ApplicationId = "tos>waveform".parse()?;
+    let app_id: crate::domain::identity::ApplicationId = "waveform".parse()?;
     let iam = Arc::new(FixtureIam::new(
         ActorKind::Carbon,
         Uuid::new_v4(),
@@ -112,8 +112,8 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
     let mut test_snapshot = snapshot(actor);
     test_snapshot["authorization"]["testing_environment_id"] = json!(iam_plane);
     test_snapshot["authorization"]["scopes"] = json!([
-        "obo:tos>briefcase:briefcase.files.create",
-        "obo:tos>briefcase:briefcase.files.read"
+        "obo:briefcase:briefcase.files.create",
+        "obo:briefcase:briefcase.files.read"
     ]);
     Mock::given(path("/api/v1/oauth/introspect"))
         .and(header("x-testing-application", basic_test(&root)))
@@ -121,10 +121,10 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
         .with_priority(1)
         .mount(&iam)
         .await;
-    Mock::given(method("GET")).and(path("/api/v1/obo-access/applications/tos%3Ebriefcase/endpoints"))
+    Mock::given(method("GET")).and(path("/api/v1/obo-access/applications/briefcase/endpoints"))
         .and(header("x-testing-application", basic_test(&root)))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "application":{"app_id":"tos>briefcase","org_id":"tos"},
+            "application":{"app_id":"briefcase","org_id":"tos"},
             "endpoints":[{"critical":false,"endpoint_id":"briefcase.files.create","path":"/api/v1/obo/files","metadata":{"path":{"type":"string"},"name":{"type":"string"},"content_type":{"type":"string"}}}, {"critical":false,"endpoint_id":"briefcase.entries.list","path":"/api/v1/obo/entries/list","metadata":{}}, {"critical":false,"endpoint_id":"briefcase.files.read","path":"/api/v1/obo/files/read","metadata":{}}]
         }))).expect(5).mount(&iam).await;
     let read_ledger = Arc::new(Mutex::new(ReadLedger::default()));
@@ -141,19 +141,19 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
         .respond_with(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap_or_else(|_| panic!("exchange JSON"));
             assert_eq!(body["subject_token"], "oat_fixture");
-            assert_eq!(body["audience"], "tos>briefcase");
+            assert_eq!(body["audience"], "briefcase");
             if body["endpoint_id"] != "briefcase.files.create" {
                 let proof = format!("obo_{}", Uuid::new_v4());
                 let endpoint = body["endpoint_id"].as_str().unwrap_or_else(|| panic!("endpoint"));
                 let digest = body["request"]["body_sha256"].as_str().unwrap_or_else(|| panic!("digest"));
                 minted_reads.lock().unwrap_or_else(|_| panic!("ledger")).proofs.insert(proof.clone(), (endpoint.to_owned(), digest.to_owned()));
-                return ResponseTemplate::new(201).set_body_json(json!({"testing_context":{"app_id":"tos>briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)},"access_proof":proof,"proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}));
+                return ResponseTemplate::new(201).set_body_json(json!({"testing_context":{"app_id":"briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)},"access_proof":proof,"proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}));
             }
             let clip_index = exchange_names.lock().unwrap_or_else(|_| panic!("exchange lock")).len();
             assert_eq!(body["request"]["body_sha256"], silicon_iam_client::api::obo::body_sha256(expected_clips[clip_index]));
             assert!(request.headers.contains_key("x-obo-signature"));
             exchange_names.lock().unwrap_or_else(|_| panic!("exchange lock")).push(body["metadata"]["name"].as_str().unwrap_or_else(|| panic!("upload name")).to_owned());
-            ResponseTemplate::new(201).set_body_json(json!({"testing_context":{"app_id":"tos>briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)},"access_proof":"obo_paired_upload","proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
+            ResponseTemplate::new(201).set_body_json(json!({"testing_context":{"app_id":"briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)},"access_proof":"obo_paired_upload","proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
         }).expect(5).mount(&iam).await;
     let operations = briefcase_client::OPERATIONS
         .iter()
@@ -167,7 +167,7 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
     Mock::given(method("POST")).and(path("/api/v1/obo/files"))
         .and(header("x-briefcase-app-secret", format!("ask_{}","B".repeat(43))))
         .and(header("x-iam-obo-access-proof", "obo_paired_upload"))
-        .and(header("x-app-id", "tos>waveform"))
+        .and(header("x-app-id", "waveform"))
         .respond_with(move |request: &wiremock::Request| {
             assert!(!request.headers.contains_key("authorization"));
             let names = stored_names.lock().unwrap_or_else(|_| panic!("upload lock"));
@@ -175,8 +175,8 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
             let name = names.last().unwrap_or_else(|| panic!("upload must follow exchange"));
             ResponseTemplate::new(201).set_body_json(json!({
                 "id":Uuid::new_v4(), "org_id":"tos", "type":"file", "visibility":"full", "name":name,
-                "path":format!("private/actor/apps/tos>waveform/{name}"), "root_type":"private", "content_type":"audio/mpeg", "size":request.body.len(),
-                "permanent_url":format!("https://briefcase.example.test/org/tos/private/actor/apps/tos>waveform/{name}"), "origin_app_id":"tos>waveform", "effective_access":["read"],
+                "path":format!("private/actor/apps/waveform/{name}"), "root_type":"private", "content_type":"audio/mpeg", "size":request.body.len(),
+                "permanent_url":format!("https://briefcase.example.test/org/tos/private/actor/apps/waveform/{name}"), "origin_app_id":"waveform", "effective_access":["read"],
                 "created_at":"2026-09-08T00:00:00Z", "updated_at":"2026-09-08T00:00:00Z", "deleted_at":null
             }))
         }).expect(3).mount(&storage).await;
@@ -191,8 +191,8 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
             let name = &names[0];
             ResponseTemplate::new(200).set_body_json(json!({"items":[{
                 "id":replay_entry_id,"org_id":"tos","type":"file","visibility":"full","name":name,
-                "path":format!("private/actor/apps/tos>waveform/{name}"),"root_type":"private",
-                "permanent_url":format!("https://briefcase.example.test/org/tos/private/actor/apps/tos>waveform/{name}"),
+                "path":format!("private/actor/apps/waveform/{name}"),"root_type":"private",
+                "permanent_url":format!("https://briefcase.example.test/org/tos/private/actor/apps/waveform/{name}"),
                 "effective_access":["read"],"created_at":null,"updated_at":null,"deleted_at":null
             }],"next_cursor":null}))
         }).expect(1).mount(&storage).await;
@@ -276,9 +276,9 @@ async fn discovered_tts_uses_only_waveform_secret_and_iam_downstream_context() -
         if index == 3 {
             assert_eq!(body, first_result);
         }
-        assert!(body["file_url"].as_str().is_some_and(|url| url.starts_with(
-            "https://briefcase.example.test/org/tos/private/actor/apps/tos%3Ewaveform/"
-        )));
+        assert!(body["file_url"].as_str().is_some_and(|url| {
+            url.starts_with("https://briefcase.example.test/org/tos/private/actor/apps/waveform/")
+        }));
     }
     let names = uploads
         .lock()
@@ -467,7 +467,7 @@ async fn real_cli_keeps_production_and_test_logins_separate() -> TestResult {
             assert!(String::from_utf8_lossy(&request.body).contains(plane));
             ResponseTemplate::new(200).set_body_json(json!({
                 "access_token":format!("oat_{plane}"), "refresh_token":format!("ort_{plane}"), "token_type":"Bearer", "expires_in":1800,
-                "scope":"roles.read memberships.read", "actor":{"principal_id":actor,"type":"carbon","public_id":"12345678"}, "org_id":"tos"
+                "scope":"roles.read memberships.read", "actor":{"principal_id":actor,"type":"carbon","public_id":"c:12345678"}, "org_id":"tos"
             }))
         }).mount(&iam).await;
     Mock::given(path("/api/v1/oauth/revoke"))
@@ -565,9 +565,14 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
     let iam_plane = Uuid::new_v4();
     let mut actor_snapshot = snapshot(actor);
     actor_snapshot["authorization"]["actor_type"] = json!(kind);
+    actor_snapshot["authorization"]["public_id"] = json!(if kind == "carbon" {
+        "c:12345678"
+    } else {
+        "si:12345678"
+    });
     actor_snapshot["authorization"]["scopes"] = json!([
-        "obo:tos>briefcase:briefcase.files.create",
-        "obo:tos>briefcase:briefcase.files.read"
+        "obo:briefcase:briefcase.files.create",
+        "obo:briefcase:briefcase.files.read"
     ]);
     Mock::given(path("/api/v1/oauth/introspect"))
         .respond_with(ResponseTemplate::new(200).set_body_json(actor_snapshot.clone()))
@@ -588,10 +593,10 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
         .with_priority(1)
         .mount(&iam)
         .await;
-    Mock::given(path("/api/v1/obo-access/applications/tos%3Ebriefcase/endpoints"))
+    Mock::given(path("/api/v1/obo-access/applications/briefcase/endpoints"))
         .and(header("x-testing-environment-key", "I".repeat(32)))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "application":{"app_id":"tos>briefcase","org_id":"tos"}, "endpoints":[
+            "application":{"app_id":"briefcase","org_id":"tos"}, "endpoints":[
                 {"critical":false,"endpoint_id":"briefcase.entries.list","path":"/api/v1/obo/entries/list","metadata":{}},
                 {"critical":false,"endpoint_id":"briefcase.files.read","path":"/api/v1/obo/files/read","metadata":{}}
             ]
@@ -606,14 +611,14 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             assert_eq!(body["org_id"], "client-workspace");
             assert_eq!(body["metadata"], json!({}));
             assert_eq!(body["request"]["method"], "POST");
-            assert_eq!(body["audience"], "tos>briefcase");
+            assert_eq!(body["audience"], "briefcase");
             assert!(request.headers.contains_key("x-obo-signature"));
             let proof = format!("obo_{}", Uuid::new_v4());
             mint.lock().expect("proof ledger").proofs.insert(proof.clone(), (
                 body["endpoint_id"].as_str().expect("endpoint").to_owned(),
                 body["request"]["body_sha256"].as_str().expect("digest").to_owned(),
             ));
-            ResponseTemplate::new(201).set_body_json(json!({"testing_context":{"app_id":"tos>briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)},"access_proof":proof,"proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
+            ResponseTemplate::new(201).set_body_json(json!({"testing_context":{"app_id":"briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)},"access_proof":proof,"proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
         }).mount(&iam).await;
     Mock::given(path("/api/version"))
         .and(header(
@@ -637,7 +642,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             "x-briefcase-app-secret",
             format!("ask_{}", "B".repeat(43)),
         ))
-        .and(header("x-app-id", "tos>waveform"))
+        .and(header("x-app-id", "waveform"))
         .respond_with(move |request: &wiremock::Request| {
             consume_read_proof(&listing, request, "briefcase.entries.list");
             let body: Value = serde_json::from_slice(&request.body).expect("list JSON");
@@ -661,7 +666,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             "x-briefcase-app-secret",
             format!("ask_{}", "B".repeat(43)),
         ))
-        .and(header("x-app-id", "tos>waveform"))
+        .and(header("x-app-id", "waveform"))
         .respond_with(move |request: &wiremock::Request| {
             consume_read_proof(&reading, request, "briefcase.files.read");
             let body: Value = serde_json::from_slice(&request.body).expect("read JSON");
@@ -726,7 +731,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
         .and(header("x-testing-environment-key", "I".repeat(32)))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token":"oat_fixture","refresh_token":"ort_fixture","token_type":"Bearer","expires_in":1800,
-            "scope":"roles.read memberships.read","actor":{"principal_id":actor,"type":kind,"public_id":"12345678"},"org_id":"client-workspace"
+            "scope":"roles.read memberships.read","actor":{"principal_id":actor,"type":kind,"public_id":if kind == "carbon" { "c:12345678" } else { "si:12345678" }},"org_id":"client-workspace"
         }))).expect(1).mount(&iam).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -887,7 +892,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
     for (field, value) in [
         ("testing_environment_id", json!(Uuid::new_v4())),
         ("org_id", json!("other-workspace")),
-        ("audience", json!("tos>other-app")),
+        ("audience", json!("other-app")),
         ("actor_type", Value::Null),
     ] {
         let mut invalid = actor_snapshot.clone();
@@ -965,8 +970,5 @@ fn one_second_wav() -> Vec<u8> {
 
 fn basic_test(secret: &str) -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    format!(
-        "Basic {}",
-        STANDARD.encode(format!("tos>waveform:{secret}"))
-    )
+    format!("Basic {}", STANDARD.encode(format!("waveform:{secret}")))
 }

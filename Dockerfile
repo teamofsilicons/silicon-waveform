@@ -5,6 +5,7 @@ WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY vendor ./vendor
 COPY migrations ./migrations
 
 RUN cargo build --locked --release --bin waveform-api

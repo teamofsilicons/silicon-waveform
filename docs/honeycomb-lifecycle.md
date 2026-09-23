@@ -25,7 +25,7 @@ Authorization: Bearer <dedicated service credential>
   "operation_id": "11111111-1111-4111-8111-111111111111",
   "environment_id": "22222222-2222-4222-8222-222222222222",
   "org_id": "tos",
-  "app_id": "tos>waveform",
+  "app_id": "waveform",
   "environment_revision": 1,
   "generation": 1,
   "key_version": 1,

@@ -1133,7 +1133,7 @@ components:
         public_id: { type: string, description: Immutable canonical Carbon or Silicon identity., example: saket }
         organization_id: { type: string, format: uuid }
         org_id: { type: string }
-        membership_id: { type: string, description: Canonical actor membership in the selected organization., example: "saket[tos]" }
+        membership_id: { type: string, description: Canonical actor membership in the selected organization., example: "c:saket[tos]" }
         membership_version: { type: integer, format: int64 }
         authorization_epoch: { type: integer, format: int64 }
         audience: { type: string }

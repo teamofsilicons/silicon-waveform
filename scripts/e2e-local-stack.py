@@ -25,7 +25,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTOR = '00000000-0000-4000-8000-000000000123'
-SCOPES = ['roles.read', 'memberships.read', 'obo:tos>briefcase:briefcase.files.create', 'obo:tos>briefcase:briefcase.files.read']
+SCOPES = ['roles.read', 'memberships.read', 'obo:briefcase:briefcase.files.create', 'obo:briefcase:briefcase.files.read']
 ORIGIN = 'https://briefcase.e2e.test'
 AUDIO = (ROOT / 'src/infrastructure/test-audio/kore.mp3').read_bytes()
 CONTRACT = json.loads((ROOT / 'tests/fixtures/briefcase-v1.1.0.json').read_text())
@@ -38,10 +38,10 @@ STOP = threading.Event()
 
 
 def entry(name, data):
-    path = f'private/e2e/apps/tos>waveform/{name}'
+    path = f'private/e2e/apps/waveform/{name}'
     return {'id': str(uuid.uuid4()), 'org_id': 'tos', 'type': 'file', 'visibility': 'full', 'name': name,
             'path': path, 'root_type': 'private', 'content_type': 'audio/mpeg', 'size': len(data),
-            'permanent_url': f'{ORIGIN}/org/tos/{path}', 'origin_app_id': 'tos>waveform',
+            'permanent_url': f'{ORIGIN}/org/tos/{path}', 'origin_app_id': 'waveform',
             'effective_access': ['read'], 'created_at': '2026-09-20T00:00:00Z', 'updated_at': '2026-09-20T00:00:00Z', 'deleted_at': None}
 
 
@@ -88,7 +88,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == '/api/version':
             return self.send(200, CONTRACT, {'briefcase-api-version': 'v1'})
         if url.path.startswith('/api/v1/obo-access/applications/') and url.path.endswith('/endpoints'):
-            return self.send(200, {'application': {'app_id': 'tos>briefcase', 'org_id': 'tos'}, 'endpoints': [
+            return self.send(200, {'application': {'app_id': 'briefcase', 'org_id': 'tos'}, 'endpoints': [
                 {'critical': False, 'endpoint_id': 'briefcase.files.create', 'path': '/api/v1/obo/files', 'metadata': {'path': {'type': 'string'}, 'name': {'type': 'string'}, 'content_type': {'type': 'string'}}},
                 {'critical': False, 'endpoint_id': 'briefcase.entries.list', 'path': '/api/v1/obo/entries/list', 'metadata': {}},
                 {'critical': False, 'endpoint_id': 'briefcase.files.read', 'path': '/api/v1/obo/files/read', 'metadata': {}}]})
@@ -117,15 +117,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/v1/app-auth/tokens':
             record({'kind': 'iam', 'path': path})
             return self.send(200, {'access_token': 'oat_waveform_e2e', 'refresh_token': 'ort_waveform_e2e', 'token_type': 'Bearer', 'expires_in': 1800,
-                                  'scope': ' '.join(SCOPES), 'actor': {'principal_id': ACTOR, 'type': 'carbon', 'public_id': '12345678'}, 'org_id': 'tos'})
+                                  'scope': ' '.join(SCOPES), 'actor': {'principal_id': ACTOR, 'type': 'carbon', 'public_id': 'c:12345678'}, 'org_id': 'tos'})
         if path == '/api/v1/oauth/introspect':
-            authority = {'principal_id': ACTOR, 'actor_type': 'carbon', 'public_id': '12345678',
+            authority = {'principal_id': ACTOR, 'actor_type': 'carbon', 'public_id': 'c:12345678',
                          'organization_id': '00000000-0000-4000-8000-000000000002', 'org_id': 'tos',
-                         'membership_id': '00000000-0000-4000-8000-000000000003', 'membership_version': 1,
-                         'authorization_epoch': 1, 'audience': 'tos>waveform', 'testing_environment_id': None,
+                         'membership_id': 'c:12345678[tos]', 'membership_version': 1,
+                         'authorization_epoch': 1, 'audience': 'waveform', 'testing_environment_id': None,
                          'scopes': SCOPES, 'org_role': 'member', 'tags': []}
             return self.send(200, {'active': True, 'principal_id': ACTOR, 'actor_type': 'carbon', 'org_id': 'tos', 'scope': ' '.join(SCOPES),
-                                   'audience': 'tos>waveform', 'expires_at': 4102444800, 'authorization': authority})
+                                   'audience': 'waveform', 'expires_at': 4102444800, 'authorization': authority})
         if path == '/api/v1/oauth/revoke':
             return self.send(200, {})
         if path == '/api/v1/obo-access/exchanges':
@@ -221,9 +221,9 @@ def main():
     # Every configured remote origin points at this process; keys are dummy.
     env.update({'WAVEFORM_ENVIRONMENT': 'development', 'WAVEFORM_BIND_ADDR': '127.0.0.1:4382',
                 'WAVEFORM_DATABASE_URL': f'postgres://waveform_e2e:{password.read_text()}@127.0.0.1:{pg_port}/waveform_e2e',
-                'WAVEFORM_IAM_BASE_URL': 'http://127.0.0.1:4383', 'WAVEFORM_IAM_APP_ID': 'tos>waveform', 'WAVEFORM_IAM_AUDIENCE': 'tos>waveform',
+                'WAVEFORM_IAM_BASE_URL': 'http://127.0.0.1:4383', 'WAVEFORM_IAM_APP_ID': 'waveform', 'WAVEFORM_IAM_AUDIENCE': 'waveform',
                 'WAVEFORM_IAM_APP_SECRET': 'e2e-waveform-dummy-app-secret', 'WAVEFORM_BRIEFCASE_BASE_URL': 'http://127.0.0.1:4383',
-                'WAVEFORM_BRIEFCASE_PERMANENT_ORIGIN': ORIGIN, 'WAVEFORM_BRIEFCASE_CDN_ORIGIN': ORIGIN, 'WAVEFORM_BRIEFCASE_APP_ID': 'tos>waveform',
+                'WAVEFORM_BRIEFCASE_PERMANENT_ORIGIN': ORIGIN, 'WAVEFORM_BRIEFCASE_CDN_ORIGIN': ORIGIN, 'WAVEFORM_BRIEFCASE_APP_ID': 'waveform',
                 'WAVEFORM_ENCRYPTION_KEY': '19'*32, 'WAVEFORM_IDEMPOTENCY_DIGEST_KEY': 'e2e-dummy-digest-key-12345678901234567890',
                 'WAVEFORM_TELEMETRY': '0', 'WAVEFORM_TELEMETRY_KEY': '', 'WAVEFORM_HONEYCOMB_SERVICE_TOKEN': '',
                 'WAVEFORM_LOG_FILTER': 'silicon_waveform=info', 'WAVEFORM_LOG_JSON': 'false'})

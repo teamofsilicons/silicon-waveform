@@ -497,8 +497,8 @@ mod tests {
             base_url: "https://backend.briefcase.test".parse()?,
             permanent_origin: "https://briefcase.test".parse()?,
             cdn_origin: "https://cdn.briefcase.test".parse()?,
-            app_id: "tos>waveform".to_owned(),
-            audience: "tos>briefcase".to_owned(),
+            app_id: "waveform".to_owned(),
+            audience: "briefcase".to_owned(),
             timeout: std::time::Duration::from_secs(1),
             download_timeout: std::time::Duration::from_secs(1),
             max_download_bytes: 1024,
@@ -506,7 +506,7 @@ mod tests {
         let iam = Arc::new(crate::infrastructure::testing::FixtureIam::new(
             crate::domain::identity::ActorKind::Carbon,
             uuid::Uuid::new_v4(),
-            "tos>waveform".parse()?,
+            "waveform".parse()?,
         )?);
         let reader = BriefcaseSdkReader::new(settings, iam);
         let valid = BriefcaseFileUrl::new(

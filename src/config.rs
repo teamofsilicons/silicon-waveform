@@ -502,7 +502,7 @@ fn load_iam(source: &impl EnvironmentSource) -> Result<IamSettings, SettingsErro
             value_or(
                 source,
                 "WAVEFORM_IAM_TTS_ACTION",
-                "obo:tos>briefcase:briefcase.files.create",
+                "obo:briefcase:briefcase.files.create",
             )?,
         )?,
         stt_action: action_name(
@@ -510,7 +510,7 @@ fn load_iam(source: &impl EnvironmentSource) -> Result<IamSettings, SettingsErro
             value_or(
                 source,
                 "WAVEFORM_IAM_STT_ACTION",
-                "obo:tos>briefcase:briefcase.files.read",
+                "obo:briefcase:briefcase.files.read",
             )?,
         )?,
         timeout: duration_seconds(source, "WAVEFORM_IAM_TIMEOUT_SECONDS", 5, 1, 60)?,
@@ -548,7 +548,7 @@ fn load_briefcase(
         audience: bounded_string(
             "WAVEFORM_BRIEFCASE_AUDIENCE",
             optional(source, "WAVEFORM_BRIEFCASE_AUDIENCE")?
-                .unwrap_or_else(|| "tos>briefcase".to_owned()),
+                .unwrap_or_else(|| "briefcase".to_owned()),
             3,
             80,
         )?,
@@ -1296,11 +1296,11 @@ mod tests {
         assert_eq!(settings.environment, RuntimeEnvironment::Development);
         assert_eq!(
             settings.iam.tts_action,
-            "obo:tos>briefcase:briefcase.files.create"
+            "obo:briefcase:briefcase.files.create"
         );
         assert_eq!(
             settings.iam.stt_action,
-            "obo:tos>briefcase:briefcase.files.read"
+            "obo:briefcase:briefcase.files.read"
         );
         assert_eq!(settings.limits.max_text_chars, 4_096);
         assert_eq!(settings.limits.max_media_bytes, 25 * 1_024 * 1_024);

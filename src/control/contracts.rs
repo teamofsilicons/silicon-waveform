@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(response.headers()["x-waveform-api-version"], "v1");
         assert_eq!(response.headers()["x-waveform-protocol-version"], "1");
         let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
-        assert_eq!(body["app_id"], "tos>waveform");
+        assert_eq!(body["app_id"], "waveform");
         for (path, header, value) in [
             ("/api/v2/iam", "x-waveform-api-version", "v2"),
             ("/api/v1/iam", "x-waveform-api-version", "v2"),

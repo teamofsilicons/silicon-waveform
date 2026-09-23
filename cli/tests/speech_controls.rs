@@ -50,7 +50,7 @@ impl Home {
     async fn login(&self, server: &MockServer) {
         Mock::given(method("GET")).and(path("/api/v1/auth/me"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "actor_type":"carbon", "public_id":"12345678", "organization_id":"00000000-0000-0000-0000-000000000002", "org_id":"tos", "membership_id":"12345678[tos]", "membership_version":1, "authorization_epoch":1, "audience":"tos>waveform", "testing_environment_id":null, "scopes":[], "org_role":"member", "tags":[]
+                "actor_type":"carbon", "public_id":"12345678", "organization_id":"00000000-0000-0000-0000-000000000002", "org_id":"tos", "membership_id":"12345678[tos]", "membership_version":1, "authorization_epoch":1, "audience":"waveform", "testing_environment_id":null, "scopes":[], "org_role":"member", "tags":[]
             }))).mount(server).await;
         Mock::given(method("POST")).and(path("/api/v1/auth/login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({

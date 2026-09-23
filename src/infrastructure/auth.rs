@@ -96,8 +96,6 @@ impl IamHttpAdapter {
             .map_err(|_| IamAdapterBuildError::InvalidApplicationIdentity)?;
         if application_id.as_str() != settings.app_id.as_str()
             || audience.as_str() != settings.audience.as_str()
-            || application_id.as_str().len() < 3
-            || audience.as_str().len() < 3
             || settings.app_secret.expose_secret().is_empty()
             || !valid_action(&settings.tts_action)
             || !valid_action(&settings.stt_action)
@@ -146,6 +144,9 @@ impl IamHttpAdapter {
         });
         let mut actor = self.validate_introspection(response, request)?;
         let public_id = public_id.ok_or(IamError::InvalidResponse)?;
+        if crate::infrastructure::actor_keys::canonical_kind(&public_id) != Some(actor.actor.kind) {
+            return Err(IamError::InvalidResponse);
+        }
         let key = if let Some(pool) = &self.identity_pool {
             crate::infrastructure::actor_keys::resolve(pool, uuid::Uuid::nil(), &public_id)
                 .await
@@ -395,10 +396,7 @@ async fn delegate_storage(
         .map_err(|_| IamError::Unavailable)?;
     // The catalog owner identifies the recipient application, not the member's
     // storage organization. IAM authorizes the selected data org in the exchange.
-    let recipient_owner = audience.split_once('>').map(|(owner, _)| owner);
-    if catalog.application.app_id != audience
-        || recipient_owner != Some(catalog.application.org_id.as_str())
-    {
+    if catalog.application.app_id != audience || catalog.application.org_id.is_empty() {
         return Err(IamError::OrganizationMismatch);
     }
     let selected = catalog
@@ -615,7 +613,7 @@ mod tests {
             .and(body_string_contains("token_type_hint=access_token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "active": true,
-                "principal_id": actor_id, "public_id":"test-carbon",
+                "principal_id": actor_id, "public_id":"c:test-carbon",
                 "actor_type": "carbon",
                 "org_id": "acme",
                 "scope": "waveform.tts waveform.stt",
@@ -761,19 +759,19 @@ mod tests {
         use wiremock::matchers::body_partial_json;
         let server = MockServer::start().await;
         let mut config = settings(&server)?;
-        config.app_id = "acme>waveform".to_owned();
-        config.audience = "acme>waveform".to_owned();
-        let adapter = IamHttpAdapter::new(&config)?.with_storage_audience("acme>storage");
+        config.app_id = "waveform".to_owned();
+        config.audience = "waveform".to_owned();
+        let adapter = IamHttpAdapter::new(&config)?.with_storage_audience("storage");
         let filename =
             GeneratedAudioFileName::for_request(time::OffsetDateTime::now_utc(), request_id()?);
         let digest = silicon_iam_client::api::obo::body_sha256(b"exact normalized bytes");
-        Mock::given(method("GET")).and(path("/api/v1/obo-access/applications/acme%3Estorage/endpoints"))
+        Mock::given(method("GET")).and(path("/api/v1/obo-access/applications/storage/endpoints"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "application":{"app_id":"acme>storage","org_id":"acme"},
+                "application":{"app_id":"storage","org_id":"acme"},
                 "endpoints":[{"critical":false,"endpoint_id":"briefcase.files.create","path":"/api/v1/obo/files","metadata":{"path":{"type":"string"},"name":{"type":"string"},"content_type":{"type":"string"}}}]
             }))).expect(1).mount(&server).await;
         Mock::given(method("POST")).and(path("/api/v1/obo-access/exchanges"))
-            .and(body_partial_json(json!({"org_id":"client-workspace", "subject_token":"oat_request_subject", "audience":"acme>storage", "endpoint_id":"briefcase.files.create", "request":{"method":"POST","body_sha256":digest}, "metadata":{"name":filename.as_str(),"path":"","content_type":"audio/mpeg"}})))
+            .and(body_partial_json(json!({"org_id":"client-workspace", "subject_token":"oat_request_subject", "audience":"storage", "endpoint_id":"briefcase.files.create", "request":{"method":"POST","body_sha256":digest}, "metadata":{"name":filename.as_str(),"path":"","content_type":"audio/mpeg"}})))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({"access_proof":"obo_exact_upload","proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"})))
             .expect(1).mount(&server).await;
         let proof = adapter
@@ -794,7 +792,7 @@ mod tests {
                 }),
             })
             .await?;
-        assert_eq!(proof.application_id.as_str(), "acme>waveform");
+        assert_eq!(proof.application_id.as_str(), "waveform");
         assert_eq!(proof.proof.expose_secret(), "obo_exact_upload");
         let requests = server.received_requests().await.ok_or("no requests")?;
         assert!(
@@ -819,19 +817,19 @@ mod tests {
         };
         for (catalog_app, catalog_owner, catalog_path, expected) in [
             (
-                "other>storage",
+                "other-storage",
                 "other",
                 "/api/v1/obo/entries/list",
                 IamError::OrganizationMismatch,
             ),
             (
-                "acme>storage",
-                "other",
+                "storage",
+                "",
                 "/api/v1/obo/entries/list",
                 IamError::OrganizationMismatch,
             ),
             (
-                "acme>storage",
+                "storage",
                 "acme",
                 "/api/v1/obo/files/read",
                 IamError::ContractUnavailable,
@@ -839,11 +837,11 @@ mod tests {
         ] {
             let server = MockServer::start().await;
             let mut config = settings(&server)?;
-            config.app_id = "acme>waveform".to_owned();
+            config.app_id = "waveform".to_owned();
             config.audience = config.app_id.clone();
-            let adapter = IamHttpAdapter::new(&config)?.with_storage_audience("acme>storage");
+            let adapter = IamHttpAdapter::new(&config)?.with_storage_audience("storage");
             Mock::given(method("GET"))
-                .and(path("/api/v1/obo-access/applications/acme%3Estorage/endpoints"))
+                .and(path("/api/v1/obo-access/applications/storage/endpoints"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "application":{"app_id":catalog_app,"org_id":catalog_owner},
                     "endpoints":[{"critical":false,"endpoint_id":"briefcase.entries.list","path":catalog_path,"metadata":{}}]
@@ -886,7 +884,7 @@ mod tests {
         let body = json!({"active":true,"principal_id":actor,"actor_type":"carbon","org_id":"acme",
             "scope":"waveform.tts","audience":"waveform","expires_at":4_102_444_800_i64,
             "authorization":{
-                "principal_id":actor,"actor_type":"carbon","public_id":"12345678",
+                "principal_id":actor,"actor_type":"carbon","public_id":"c:12345678",
                 "organization_id":Uuid::new_v4(),"org_id":"acme","membership_id":Uuid::new_v4(),
                 "membership_version":1,"authorization_epoch":1,"audience":"waveform",
                 "testing_environment_id":Uuid::new_v4(),"scopes":["waveform.tts"],"org_role":"member","tags":[]

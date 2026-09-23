@@ -10,7 +10,7 @@ import { fixture } from "./fixture.mjs";
 const origin = "http://localhost:4325",
   backend = "http://127.0.0.1:4340",
   iam = "https://auth.iam.teamofsilicons.com",
-  appId = "tos>waveform";
+  appId = "waveform";
 function setup(t, wrap = (fetcher) => fetcher) {
   const directory = mkdtempSync(join(tmpdir(), "waveform-browser-session-")),
     fake = fixture();

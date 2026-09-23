@@ -151,7 +151,7 @@ Configuration (server-side environment variables):
 - `WAVEFORM_BACKEND_URL`: defaults to `https://backend.waveform.teamofsilicons.com`.
 - `WAVEFORM_FRONTEND_ORIGIN`: defaults to `http://localhost:4325`.
 - `WAVEFORM_IAM_AUTH_ORIGIN`: defaults to `https://auth.iam.teamofsilicons.com`.
-- `WAVEFORM_APP_ID`: defaults to `tos>waveform`.
+- `WAVEFORM_APP_ID`: defaults to `waveform`.
 - `WAVEFORM_SESSION_DIRECTORY`: required in production; absolute path on persistent storage.
 - `HOST`, `PORT`: production server bind address and port.
 

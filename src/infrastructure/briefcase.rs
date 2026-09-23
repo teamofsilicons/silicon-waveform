@@ -244,7 +244,7 @@ mod tests {
             permanent_origin: Url::parse("https://briefcase.example.test")?,
             cdn_origin: Url::parse("https://cdn.example.test")?,
             app_id: "waveform".to_owned(),
-            audience: "tos>briefcase".to_owned(),
+            audience: "briefcase".to_owned(),
             timeout: Duration::from_secs(10),
             download_timeout: Duration::from_secs(30),
             max_download_bytes: 25 * 1_024 * 1_024,

@@ -47,7 +47,7 @@ fn output_json(output: Output) -> Value {
 fn authority(kind: &str) -> Value {
     json!({"actor_type":kind,"public_id":"12345678","organization_id":"00000000-0000-0000-0000-000000000002",
         "org_id":"tos","membership_id":"12345678[tos]",
-        "membership_version":1,"authorization_epoch":1,"audience":"tos>waveform",
+        "membership_version":1,"authorization_epoch":1,"audience":"waveform",
         "testing_environment_id":null,"scopes":[],"org_role":"member","tags":[]})
 }
 async fn login(home: &Home, server: &MockServer, selection: &[&str]) {
@@ -109,7 +109,7 @@ async fn discovery_is_public_and_preserves_test_selection() {
         .and(header("x-testing-environment-key", key.as_str()))
         .and(|r: &wiremock::Request| !r.headers.contains_key("authorization"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "app_id":"tos>waveform", "iam_base_url":"https://iam.example/",
+            "app_id":"waveform", "iam_base_url":"https://iam.example/",
             "testing_environment_id":"00000000-0000-0000-0000-000000000004"
         })))
         .expect(1)
@@ -119,7 +119,7 @@ async fn discovery_is_public_and_preserves_test_selection() {
         home.run(&server.uri(), &["--test", &key, "iam", "--json"])
             .await,
     );
-    assert_eq!(value["app_id"], "tos>waveform");
+    assert_eq!(value["app_id"], "waveform");
     assert!(!value.to_string().contains(&key));
 }
 
@@ -313,7 +313,7 @@ async fn environment_selects_test_requests_and_explicit_flag_overrides_it() {
         Mock::given(method("GET")).and(path("/api/v1/iam"))
             .and(header("x-testing-environment-key", if explicit { explicit_key } else { env_key }))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "app_id":"tos>waveform", "iam_base_url":"https://iam.example/", "testing_environment_id":null
+                "app_id":"waveform", "iam_base_url":"https://iam.example/", "testing_environment_id":null
             }))).expect(1).mount(&server).await;
         let mut command = Command::new(env!("CARGO_BIN_EXE_waveform"));
         command
@@ -328,7 +328,7 @@ async fn environment_selects_test_requests_and_explicit_flag_overrides_it() {
         let output = tokio::task::spawn_blocking(move || command.output().unwrap())
             .await
             .unwrap();
-        assert_eq!(output_json(output)["app_id"], "tos>waveform");
+        assert_eq!(output_json(output)["app_id"], "waveform");
     }
     let output = Command::new(env!("CARGO_BIN_EXE_waveform"))
         .env("WAVEFORM_TEST", env_key)

@@ -116,7 +116,7 @@ def deploy(args, rows, importer):
     unit = Path('/etc/systemd/system/waveform-api.service')
     old_unit = unit.read_bytes()
     env = lambda key: upgrade.env_value(old_env, key)
-    upgrade.require(env('WAVEFORM_IAM_APP_ID') == 'tos>waveform', 'Unexpected app identity')
+    upgrade.require(env('WAVEFORM_IAM_APP_ID') == 'waveform', 'Unexpected app identity')
     iam_url = env('WAVEFORM_IAM_BASE_URL').rstrip('/')
     with urllib.request.urlopen(iam_url + '/api/v1/version', timeout=20) as response:
         version = json.load(response)
