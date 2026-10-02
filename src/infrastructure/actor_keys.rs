@@ -31,10 +31,9 @@ pub(crate) fn canonical_kind(value: &str) -> Option<crate::domain::identity::Act
     use crate::domain::identity::ActorKind;
     let (kind, handle, maximum) = if let Some(handle) = value.strip_prefix("c:") {
         (ActorKind::Carbon, handle, 30)
-    } else if let Some(handle) = value.strip_prefix("si:") {
-        (ActorKind::Silicon, handle, 50)
     } else {
-        return None;
+        let handle = value.strip_prefix("si:")?;
+        (ActorKind::Silicon, handle, 50)
     };
     ((3..=maximum).contains(&handle.len())
         && handle.bytes().all(|byte| {

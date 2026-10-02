@@ -157,11 +157,14 @@ impl Client {
             .mime_str(&content_type)
             .map_err(|error| Error::Configuration(format!("invalid content type: {error}")))?;
 
-        let form = match &upload.destination {
+        let mut form = match &upload.destination {
             Destination::Id(id) => Form::new().text("parent_id", id.to_string()),
             Destination::Path(path) => Form::new().text("path", path.clone()),
+        };
+        if let Some(minutes) = upload.self_destruct_minutes {
+            form = form.text("self_destruct_minutes", minutes.to_string());
         }
-        .part("file", part);
+        let form = form.part("file", part);
 
         let request = self
             .request(Method::POST, self.api_url(&["uploads"])?)
@@ -315,44 +318,16 @@ impl Client {
         self.receive_json(request).await
     }
 
-    /// Creates a file for the member an application represents.
-    ///
-    /// This is the compatible one-shot upload. The destination, name,
-    /// and media type come from the IAM proof rather than from this request,
-    /// and the proof is spent exactly once: a refused call must never be
-    /// retried with the same proof. For long transfers and durable logical
-    /// reconciliation, use [`Client::reserve_delegated_upload`] and a separate
-    /// fresh-authorized commit instead.
-    ///
-    /// The client's own bearer token, if it has one, is deliberately not sent:
-    /// presenting both credentials at once is a request error.
+    /// Retired raw upload retained only as a source-compatible migration error.
+    /// Use `reserve_delegated_upload`, `transfer_delegated_upload` and
+    /// `commit_delegated_upload` with reusable endpoint access tokens.
     ///
     /// # Errors
-    ///
-    /// Returns an unauthenticated error for a proof that is unknown, expired,
-    /// already spent, or minted over different bytes, and a forbidden error
-    /// when it was minted for another endpoint, audience, or application.
+    /// Always returns a configuration error without transmitting credentials or bytes.
     pub async fn create_file_on_behalf_of(&self, upload: &OnBehalfOfUpload) -> Result<Entry> {
         crate::ApplicationId::new(upload.app_id.clone())?;
-        let url = self.api_url(&["obo", "files"])?;
-        let body = match &upload.source {
-            UploadSource::Bytes(bytes) => reqwest::Body::from(bytes.clone()),
-            UploadSource::File(path) => {
-                let file = tokio::fs::File::open(path)
-                    .await
-                    .map_err(|error| io(path.display().to_string(), error))?;
-                reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file))
-            }
-        };
-        let request = self
-            .http()
-            .post(url)
-            .header("x-org-id", self.organization())
-            .header("x-app-id", &upload.app_id)
-            .header("x-iam-obo-access-proof", &upload.proof)
-            .header("content-type", "application/octet-stream")
-            .body(body)
-            .timeout(self.transfer_timeout());
-        self.receive_json(self.apply_environment(request)).await
+        Err(crate::Error::Configuration(
+            "Raw OBO uploads are retired; use reserve, content and commit".into(),
+        ))
     }
 }

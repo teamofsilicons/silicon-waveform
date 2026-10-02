@@ -87,8 +87,8 @@ pub use api::delegated::{
     UploadCapability,
 };
 pub use api::{
-    BugReport, ContentStream, Invitation, InvitationPage, Invite, LinkAccess, LogEvent, LogPage,
-    PublicEntry, PublicPage, Recipient, ReportReceipt,
+    BugReport, ContentStream, ExpiryChange, Invitation, InvitationPage, Invite, LinkAccess,
+    LogEvent, LogPage, PublicEntry, PublicPage, Recipient, ReportReceipt,
 };
 pub use client::{Client, IdempotencyKey};
 pub use config::{

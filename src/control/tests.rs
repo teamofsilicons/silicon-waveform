@@ -115,7 +115,7 @@ pub(super) async fn call(
     ))
 }
 
-fn snapshot(actor: Uuid) -> Value {
+pub(super) fn snapshot(actor: Uuid) -> Value {
     json!({"active": true, "authorization": {
         "principal_id": actor, "actor_type": "carbon", "public_id": "c:12345678",
         "organization_id": Uuid::from_u128(2), "org_id": "tos", "membership_id": Uuid::from_u128(3),
@@ -1366,4 +1366,40 @@ fn provider_failures_do_not_clear_application_sessions() {
         };
         assert_eq!(ControlError::iam(error.into()).status, expected);
     }
+}
+
+/// Install an already-approved encrypted fixture grant using the same selected
+/// account/plane binding as the HTTP broker (the broker itself is tested end to end).
+pub(super) async fn seed_storage(
+    state: &ControlState,
+    root: Option<&str>,
+    org: &str,
+    selected_org: &str,
+    subject: &str,
+    testing: bool,
+) -> TestResult {
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", "Bearer oat_fixture".parse()?);
+    headers.insert("x-org-id", org.parse()?);
+    if let Some(root) = root {
+        headers.insert("x-testing-environment-key", root.parse()?);
+    }
+    let identity = state
+        .identity(&headers)
+        .await
+        .map_err(|_| "fixture identity")?;
+    for endpoint in super::storage::ENDPOINTS {
+        let body = json!({"grant_id":Uuid::new_v4(),"access_token":format!("oba_{endpoint}"),"refresh_token":format!("obr_{endpoint}"),"token_type":"Bearer","expires_in":1800,"expires_at":"2099-01-01T00:00:00Z","audience":"briefcase","endpoint_id":endpoint,"org_id":selected_org,"actor":{"type":if subject.starts_with("si:"){"silicon"}else{"carbon"},"public_id":subject},"scope":"","testing_context":testing.then(||json!({"app_id":"briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)}))});
+        let context = format!(
+            "storage-grant/{}/{}/{}/{endpoint}",
+            identity.plane.id, org, identity.storage_actor_id
+        );
+        let cipher = state
+            .vault()
+            .map_err(|_| "vault")?
+            .seal(&body.to_string(), &context)?;
+        sqlx::query("INSERT INTO waveform_storage_grants(plane_id,org_id,actor_id,endpoint_id,token_cipher,expires_at) VALUES($1,$2,$3,$4,$5,'2099-01-01') ON CONFLICT(plane_id,org_id,actor_id,endpoint_id) DO UPDATE SET token_cipher=excluded.token_cipher,invalidated_at=NULL")
+            .bind(identity.plane.id).bind(org).bind(identity.storage_actor_id).bind(endpoint).bind(cipher).execute(&state.pool).await?;
+    }
+    Ok(())
 }

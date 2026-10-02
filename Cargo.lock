@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "briefcase-client"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "futures-core",
  "libc",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-iam-client"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -2045,7 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-waveform"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",

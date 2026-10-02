@@ -177,7 +177,8 @@ impl BriefcasePort for FailClosedBriefcaseStore {
         let entry = uploader
             .upload(super::briefcase_sdk::AudioUpload {
                 app_id: self.application_id.as_str(),
-                organization: request.authorization.organization_id.as_str(),
+                organization: request.delegated_authorization.organization_id.as_str(),
+                operation_id: request.request_id.as_uuid(),
                 delegated_authorization: &request.delegated_authorization,
                 environment: self.environment.clone(),
                 filename: &request.filename,
@@ -268,6 +269,10 @@ mod tests {
         purpose: DelegationPurpose,
     ) -> Result<DelegatedAuthorization, Box<dyn std::error::Error>> {
         Ok(DelegatedAuthorization {
+            organization_id: "acme".parse()?,
+            commit_proof: None,
+            list_proof: None,
+            actor_id: None,
             testing_secret: None,
             application_id: ApplicationId::from_str("waveform")?,
             proof: OboProof::new("obo_downstream-proof".to_owned())?,

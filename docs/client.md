@@ -1,5 +1,8 @@
 # Silicon Waveform Rust client
 
+> **Integration preview for Waveform 0.5.0 / IAM 5.0.0 / Briefcase 3.0.0.** These guides precede the coordinated runtime rollout. Upgrade dependent services and clients together; public documentation alone does not indicate the new runtime is live.
+
+
 Add the package with `cargo add silicon-waveform-client@0.3`. Production clients
 use `https://backend.waveform.teamofsilicons.com` as their API origin.
 
@@ -141,3 +144,7 @@ remain supported.
 `provider_options` map. Top-level `byok: Option<ByokCapabilities>` reports saved
 and per-request support plus credential precedence. Older servers may omit this
 metadata; optional fields remain `None` and the options map remains empty.
+
+## Reusable OBO speech
+
+An application can use `client.with_obo_token("ting", access_token)?` to replace its ordinary bearer with a reusable approved IAM graph token. Waveform verifies the endpoint on every call. The helper sends `X-App-ID` and `X-IAM-OBO-Access-Token`, preserves the selected testing environment, and sends no ordinary bearer. Never pass ATA credentials to this helper.

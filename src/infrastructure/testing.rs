@@ -358,6 +358,10 @@ impl IamPort for FixtureIam {
         let proof = crate::domain::auth::OboProof::new("test-plane-fixture-proof".to_owned())
             .map_err(|_| IamError::InvalidResponse)?;
         Ok(DelegatedAuthorization {
+            organization_id: request.authorization.organization_id.clone(),
+            commit_proof: Some(proof.clone()),
+            list_proof: Some(proof.clone()),
+            actor_id: None,
             testing_secret: None,
             application_id: self.briefcase_application.clone(),
             proof,
@@ -710,7 +714,7 @@ mod tests {
                 )
                 .await?;
             let entry = &manifest["clips"][&profile.id];
-            let hash = silicon_iam_client::api::obo::body_sha256(artifact.bytes());
+            let hash = crate::infrastructure::auth::test_digest(artifact.bytes());
             assert_eq!(entry["sha256"], hash);
             assert!(hashes.insert(hash));
             assert_eq!(entry["voice"], profile.gemini_voice);

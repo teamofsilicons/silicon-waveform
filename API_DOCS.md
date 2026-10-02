@@ -15,22 +15,21 @@ Waveform provides a provider-independent interface for text-to-speech and speech
 ### Authentication
 
 - **Bearer authentication:** IAM access token for a Carbon or Silicon.
-- **OBO Access:** `X-IAM-OBO-Access-Proof` and `X-App-ID` for applications acting for an actor.
+- **OBO Access:** `X-IAM-OBO-Access-Token` and `X-App-ID` for applications acting for an actor.
 - **Organization context:** Speech operations require `X-Org-ID`.
 - **Idempotency:** Speech operations require `Idempotency-Key`.
 
 Exactly one authentication mode is accepted. Sending both Bearer and OBO
 credentials, or sending only one header from the OBO pair, is a malformed
-request. Waveform verifies bearer tokens with IAM introspection. OBO speech is
-currently fail-closed until the released adapter threads the exact request
-method, path, and body digest required by IAM's current proof-verification
-contract; Waveform never forwards an unverified proof downstream.
+request. Waveform introspects bearer sessions and verifies reusable OBO tokens online against its own endpoint and the selected account, organization and testing plane. Declared downstream calls forward the same token with the provider-selected context. Retired per-request proofs are rejected.
+
+Before direct TTS or Briefcase source reads, use the separate [storage consent flow](docs/iam.md). `403 storage_authorization_required` requests that approval without invalidating the Waveform login. TTS checks permission before paid generation. Storage credentials are encrypted server-side and refreshed with stable retry identities.
 
 All current generation requests are synchronous and hold the connection until success or terminal failure.
 
 Production bearer TTS and test-plane TTS uploads are connected to the official
 IAM and Briefcase SDKs. STT delegated source reads and replay access checks use
-Briefcase 1.1.0. Current testing uses Waveform’s IAM test app_secret, live IAM discovery, and downstream Briefcase credentials from OBO exchange. No separate Briefcase key is entered by the caller. See [the testing guide](docs/testing.md) and [implementation evidence](docs/IMPLEMENTATION.md).
+the current Briefcase client. Current testing uses Waveform’s IAM test app_secret, live IAM discovery, and downstream Briefcase credentials from feature consent. No separate Briefcase key is entered by the caller. See [the testing guide](docs/testing.md) and [implementation evidence](docs/IMPLEMENTATION.md).
 
 ## IAM discovery
 
@@ -63,7 +62,7 @@ TTS attempts only the first resolved provider by default. Set `auto_fallback: tr
 Waveform creates the file in the represented actor's Briefcase application
 folder using a name based on the canonical operation start time established by
 the first successful PostgreSQL idempotency claim. The permanent URL is the
-durable reference. The published one-shot upload contract returns no signed
+durable reference. The reserve/transfer/commit upload contract returns no signed
 delivery URL, so `temporary_url` is currently null in the running service.
 
 The language hint may be ignored by providers that do not accept it. It must not change the response schema.
@@ -179,9 +178,10 @@ or Briefcase credentials are valid and does not make billable provider calls.
 ```text
 Caller submits text and optional language
   -> Waveform verifies actor context
+  -> Waveform checks separately approved storage authority
   -> Waveform attempts provider chain
   -> successful audio is normalized to MP3
-  -> Waveform mints an exact-byte proof and stores MP3 in Briefcase through OBO Access
+  -> Waveform reserves exact bytes, transfers with a staging capability, and commits with live OBO authority
   -> caller receives a permanent URL and null temporary URL
 ```
 
@@ -191,7 +191,7 @@ Caller submits text and optional language
 DM uploads voice file to Briefcase
   -> caller submits the permanent URL using its Waveform-issued bearer token
   -> Waveform verifies actor context and obtains Briefcase delegation
-  -> Waveform resolves and reads the authorized Briefcase file with fresh proofs
+  -> Waveform resolves and reads the authorized Briefcase file with reusable endpoint tokens
   -> Waveform measures decoded source duration
   -> Waveform attempts provider chain
   -> DM sends voice message with transcript or a recorded transcription failure
@@ -200,7 +200,7 @@ DM uploads voice file to Briefcase
 ## Remaining integration work and optional extensions
 
 - Deployed paired IAM/Briefcase testing with real test keys and a test login remains required.
-- Inbound OBO speech cannot mint a downstream Briefcase proof from the consumed incoming proof. Use a bearer token issued to Waveform for implemented speech flows.
+- Incoming OBO verifies the live graph and forwards the same token to declared dependencies. Deploy the full caller/receiver graph together.
 - Voice/style controls, diarization, transcript segments, quotas and asynchronous execution are outside the current product contract.
 - Jobs expose running/failed/completed state, polling, cancellation recovery and expired-lease recovery; processing itself remains synchronous and bounded.
 

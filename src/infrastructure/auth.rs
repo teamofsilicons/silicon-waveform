@@ -1,9 +1,6 @@
-//! Online IAM authorization and exact-byte upload delegation.
-//!
-//! Bearer introspection is bounded and checked against the selected actor action.
-//! Storage proofs use the official SDK and a separately configured Briefcase
-//! audience. Uploads bind normalized bytes; reads bind immutable SDK manifests.
-//! Inbound OBO proof chaining is not part of the released IAM contract.
+//! Live IAM authentication, reusable endpoint verification and storage consent.
+//! Direct sessions use the encrypted feature grant broker. Incoming OBO tokens
+//! retain the same credential along a declared, user-approved dependency chain.
 
 use std::{fmt, str::FromStr as _, time::Duration};
 
@@ -49,6 +46,7 @@ pub enum IamAdapterBuildError {
 #[derive(Clone)]
 pub struct IamHttpAdapter {
     identity_pool: Option<sqlx::PgPool>,
+    storage_grants: Option<crate::control::storage::StorageGrants>,
     introspection_url: Url,
     obo_verify_url: Url,
     sdk: silicon_iam_client::Client,
@@ -64,8 +62,8 @@ impl IamHttpAdapter {
     /// Builds an IAM adapter from validated process settings.
     ///
     /// The resulting client disables redirects, applies explicit connect and
-    /// whole-request deadlines, bounds idle connections, and never retries the
-    /// single-use OBO verification request.
+    /// whole-request deadlines, bounds idle connections, and never blindly retries an
+    /// OBO verification request.
     ///
     /// # Errors
     ///
@@ -73,7 +71,7 @@ impl IamHttpAdapter {
     /// underlying HTTP client cannot be constructed safely.
     pub fn new(settings: &IamSettings) -> Result<Self, IamAdapterBuildError> {
         if settings.token_introspection_path != "/api/v1/oauth/introspect"
-            || settings.obo_verify_path != "/api/v1/obo-access/verify"
+            || settings.obo_verify_path != "/api/v1/obo-access/token-verifications"
         {
             return Err(IamAdapterBuildError::InvalidEndpoint);
         }
@@ -104,6 +102,7 @@ impl IamHttpAdapter {
         }
         Ok(Self {
             identity_pool: None,
+            storage_grants: None,
             introspection_url,
             obo_verify_url,
             sdk,
@@ -170,11 +169,27 @@ impl IamHttpAdapter {
 
     async fn authorize_obo(
         &self,
-        _request: &AuthorizationRequest,
-        _credentials: &OboCredentials,
+        request: &AuthorizationRequest,
+        credentials: &OboCredentials,
     ) -> Result<AuthorizedActor, IamError> {
-        tokio::task::yield_now().await;
-        Err(IamError::ContractUnavailable)
+        verify_obo(
+            &self.sdk,
+            self.identity_pool.as_ref(),
+            uuid::Uuid::nil(),
+            None,
+            &self.application_id,
+            request,
+            credentials,
+        )
+        .await
+    }
+
+    pub(crate) fn with_storage_grants(
+        mut self,
+        store: Option<crate::control::storage::StorageGrants>,
+    ) -> Self {
+        self.storage_grants = store;
+        self
     }
 
     /// Selects the independently configured Briefcase audience for upload delegation.
@@ -286,6 +301,8 @@ impl IamPort for IamHttpAdapter {
     ) -> Result<DelegatedAuthorization, IamError> {
         let delegated = delegate_storage(
             &self.sdk,
+            self.storage_grants.as_ref(),
+            uuid::Uuid::nil(),
             &self.application_id,
             self.storage_audience
                 .as_deref()
@@ -303,6 +320,8 @@ impl IamPort for IamHttpAdapter {
 /// Storage delegation using an already selected test IAM client. It cannot
 /// authenticate callers; the control plane must validate their test identity first.
 pub(crate) struct TestStorageDelegator {
+    pub(crate) store: crate::control::storage::StorageGrants,
+    pub(crate) plane: uuid::Uuid,
     pub(crate) sdk: silicon_iam_client::Client,
     pub(crate) application_id: ApplicationId,
     pub(crate) audience: String,
@@ -318,8 +337,15 @@ impl IamPort for TestStorageDelegator {
         &self,
         request: DelegationRequest,
     ) -> Result<DelegatedAuthorization, IamError> {
-        let delegated =
-            delegate_storage(&self.sdk, &self.application_id, &self.audience, request).await?;
+        let delegated = delegate_storage(
+            &self.sdk,
+            Some(&self.store),
+            self.plane,
+            &self.application_id,
+            &self.audience,
+            request,
+        )
+        .await?;
         if delegated.testing_secret.is_none() {
             return Err(IamError::InvalidResponse);
         }
@@ -330,6 +356,8 @@ impl IamPort for TestStorageDelegator {
 /// Delegates storage for an identity already verified by the source-target route.
 /// The selected SDK client retains its production or testing plane credentials.
 pub(crate) struct SourceStorageDelegator {
+    pub(crate) store: crate::control::storage::StorageGrants,
+    pub(crate) plane: uuid::Uuid,
     pub(crate) sdk: silicon_iam_client::Client,
     pub(crate) application_id: ApplicationId,
     pub(crate) audience: String,
@@ -346,8 +374,15 @@ impl IamPort for SourceStorageDelegator {
         &self,
         request: DelegationRequest,
     ) -> Result<DelegatedAuthorization, IamError> {
-        let delegated =
-            delegate_storage(&self.sdk, &self.application_id, &self.audience, request).await?;
+        let delegated = delegate_storage(
+            &self.sdk,
+            Some(&self.store),
+            self.plane,
+            &self.application_id,
+            &self.audience,
+            request,
+        )
+        .await?;
         if delegated.testing_secret.is_some() != self.testing {
             return Err(IamError::InvalidResponse);
         }
@@ -355,78 +390,248 @@ impl IamPort for SourceStorageDelegator {
     }
 }
 
+pub(crate) async fn verify_obo(
+    sdk: &silicon_iam_client::Client,
+    pool: Option<&sqlx::PgPool>,
+    plane: uuid::Uuid,
+    expected_testing: Option<uuid::Uuid>,
+    application_id: &ApplicationId,
+    request: &AuthorizationRequest,
+    credentials: &OboCredentials,
+) -> Result<AuthorizedActor, IamError> {
+    if !credentials.proof.expose_secret().starts_with("oba_") {
+        return Err(IamError::InvalidCredential);
+    }
+    let (endpoint, path) = match request.action {
+        WaveformAction::SynthesizeSpeech => ("waveform.tts", "/api/v1/tts"),
+        WaveformAction::TranscribeSpeech => ("waveform.stt", "/api/v1/stt"),
+    };
+    let verified = sdk
+        .obo()
+        .verify(&silicon_iam_client::models::OboTokenVerificationRequest {
+            access_token: credentials.proof.expose_secret().to_owned(),
+            endpoint_id: endpoint.to_owned(),
+            request: silicon_iam_client::models::OboTokenRequestBinding {
+                method: "POST".to_owned(),
+                path: path.to_owned(),
+            },
+        })
+        .await
+        .map_err(map_sdk_error)?;
+    if !verified.active
+        || verified.issuer_app_id != credentials.application_id.as_str()
+        || verified.endpoint.app_id != application_id.as_str()
+        || verified.endpoint.endpoint_id != endpoint
+        || verified.endpoint.path != path
+        || verified.org_id != request.organization_id.as_str()
+        || verified.authorization.org_id != verified.org_id
+        || verified.authorization.audience != application_id.as_str()
+        || verified.authorization.testing_environment_id != expected_testing
+        || verified
+            .authorization
+            .public_id
+            .as_ref()
+            .is_some_and(|id| id != &verified.actor.public_id)
+        || verified.expires_at <= OffsetDateTime::now_utc()
+    {
+        return Err(IamError::InvalidCredential);
+    }
+    let kind = match verified.actor.type_field {
+        silicon_iam_client::models::ActorRefType::Carbon => ActorKind::Carbon,
+        silicon_iam_client::models::ActorRefType::Silicon => ActorKind::Silicon,
+        _ => return Err(IamError::InvalidResponse),
+    };
+    if crate::infrastructure::actor_keys::canonical_kind(&verified.actor.public_id) != Some(kind) {
+        return Err(IamError::InvalidResponse);
+    }
+    let private_id = if let Some(pool) = pool {
+        crate::infrastructure::actor_keys::resolve(pool, plane, &verified.actor.public_id)
+            .await
+            .map_err(|_| IamError::Unavailable)?
+    } else {
+        #[cfg(not(test))]
+        return Err(IamError::ContractUnavailable);
+        #[cfg(test)]
+        uuid::Uuid::new_v4()
+    };
+    Ok(AuthorizedActor {
+        actor: Actor::new(
+            kind,
+            ActorId::new(private_id).map_err(|_| IamError::InvalidResponse)?,
+        ),
+        organization_id: request.organization_id.clone(),
+        originating_application: Some(
+            verified
+                .originating_app_id
+                .parse()
+                .map_err(|_| IamError::InvalidResponse)?,
+        ),
+        expires_at: Some(verified.expires_at),
+    })
+}
+
+async fn storage_token(
+    sdk: &silicon_iam_client::Client,
+    store: Option<&crate::control::storage::StorageGrants>,
+    plane: uuid::Uuid,
+    audience: &str,
+    request: &DelegationRequest,
+    endpoint: &str,
+) -> Result<silicon_iam_client::models::OboAccessToken, IamError> {
+    let token = request
+        .subject_token
+        .as_ref()
+        .ok_or(IamError::StorageAuthorizationRequired)?;
+    if request.authorization.originating_application.is_some() {
+        if !token.expose_secret().starts_with("oba_") {
+            return Err(IamError::InvalidCredential);
+        }
+        let response = sdk
+            .obo()
+            .delegate(
+                &silicon_iam_client::models::OboDelegationRequest {
+                    access_token: token.expose_secret().to_owned(),
+                    audience: audience.to_owned(),
+                    endpoint_id: endpoint.to_owned(),
+                },
+                &silicon_iam_client::Mutation::new(),
+            )
+            .await
+            .map_err(map_sdk_error)?;
+        if response.access_token != token.expose_secret() {
+            return Err(IamError::InvalidResponse);
+        }
+        return Ok(response);
+    }
+    let pair = store
+        .ok_or(IamError::ContractUnavailable)?
+        .token(
+            sdk,
+            plane,
+            request.authorization.organization_id.as_str(),
+            request.authorization.actor.id.as_uuid(),
+            audience,
+            endpoint,
+        )
+        .await?;
+    // Same fields, excluding the encrypted refresh credential retained by the broker.
+    serde_json::from_value(serde_json::to_value(&pair).map_err(|_| IamError::InvalidResponse)?)
+        .map_err(|_| IamError::InvalidResponse)
+}
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps provider token and selected-context checks together"
+)]
 async fn delegate_storage(
     sdk: &silicon_iam_client::Client,
+    store: Option<&crate::control::storage::StorageGrants>,
+    plane: uuid::Uuid,
     application_id: &ApplicationId,
     audience: &str,
     request: DelegationRequest,
 ) -> Result<DelegatedAuthorization, IamError> {
-    let token = request.subject_token.ok_or(IamError::ContractUnavailable)?;
-    let (endpoint_id, path, body_sha256, metadata) = match request.purpose {
-        crate::domain::auth::DelegationPurpose::StoreGeneratedAudio => {
-            let upload = request.upload.ok_or(IamError::ContractUnavailable)?;
-            (
-                "briefcase.files.create".to_owned(),
-                "/api/v1/obo/files".to_owned(),
-                upload.body_sha256,
-                serde_json::json!({"path":"", "name":upload.filename.as_str(), "content_type":"audio/mpeg"}),
-            )
-        }
+    let endpoint = match request.purpose {
+        crate::domain::auth::DelegationPurpose::StoreGeneratedAudio => "briefcase.uploads.reserve",
         crate::domain::auth::DelegationPurpose::ReadBriefcaseFile => {
-            let binding = request.manifest.ok_or(IamError::ContractUnavailable)?;
+            let manifest = request
+                .manifest
+                .as_ref()
+                .ok_or(IamError::ContractUnavailable)?;
             if !matches!(
-                (binding.endpoint_id.as_str(), binding.path.as_str()),
+                (manifest.endpoint_id.as_str(), manifest.path.as_str()),
                 ("briefcase.entries.list", "/api/v1/obo/entries/list")
                     | ("briefcase.files.read", "/api/v1/obo/files/read")
             ) {
                 return Err(IamError::Forbidden);
             }
-            (
-                binding.endpoint_id,
-                binding.path,
-                binding.body_sha256,
-                serde_json::json!({}),
-            )
+            &manifest.endpoint_id
         }
     };
-    let catalog = sdk
-        .obo()
-        .endpoints(audience)
-        .await
-        .map_err(|_| IamError::Unavailable)?;
-    // The catalog owner identifies the recipient application, not the member's
-    // storage organization. IAM authorizes the selected data org in the exchange.
-    if catalog.application.app_id != audience || catalog.application.org_id.is_empty() {
-        return Err(IamError::OrganizationMismatch);
-    }
-    let selected = catalog
-        .endpoints
-        .iter()
-        .find(|item| item.endpoint_id == endpoint_id)
-        .ok_or(IamError::ContractUnavailable)?;
-    if selected.path != path {
-        return Err(IamError::ContractUnavailable);
-    }
-    let exchange = silicon_iam_client::models::OboExchangeRequest {
-        org_id: Some(request.authorization.organization_id.as_str().to_owned()),
-        subject_token: token.expose_secret().to_owned(),
-        audience: audience.to_owned(),
-        endpoint_id,
-        metadata,
-        request: silicon_iam_client::models::OboExchangeRequestBinding {
-            method: "POST".to_owned(),
-            body_sha256,
-        },
-    };
-    let response = sdk
-        .obo()
-        .exchange_signed(&exchange, &catalog, &silicon_iam_client::Mutation::new())
-        .await
-        .map_err(|_| IamError::Unavailable)?;
-    if response.expires_at <= OffsetDateTime::now_utc() {
+    let response = storage_token(sdk, store, plane, audience, &request, endpoint).await?;
+    if response.audience != audience
+        || response.endpoint_id != endpoint
+        || response.expires_at <= OffsetDateTime::now_utc()
+        || response.testing_context.is_some() == plane.is_nil()
+    {
         return Err(IamError::InvalidResponse);
     }
+    let commit = if request.purpose == crate::domain::auth::DelegationPurpose::StoreGeneratedAudio {
+        let commit = storage_token(
+            sdk,
+            store,
+            plane,
+            audience,
+            &request,
+            "briefcase.uploads.commit",
+        )
+        .await?;
+        if commit.audience != audience
+            || commit.endpoint_id != "briefcase.uploads.commit"
+            || commit.org_id != response.org_id
+            || commit.actor.as_ref().map(|a| &a.public_id)
+                != response.actor.as_ref().map(|a| &a.public_id)
+            || commit.expires_at <= OffsetDateTime::now_utc()
+            || commit
+                .testing_context
+                .as_ref()
+                .map(|c| (&c.app_id, &c.app_secret))
+                != response
+                    .testing_context
+                    .as_ref()
+                    .map(|c| (&c.app_id, &c.app_secret))
+        {
+            return Err(IamError::InvalidResponse);
+        }
+        Some(
+            crate::domain::auth::OboProof::new(commit.access_token)
+                .map_err(|_| IamError::InvalidResponse)?,
+        )
+    } else {
+        None
+    };
+    let actor_id = response.actor.as_ref().map(|actor| actor.public_id.clone());
+    let list = if request.purpose == crate::domain::auth::DelegationPurpose::StoreGeneratedAudio {
+        let list = storage_token(
+            sdk,
+            store,
+            plane,
+            audience,
+            &request,
+            "briefcase.entries.list",
+        )
+        .await?;
+        if list.audience != audience
+            || list.endpoint_id != "briefcase.entries.list"
+            || list.org_id != response.org_id
+            || list.actor.as_ref().map(|a| &a.public_id)
+                != response.actor.as_ref().map(|a| &a.public_id)
+            || list
+                .testing_context
+                .as_ref()
+                .map(|c| (&c.app_id, &c.app_secret))
+                != response
+                    .testing_context
+                    .as_ref()
+                    .map(|c| (&c.app_id, &c.app_secret))
+            || list.expires_at <= OffsetDateTime::now_utc()
+        {
+            return Err(IamError::InvalidResponse);
+        }
+        Some(
+            crate::domain::auth::OboProof::new(list.access_token)
+                .map_err(|_| IamError::InvalidResponse)?,
+        )
+    } else {
+        None
+    };
     Ok(DelegatedAuthorization {
+        list_proof: list,
+        actor_id,
+        organization_id: response
+            .org_id
+            .parse()
+            .map_err(|_| IamError::InvalidResponse)?,
+        commit_proof: commit,
         testing_secret: response
             .testing_context
             .map(|context| {
@@ -439,7 +644,7 @@ async fn delegate_storage(
             })
             .transpose()?,
         application_id: application_id.clone(),
-        proof: crate::domain::auth::OboProof::new(response.access_proof)
+        proof: crate::domain::auth::OboProof::new(response.access_token)
             .map_err(|_| IamError::InvalidResponse)?,
         purpose: request.purpose,
         expires_at: response.expires_at,
@@ -533,7 +738,14 @@ fn map_status(status: StatusCode) -> IamError {
 }
 
 #[cfg(test)]
+pub(crate) fn test_digest(value: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(value))
+}
+
+#[cfg(test)]
 mod tests {
+    use super::{Actor, ActorId, ActorKind, AuthorizedActor};
     use std::{str::FromStr as _, time::Duration};
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -578,7 +790,7 @@ mod tests {
             app_id: "waveform".to_owned(),
             app_secret: SecretString::from("unit-test-app-secret".to_owned()),
             token_introspection_path: "/api/v1/oauth/introspect".to_owned(),
-            obo_verify_path: "/api/v1/obo-access/verify".to_owned(),
+            obo_verify_path: "/api/v1/obo-access/token-verifications".to_owned(),
             audience: "waveform".to_owned(),
             tts_action: "waveform.tts".to_owned(),
             stt_action: "waveform.stt".to_owned(),
@@ -642,7 +854,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn obo_verification_is_fail_closed_until_request_bound_contract()
+    async fn retired_proof_is_rejected_without_an_upstream_call()
     -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
         let adapter = IamHttpAdapter::new(&settings(&server)?)?;
@@ -657,7 +869,7 @@ mod tests {
                 request_id: request_id()?,
             })
             .await;
-        assert_eq!(result, Err(IamError::ContractUnavailable));
+        assert_eq!(result, Err(IamError::InvalidCredential));
         Ok(())
     }
 
@@ -748,133 +960,102 @@ mod tests {
         assert!(matches!(result, Err(IamError::ContractUnavailable)));
         Ok(())
     }
+    fn obo_snapshot() -> serde_json::Value {
+        json!({"active":true,"token_id":Uuid::new_v4(),"grant_id":Uuid::new_v4(),"actor":{"type":"carbon","public_id":"c:alice"},"org_id":"acme","issuer_app_id":"calling-app","originating_app_id":"calling-app","endpoint":{"app_id":"waveform","endpoint_id":"waveform.tts","path":"/api/v1/tts"},"chain":[{"app_id":"calling-app","audience":"waveform","endpoint_id":"waveform.tts"}],"authorization":{"organization_id":Uuid::new_v4(),"membership_id":"c:alice[acme]","membership_version":1,"authorization_epoch":1,"org_role":null,"tags":null,"audience":"waveform","org_id":"acme","testing_environment_id":null,"public_id":"c:alice","actor_type":"carbon","scopes":["obo:waveform:waveform.tts"]},"expires_at":"2099-01-01T00:00:00Z"})
+    }
+    fn obo_request() -> Result<AuthorizationRequest, Box<dyn std::error::Error>> {
+        Ok(AuthorizationRequest {
+            credentials: InboundCredentials::OnBehalfOf(OboCredentials {
+                application_id: "calling-app".parse()?,
+                proof: OboProof::new("oba_shared-chain".to_owned())?,
+            }),
+            organization_id: organization()?,
+            action: WaveformAction::SynthesizeSpeech,
+            request_id: request_id()?,
+        })
+    }
     #[tokio::test]
-    async fn upload_delegation_uses_configured_storage_audience_and_exact_bytes()
+    async fn shared_token_is_verified_each_time_and_rejects_misbound_authority()
     -> Result<(), Box<dyn std::error::Error>> {
-        use crate::domain::{
-            auth::{AuthorizedActor, DelegatedUploadBinding},
-            identity::{Actor, ActorId, ActorKind},
-            media::GeneratedAudioFileName,
-        };
-        use wiremock::matchers::body_partial_json;
+        for fault in [
+            None,
+            Some("issuer"),
+            Some("endpoint"),
+            Some("org"),
+            Some("plane"),
+            Some("actor"),
+            Some("expiry"),
+        ] {
+            let server = MockServer::start().await;
+            let mut body = obo_snapshot();
+            match fault {
+                Some("issuer") => body["issuer_app_id"] = json!("other-app"),
+                Some("endpoint") => body["endpoint"]["path"] = json!("/api/v1/stt"),
+                Some("org") => body["org_id"] = json!("other"),
+                Some("plane") => {
+                    body["authorization"]["testing_environment_id"] = json!(Uuid::new_v4());
+                }
+                Some("actor") => body["actor"]["public_id"] = json!("si:alice"),
+                Some("expiry") => body["expires_at"] = json!("2000-01-01T00:00:00Z"),
+                _ => {}
+            }
+            Mock::given(method("POST"))
+                .and(path("/api/v1/obo-access/token-verifications"))
+                .and(header("authorization", basic_authorization()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(2)
+                .mount(&server)
+                .await;
+            let adapter = IamHttpAdapter::new(&settings(&server)?)?;
+            for _ in 0..2 {
+                let result = adapter.authorize(obo_request()?).await;
+                if fault.is_none() {
+                    let actor = result?;
+                    assert_eq!(actor.organization_id.as_str(), "acme");
+                    assert_eq!(
+                        actor.originating_application.map(|a| a.to_string()),
+                        Some("calling-app".to_owned())
+                    );
+                } else {
+                    assert!(result.is_err(), "{fault:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    #[allow(clippy::expect_used, reason = "mock request assertion")]
+    async fn downstream_keeps_shared_token_and_uses_selected_provider_subject()
+    -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
-        let mut config = settings(&server)?;
-        config.app_id = "waveform".to_owned();
-        config.audience = "waveform".to_owned();
-        let adapter = IamHttpAdapter::new(&config)?.with_storage_audience("storage");
-        let filename =
-            GeneratedAudioFileName::for_request(time::OffsetDateTime::now_utc(), request_id()?);
-        let digest = silicon_iam_client::api::obo::body_sha256(b"exact normalized bytes");
-        Mock::given(method("GET")).and(path("/api/v1/obo-access/applications/storage/endpoints"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "application":{"app_id":"storage","org_id":"acme"},
-                "endpoints":[{"critical":false,"endpoint_id":"briefcase.files.create","path":"/api/v1/obo/files","metadata":{"path":{"type":"string"},"name":{"type":"string"},"content_type":{"type":"string"}}}]
-            }))).expect(1).mount(&server).await;
-        Mock::given(method("POST")).and(path("/api/v1/obo-access/exchanges"))
-            .and(body_partial_json(json!({"org_id":"client-workspace", "subject_token":"oat_request_subject", "audience":"storage", "endpoint_id":"briefcase.files.create", "request":{"method":"POST","body_sha256":digest}, "metadata":{"name":filename.as_str(),"path":"","content_type":"audio/mpeg"}})))
-            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"access_proof":"obo_exact_upload","proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"})))
-            .expect(1).mount(&server).await;
-        let proof = adapter
+        Mock::given(method("POST")).and(path("/api/v1/obo-access/delegations")).and(header("authorization",basic_authorization())).respond_with(|r:&wiremock::Request|{
+            let body:serde_json::Value=serde_json::from_slice(&r.body).expect("mock JSON");
+            assert_eq!(body["access_token"],"oba_shared-chain");assert_eq!(body["audience"],"briefcase");
+            ResponseTemplate::new(200).set_body_json(json!({"grant_id":Uuid::new_v4(),"token_id":Uuid::new_v4(),"access_token":"oba_shared-chain","token_type":"Bearer","expires_in":1800,"expires_at":"2099-01-01T00:00:00Z","audience":"briefcase","endpoint_id":body["endpoint_id"],"org_id":"other-storage-org","actor":{"type":"silicon","public_id":"si:storage-agent"},"scope":""}))
+        }).expect(3).mount(&server).await;
+        let adapter = IamHttpAdapter::new(&settings(&server)?)?.with_storage_audience("briefcase");
+        let result = adapter
             .delegate(DelegationRequest {
                 authorization: AuthorizedActor {
                     actor: Actor::new(ActorKind::Carbon, ActorId::new(Uuid::new_v4())?),
-                    organization_id: "client-workspace".parse()?,
-                    originating_application: None,
+                    organization_id: organization()?,
+                    originating_application: Some("calling-app".parse()?),
                     expires_at: None,
                 },
                 purpose: DelegationPurpose::StoreGeneratedAudio,
                 request_id: request_id()?,
-                subject_token: Some(AccessToken::new("oat_request_subject".to_owned())?),
+                subject_token: Some(AccessToken::new("oba_shared-chain".to_owned())?),
+                upload: None,
                 manifest: None,
-                upload: Some(DelegatedUploadBinding {
-                    filename,
-                    body_sha256: digest,
-                }),
             })
             .await?;
-        assert_eq!(proof.application_id.as_str(), "waveform");
-        assert_eq!(proof.proof.expose_secret(), "obo_exact_upload");
-        let requests = server.received_requests().await.ok_or("no requests")?;
-        assert!(
-            requests
-                .iter()
-                .all(|request| !request.headers.contains_key("x-org-id"))
+        assert_eq!(result.proof.expose_secret(), "oba_shared-chain");
+        assert_eq!(
+            result.commit_proof.ok_or("commit")?.expose_secret(),
+            "oba_shared-chain"
         );
-        let exchange = requests
-            .iter()
-            .find(|r| r.url.path().ends_with("exchanges"))
-            .ok_or("missing exchange")?;
-        assert!(exchange.headers.contains_key("x-obo-signature"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delegated_reads_reject_wrong_catalog_and_exact_request_binding()
-    -> Result<(), Box<dyn std::error::Error>> {
-        use crate::domain::{
-            auth::{AuthorizedActor, DelegatedManifestBinding},
-            identity::{Actor, ActorId, ActorKind},
-        };
-        for (catalog_app, catalog_owner, catalog_path, expected) in [
-            (
-                "other-storage",
-                "other",
-                "/api/v1/obo/entries/list",
-                IamError::OrganizationMismatch,
-            ),
-            (
-                "storage",
-                "",
-                "/api/v1/obo/entries/list",
-                IamError::OrganizationMismatch,
-            ),
-            (
-                "storage",
-                "acme",
-                "/api/v1/obo/files/read",
-                IamError::ContractUnavailable,
-            ),
-        ] {
-            let server = MockServer::start().await;
-            let mut config = settings(&server)?;
-            config.app_id = "waveform".to_owned();
-            config.audience = config.app_id.clone();
-            let adapter = IamHttpAdapter::new(&config)?.with_storage_audience("storage");
-            Mock::given(method("GET"))
-                .and(path("/api/v1/obo-access/applications/storage/endpoints"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "application":{"app_id":catalog_app,"org_id":catalog_owner},
-                    "endpoints":[{"critical":false,"endpoint_id":"briefcase.entries.list","path":catalog_path,"metadata":{}}]
-                }))).expect(1).mount(&server).await;
-            let result = adapter
-                .delegate(DelegationRequest {
-                    authorization: AuthorizedActor {
-                        actor: Actor::new(ActorKind::Carbon, ActorId::new(Uuid::new_v4())?),
-                        organization_id: "client-workspace".parse()?,
-                        originating_application: None,
-                        expires_at: None,
-                    },
-                    purpose: DelegationPurpose::ReadBriefcaseFile,
-                    request_id: request_id()?,
-                    subject_token: Some(AccessToken::new("oat_request_subject".to_owned())?),
-                    manifest: Some(DelegatedManifestBinding {
-                        endpoint_id: "briefcase.entries.list".to_owned(),
-                        path: "/api/v1/obo/entries/list".to_owned(),
-                        body_sha256: silicon_iam_client::api::obo::body_sha256(b"{}"),
-                    }),
-                    upload: None,
-                })
-                .await;
-            assert_eq!(result.err(), Some(expected));
-            assert_eq!(
-                server
-                    .received_requests()
-                    .await
-                    .ok_or("requests missing")?
-                    .len(),
-                1
-            );
-        }
+        assert_eq!(result.organization_id.as_str(), "other-storage-org");
+        assert_eq!(result.actor_id.as_deref(), Some("si:storage-agent"));
         Ok(())
     }
     #[tokio::test]

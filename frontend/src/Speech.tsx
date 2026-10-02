@@ -25,6 +25,7 @@ import {
 } from "./api";
 import { Copy, Empty, Heading, Icon, Notice, Order } from "./ui";
 import VoiceProfilePicker from "./VoiceProfilePicker";
+import StorageConsent from "./StorageConsent";
 import type { VoiceProfile } from "./api";
 import ProviderControls from "./ProviderControls";
 import { publicRequestSignature, speechRequest } from "./speech-request";
@@ -64,9 +65,17 @@ export default function Speech(props: {
   );
   const count = () => [...text()].length;
   let attempt: { signature: string; key: string; id: string } | undefined;
+  const [needsStorage, setNeedsStorage] = createSignal(false);
+  const [storageApproved, setStorageApproved] = createSignal(false);
+  // Retain only in memory until explicit retry/cancel; never serialize provider keys.
+  let pendingStorage: { body: ReturnType<typeof speechRequest>; attempt: NonNullable<typeof attempt> } | undefined;
+  function cancelStorage() {
+    pendingStorage = undefined; attempt = undefined;
+    setNeedsStorage(false); setStorageApproved(false); setError();
+  }
   let mounted = true;
   onCleanup(() => {
-    mounted = false;
+    mounted = false; pendingStorage = undefined;
   });
   async function submit(e: SubmitEvent) {
     e.preventDefault();
@@ -75,6 +84,7 @@ export default function Speech(props: {
       props.signin();
       return;
     }
+    if (pendingStorage) cancelStorage();
     setError();
     setResult();
     if (props.operation === "tts" && (!text().trim() || count() > 4096)) {
@@ -105,15 +115,24 @@ export default function Speech(props: {
       providerOptions: providerOptions(),
       requestKey: requestKey(),
     });
-    const usesRequestKey = !!body.provider_keys;
     const signature = publicRequestSignature(body);
-    if (usesRequestKey || !attempt || attempt.signature !== signature)
+    if (body.provider_keys || !attempt || attempt.signature !== signature)
       attempt = {
         signature,
         key: crypto.randomUUID(),
         id: crypto.randomUUID(),
       };
-    setRequestId(attempt.id);
+    await runSpeech(body, attempt);
+  }
+  async function retryStorage() {
+    const pending = pendingStorage;
+    if (!pending || busy()) return;
+    setNeedsStorage(false); setStorageApproved(false); setError();
+    await runSpeech(pending.body, pending.attempt);
+  }
+  async function runSpeech(body: ReturnType<typeof speechRequest>, currentAttempt: {signature:string;key:string;id:string}) {
+    const usesRequestKey = !!body.provider_keys;
+    setRequestId(currentAttempt.id);
     setRequestKey("");
     setBusy(true);
     setElapsed(0);
@@ -125,26 +144,32 @@ export default function Speech(props: {
       const response = await api<SpeechResult>(`/api/v1/${props.operation}`, {
         method: "POST",
         body,
-        headers: { "idempotency-key": attempt.key, "x-request-id": attempt.id },
+        headers: { "idempotency-key": currentAttempt.key, "x-request-id": currentAttempt.id },
       });
       if (mounted) {
         setResult(response);
         setRequestId(response.request_id);
       }
       recordEvent("speech_completed", Math.round(performance.now() - started));
-      attempt = undefined;
+      attempt = undefined; pendingStorage = undefined;
     } catch (err) {
       recordEvent("speech_failed", Math.round(performance.now() - started));
-      if (mounted) setError(err);
-      if (
+      const storageRequired = err instanceof ApiError && err.code === "storage_authorization_required";
+      if (mounted) {
+        if (storageRequired) {
+          pendingStorage = {body, attempt: currentAttempt};
+          setNeedsStorage(true);
+        } else { setError(err); pendingStorage = undefined; }
+      }
+      if (!storageRequired && (
         err instanceof ApiError &&
         [400, 403, 404, 413, 415].includes(err.status)
-      )
+      ))
         attempt = undefined;
     } finally {
       clearInterval(timer);
       // Never retry a key-bearing attempt with different or cleared credentials.
-      if (usesRequestKey) attempt = undefined;
+      if (usesRequestKey && !pendingStorage) attempt = undefined;
       if (mounted) setBusy(false);
     }
   }
@@ -304,6 +329,16 @@ export default function Speech(props: {
                 </label>
                 <p class="hint">Used only for {providerNames[selectedProvider()]} on this request and cleared after you submit. Leave blank to use your saved key, or Waveform’s shared key if none is saved. <a class="text-link" href="#settings">Manage saved keys</a></p>
               </details>
+            </Show>
+            <Show when={needsStorage()}>
+              <StorageConsent cancel={cancelStorage} approved={() => {setNeedsStorage(false); setStorageApproved(true);}} />
+            </Show>
+            <Show when={storageApproved()}>
+              <div class="storage-consent" role="status">
+                <p>Briefcase access is ready. Your original request is preserved.</p>
+                <button class="button primary" type="button" onClick={retryStorage} disabled={busy()}>Retry original request</button>
+                <button class="button" type="button" onClick={cancelStorage} disabled={busy()}>Discard request</button>
+              </div>
             </Show>
             <Notice error={error()} />
             <Show when={busy()}>

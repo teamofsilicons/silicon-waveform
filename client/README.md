@@ -1,6 +1,6 @@
 # Silicon Waveform Rust client
 
-Add the package with `cargo add silicon-waveform-client@0.3`. Production clients
+Add the package with `cargo add silicon-waveform-client@0.4`. Production clients
 use `https://backend.waveform.teamofsilicons.com` as their API origin.
 
 `silicon-waveform-client` is stateless. Construct it with `Auth::Anonymous`,
@@ -53,7 +53,7 @@ dependency explicitly through your project's normal review and build process.
 `with_auto_update` remains a no-op for source compatibility; `update_status()`
 returns `Disabled`. Honeycomb owns CLI installation and updates.
 
-TTS `temporary_url` is optional. Published Briefcase one-shot uploads return a
+TTS `temporary_url` is optional. Briefcase reservation, byte transfer and commit return a
 permanent authenticated URL. Test-plane TTS uses the same upload adapter and
 also returns `temporary_url: null`.
 
@@ -141,3 +141,20 @@ remain supported.
 `provider_options` map. Top-level `byok: Option<ByokCapabilities>` reports saved
 and per-request support plus credential precedence. Older servers may omit this
 metadata; optional fields remain `None` and the options map remains empty.
+
+## Separate storage permission and delegated callers
+
+Ordinary login requests `self.identity.read`. A `storage_authorization_required`
+error preserves that login. Call `start_storage_authorization`, open the returned
+consent URL, then call `complete_storage_authorization` with the approved code
+and returned state. `storage_authorization` reads current status. Keep the
+original speech request ID and idempotency key when explicitly retrying speech.
+The backend encrypts and rotates the resulting Briefcase credentials.
+
+An application with an approved Waveform OBO grant can use
+`client.with_obo_token(app_id, access_token)?` for TTS/STT. This sends
+`X-App-ID` and `X-IAM-OBO-Access-Token`, without an ordinary bearer credential.
+The access token can be reused; each call is verified again and downstream
+Briefcase actions use the same approved chain. Account settings and job polling
+remain bearer-authenticated. `Auth::OnBehalfOf` exposes the same transport for
+callers constructing the client directly. Testing selection is preserved.

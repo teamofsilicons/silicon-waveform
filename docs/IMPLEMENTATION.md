@@ -1,6 +1,6 @@
 # Implementation and validation
 
-The human-owned `UNDERSTANDING.md` defines the product requirements. The current source implements IAM app-secret discovery, test-only public-ID login, isolated sessions and user permissions, downstream Briefcase testing credentials from OBO exchange, deterministic speech clips, durable report submission, diagnostic opt-outs, and Honeycomb-owned CLI installation and updates.
+The human-owned `UNDERSTANDING.md` defines the product requirements. The current source implements IAM app-secret discovery, test-only public-ID login, isolated sessions and user permissions, downstream Briefcase testing credentials from explicit feature consent, deterministic speech clips, durable report submission, diagnostic opt-outs, and Honeycomb-owned CLI installation and updates.
 
 ## What the sandbox integration verifies
 
@@ -20,7 +20,7 @@ The compatibility installer delegates to Honeycomb. Rust client requests never u
 
 The September 16 source changes add the [Honeycomb participant](honeycomb-lifecycle.md), remove autonomous environment retirement and public lifecycle mutations, and add [API contracts](api-contracts.md). These changes are included in the September 20 native release. Live lifecycle coordination still requires the corresponding Honeycomb participant registration and credentials; this release did not change them.
 
-Historical [2026-09-08 test evidence](test-report-2026-09-08.md) applies to the older explicitly paired environment protocol. Current deployment evidence is recorded separately. Inbound OBO speech remains unavailable because IAM does not provide the downstream subject-token handoff needed for that entry mode.
+Historical [2026-09-08 test evidence](test-report-2026-09-08.md) applies to the older explicitly paired environment protocol. Current deployment evidence is recorded separately. The October source update adds repeatable incoming OBO verification and shared-token downstream chaining; this is a local change pending coordinated deployment.
 
 ## September 20 TTS controls and BYOK source update
 
@@ -31,3 +31,9 @@ keys remain supported with request → saved → deployment precedence. STT reta
 automatic fallback. Version 0.2.0 was deployed and published on September 20;
 see the [production verification](deployment-verification-2026-09-20.md) for
 service, package, backup and validation evidence.
+
+## October 3 OBO source cutover
+
+Separate manual-code storage approval is available in the website, CLI and client. Credentials remain encrypted in PostgreSQL, isolated by plane/account/org/endpoint; near-expiry refresh uses a stable retry identity and row locking. TTS checks consent before paid provider work, then reserves exact normalized bytes and publishes through a separately authorized commit. STT source lookup, read and cached-response revalidation use approved reusable tokens. Per-provider selected actor/org and test secret propagate downstream. Incoming OBO repeatedly verifies Waveform's endpoint and forwards the same chain token; retired proof headers fail closed.
+
+Release gates: IAM's complete ordered cutover including selected-provider delegation metadata, current Briefcase recipient and client, Waveform migration0015, encryption key, ordinary login scope removal, endpoint dependency registration, and live production/test-plane consent + upload/read/revocation checks. Historical deployment paragraphs above describe their dated releases, not this source update.

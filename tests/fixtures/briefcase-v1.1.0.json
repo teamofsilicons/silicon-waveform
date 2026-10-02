@@ -4,48 +4,48 @@
   "supported_api_versions": [
     "v1"
   ],
-  "contract_version": "1.1.0",
-  "build": "1.1.0",
+  "contract_version": "3.0.0",
+  "build": "local-current-client",
   "operations": [
     {
       "id": "reserveDelegatedUpload",
-      "version": "1.0.0",
+      "version": "3.0.0",
       "method": "POST",
       "path": "/obo/uploads/reserve"
     },
     {
       "id": "commitDelegatedUpload",
-      "version": "1.0.0",
+      "version": "3.0.0",
       "method": "POST",
       "path": "/obo/uploads/commit"
     },
     {
       "id": "getDelegatedUploadStatus",
-      "version": "1.0.0",
+      "version": "3.0.0",
       "method": "POST",
       "path": "/obo/uploads/status"
     },
     {
       "id": "cancelDelegatedUpload",
-      "version": "1.0.0",
+      "version": "3.0.0",
       "method": "POST",
       "path": "/obo/uploads/cancel"
     },
     {
       "id": "transferDelegatedUpload",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "method": "PUT",
       "path": "/obo/uploads/{upload_id}/content"
     },
     {
       "id": "readIamInfo",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "method": "GET",
       "path": "/iam"
     },
     {
       "id": "readLoginStatus",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "method": "GET",
       "path": "/auth/status"
     },
@@ -57,31 +57,31 @@
     },
     {
       "id": "exchangeShortLivedToken",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "method": "POST",
       "path": "/auth/slt"
     },
     {
       "id": "refreshApplicationSession",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "method": "POST",
       "path": "/auth/refresh"
     },
     {
       "id": "listTestingEnvironments",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "method": "GET",
       "path": "/organizations/{org_id}/testing-environments"
     },
     {
       "id": "createTestingEnvironment",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "method": "POST",
       "path": "/organizations/{org_id}/testing-environments"
     },
     {
       "id": "getTestingEnvironment",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "method": "GET",
       "path": "/organizations/{org_id}/testing-environments/{environment_id}"
     },
@@ -105,7 +105,7 @@
     },
     {
       "id": "replaceTestingEnvironmentIamPairing",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "method": "POST",
       "path": "/organizations/{org_id}/testing-environments/{environment_id}/iam-pairings"
     },
@@ -123,7 +123,7 @@
     },
     {
       "id": "describeCurrentTestingEnvironment",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "method": "GET",
       "path": "/testing-environment"
     },
@@ -189,31 +189,31 @@
     },
     {
       "id": "createFileOnBehalfOfMember",
-      "version": "1.0.0",
+      "version": "3.0.0",
       "method": "POST",
       "path": "/obo/files"
     },
     {
       "id": "createFolderOnBehalfOfMember",
-      "version": "1.0.0",
+      "version": "3.0.0",
       "method": "POST",
       "path": "/obo/folders/create"
     },
     {
       "id": "listEntriesOnBehalfOfMember",
-      "version": "1.0.0",
+      "version": "3.0.0",
       "method": "POST",
       "path": "/obo/entries/list"
     },
     {
       "id": "readFileOnBehalfOfMember",
-      "version": "1.0.0",
+      "version": "3.0.0",
       "method": "POST",
       "path": "/obo/files/read"
     },
     {
       "id": "trashEntryOnBehalfOfMember",
-      "version": "1.0.0",
+      "version": "3.0.0",
       "method": "POST",
       "path": "/obo/entries/trash"
     },
@@ -332,6 +332,18 @@
       "path": "/entries/{entry_id}/invitations/{grant_id}"
     },
     {
+      "id": "changeExpiringShare",
+      "version": "1.0.0",
+      "method": "PATCH",
+      "path": "/entries/{entry_id}/invitations/{grant_id}"
+    },
+    {
+      "id": "makeEntryPermanent",
+      "version": "1.0.0",
+      "method": "DELETE",
+      "path": "/entries/{entry_id}/self-destruct"
+    },
+    {
       "id": "readLinkAccess",
       "version": "1.1.0",
       "method": "GET",
@@ -345,7 +357,7 @@
     },
     {
       "id": "listEntryLogs",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "method": "GET",
       "path": "/entries/{entry_id}/logs"
     },
@@ -357,13 +369,13 @@
     },
     {
       "id": "inviteOnBehalfOfMember",
-      "version": "1.0.0",
+      "version": "3.0.0",
       "method": "POST",
       "path": "/obo/invitations"
     },
     {
       "id": "setLinkAccessOnBehalfOfMember",
-      "version": "1.1.0",
+      "version": "3.0.0",
       "method": "POST",
       "path": "/obo/link-access"
     }

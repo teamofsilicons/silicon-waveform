@@ -262,6 +262,10 @@ pub struct Entry {
     /// Time the entry was moved to the bin.
     #[serde(with = "time::serde::rfc3339::option")]
     pub deleted_at: Option<OffsetDateTime>,
+    /// When a self-destructing file is permanently deleted; absent for a
+    /// permanent file, every folder, and servers that predate self destruct.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub self_destruct_at: Option<OffsetDateTime>,
 }
 
 impl Entry {
@@ -303,6 +307,9 @@ pub struct PermissionGrant {
     /// When it was created.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// When this expiring share ends; absent for a permanent grant.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 /// Explicit grants on one entry.

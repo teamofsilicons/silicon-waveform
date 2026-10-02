@@ -294,10 +294,6 @@ impl Client {
         self.config.transfer_timeout
     }
 
-    pub(crate) fn http(&self) -> &reqwest::Client {
-        &self.http
-    }
-
     /// Sends a request and reads a JSON answer.
     pub(crate) async fn receive_json<T>(&self, request: RequestBuilder) -> Result<T>
     where

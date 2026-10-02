@@ -43,28 +43,28 @@ const fn operation(
 }
 
 /// Every operation this client calls, with the revision it expects.
-pub const OPERATIONS: [OperationRevision; 60] = [
+pub const OPERATIONS: [OperationRevision; 62] = [
     operation(
         "reserveDelegatedUpload",
-        "2.0.0",
+        "3.0.0",
         "POST",
         "/obo/uploads/reserve",
     ),
     operation(
         "commitDelegatedUpload",
-        "2.0.0",
+        "3.0.0",
         "POST",
         "/obo/uploads/commit",
     ),
     operation(
         "getDelegatedUploadStatus",
-        "2.0.0",
+        "3.0.0",
         "POST",
         "/obo/uploads/status",
     ),
     operation(
         "cancelDelegatedUpload",
-        "2.0.0",
+        "3.0.0",
         "POST",
         "/obo/uploads/cancel",
     ),
@@ -174,28 +174,28 @@ pub const OPERATIONS: [OperationRevision; 60] = [
         "/org/{org_id}/{path}",
     ),
     operation("uploadFile", "1.0.0", "POST", "/uploads"),
-    operation("createFileOnBehalfOfMember", "2.0.0", "POST", "/obo/files"),
+    operation("createFileOnBehalfOfMember", "3.0.0", "POST", "/obo/files"),
     operation(
         "createFolderOnBehalfOfMember",
-        "2.0.0",
+        "3.0.0",
         "POST",
         "/obo/folders/create",
     ),
     operation(
         "listEntriesOnBehalfOfMember",
-        "2.0.0",
+        "3.0.0",
         "POST",
         "/obo/entries/list",
     ),
     operation(
         "readFileOnBehalfOfMember",
-        "2.0.0",
+        "3.0.0",
         "POST",
         "/obo/files/read",
     ),
     operation(
         "trashEntryOnBehalfOfMember",
-        "2.0.0",
+        "3.0.0",
         "POST",
         "/obo/entries/trash",
     ),
@@ -274,6 +274,18 @@ pub const OPERATIONS: [OperationRevision; 60] = [
         "/entries/{entry_id}/invitations/{grant_id}",
     ),
     operation(
+        "changeExpiringShare",
+        "1.0.0",
+        "PATCH",
+        "/entries/{entry_id}/invitations/{grant_id}",
+    ),
+    operation(
+        "makeEntryPermanent",
+        "1.0.0",
+        "DELETE",
+        "/entries/{entry_id}/self-destruct",
+    ),
+    operation(
         "readLinkAccess",
         "1.1.0",
         "GET",
@@ -289,13 +301,13 @@ pub const OPERATIONS: [OperationRevision; 60] = [
     operation("readPublicEntry", "1.1.0", "GET", "/public/{org_id}/{path}"),
     operation(
         "inviteOnBehalfOfMember",
-        "2.0.0",
+        "3.0.0",
         "POST",
         "/obo/invitations",
     ),
     operation(
         "setLinkAccessOnBehalfOfMember",
-        "2.0.0",
+        "3.0.0",
         "POST",
         "/obo/link-access",
     ),

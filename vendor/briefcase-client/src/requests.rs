@@ -164,6 +164,9 @@ pub struct NewGrant {
     pub access: Vec<AccessRight>,
     /// Whether the grant reaches descendants.
     pub inherit: bool,
+    /// Makes this a read-only expiring share that ends after 1 to 43,200 minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in_minutes: Option<u32>,
 }
 
 impl NewGrant {
@@ -174,7 +177,16 @@ impl NewGrant {
             principal,
             access: access.into_iter().collect(),
             inherit: false,
+            expires_in_minutes: None,
         }
+    }
+
+    /// Makes the grant an expiring share: read-only, and gone after `minutes`
+    /// (1 to 43,200). It never replaces a permanent grant the member holds.
+    #[must_use]
+    pub const fn expires_after(mut self, minutes: u32) -> Self {
+        self.expires_in_minutes = Some(minutes);
+        self
     }
 
     /// Extends the grant to everything inside the entry.
@@ -321,6 +333,9 @@ pub struct Upload {
     pub source: UploadSource,
     /// Key that makes a retry return the same file rather than a second one.
     pub idempotency_key: Option<IdempotencyKey>,
+    /// Makes a new file self-destruct this many minutes (1 to 43,200) after
+    /// the upload finishes. Refused when the name is an existing file.
+    pub self_destruct_minutes: Option<u32>,
 }
 
 impl Upload {
@@ -345,6 +360,7 @@ impl Upload {
             content_type: None,
             source: UploadSource::File(path),
             idempotency_key: None,
+            self_destruct_minutes: None,
         })
     }
 
@@ -361,6 +377,7 @@ impl Upload {
             content_type: None,
             source: UploadSource::Bytes(bytes.into()),
             idempotency_key: None,
+            self_destruct_minutes: None,
         }
     }
 
@@ -382,6 +399,14 @@ impl Upload {
     #[must_use]
     pub fn with_idempotency_key(mut self, key: IdempotencyKey) -> Self {
         self.idempotency_key = Some(key);
+        self
+    }
+
+    /// Makes the new file self-destruct `minutes` (1 to 43,200) after the
+    /// upload finishes. It is then deleted for good and never enters a bin.
+    #[must_use]
+    pub const fn self_destructing(mut self, minutes: u32) -> Self {
+        self.self_destruct_minutes = Some(minutes);
         self
     }
 }

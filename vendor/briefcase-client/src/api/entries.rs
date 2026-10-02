@@ -210,6 +210,23 @@ impl Client {
         self.receive_empty(request).await
     }
 
+    /// Keeps a self-destructing file: stops its timer so it is never deleted.
+    ///
+    /// Only the file's creator, org admins and org owners may keep a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns a forbidden error for anyone else who can see the file, a
+    /// not-found error when it is not visible, and `not_self_destructing` when
+    /// its timer is not running.
+    pub async fn make_permanent(&self, entry_id: Uuid) -> Result<()> {
+        let url = self.api_url(&["entries", &entry_id.to_string(), "self-destruct"])?;
+        let request = self
+            .request(Method::DELETE, url)
+            .timeout(self.request_timeout());
+        self.receive_empty(request).await
+    }
+
     /// Reads the retained "who did what, when" history of one entry.
     ///
     /// # Errors

@@ -1,5 +1,6 @@
 //! Stateful Waveform CLI. Session material lives under a private `.waveform` directory.
 use clap::{Parser, Subcommand};
+use secrecy::ExposeSecret as _;
 mod daemon;
 mod updater;
 
@@ -36,6 +37,12 @@ struct Args {
     /// Read an IAM test app_secret from a file (use - for stdin).
     #[arg(long, global = true, conflicts_with = "test")]
     app_secret_file: Option<PathBuf>,
+    /// Calling application for an incoming OBO speech request.
+    #[arg(long, global = true, requires = "obo_token_file")]
+    obo_app: Option<String>,
+    /// Read the reusable OBO access token from a private file (- for stdin).
+    #[arg(long, global = true, requires = "obo_app")]
+    obo_token_file: Option<PathBuf>,
     /// Waveform backend origin; defaults to the production service.
     #[arg(
         long,
@@ -91,6 +98,13 @@ enum Command {
         /// Backwards-compatible spelling of the positional SLT.
         #[arg(long = "slt", hide = true, conflicts_with = "slt")]
         slt_flag: Option<String>,
+    },
+    /// Approve Briefcase storage separately from login, then retry your speech request.
+    Storage {
+        #[arg(long)]
+        org: String,
+        #[command(subcommand)]
+        command: StorageCommand,
     },
     /// Synthesize text and return the stored file URLs.
     Tts {
@@ -354,6 +368,44 @@ enum TestEnvironmentCommand {
         org: String,
     },
 }
+#[derive(Subcommand, Debug)]
+enum StorageCommand {
+    /// Open the returned IAM link and review the selected account and organization.
+    Start {
+        /// Reuse this key if the authorization request is interrupted.
+        #[arg(long)]
+        idempotency: Option<String>,
+    },
+    /// Read the current request state.
+    Status { authorization_id: uuid::Uuid },
+    /// Save the approved grant with the single-use code returned by IAM.
+    Complete {
+        authorization_id: uuid::Uuid,
+        /// Read the approval code from a private file or - for stdin.
+        #[arg(long)]
+        code_file: PathBuf,
+        /// Correlation state returned by start.
+        #[arg(long)]
+        state: String,
+    },
+}
+
+fn speech_error(
+    error: silicon_waveform_client::Error,
+    org: &str,
+    key: &str,
+    request_id: uuid::Uuid,
+) -> String {
+    if matches!(&error, silicon_waveform_client::Error::Api{code,..} if code == "storage_authorization_required")
+    {
+        format!(
+            "Briefcase approval is required. Run waveform storage --org {org} start, complete the approval, then repeat the same speech command with --idempotency {key} --request-id {request_id}. Keep the same server and test options."
+        )
+    } else {
+        error.to_string()
+    }
+}
+
 fn default_home_dir() -> PathBuf {
     std::env::var_os("SILICON_HOME")
         .or_else(|| std::env::var_os("HOME"))
@@ -672,6 +724,7 @@ fn validate_stdin_sources(args: &Args) -> Result<(), String> {
             .count()
     };
     let sources = is_stdin(&args.app_secret_file)
+        + is_stdin(&args.obo_token_file)
         + match &args.command {
             Command::Tts {
                 provider_options_file,
@@ -756,7 +809,8 @@ fn read_slt(value: Option<String>) -> Result<String, String> {
 }
 fn command_org(command: &Command) -> Option<&str> {
     match command {
-        Command::Tts { org, .. }
+        Command::Storage { org, .. }
+        | Command::Tts { org, .. }
         | Command::Stt { org, .. }
         | Command::Jobs { org, .. }
         | Command::Preferences { org, .. }
@@ -937,6 +991,20 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
         )?;
         return Ok(());
     }
+    if args.obo_token_file.is_some()
+        && !matches!(&args.command, Command::Tts { .. } | Command::Stt { .. })
+    {
+        return Err("OBO access tokens apply only to tts and stt; use an ordinary login for account management".into());
+    }
+    let obo = if let (Some(app), Some(path)) = (&args.obo_app, &args.obo_token_file) {
+        let token = read_bounded_file(path, 16_384, "OBO token")?;
+        Some((
+            app.clone(),
+            secrecy::SecretString::from(token.trim().to_owned()),
+        ))
+    } else {
+        None
+    };
     let mut client = Client::new(&args.url, Auth::Anonymous)
         .map_err(|e| e.to_string())?
         .with_auto_update(false);
@@ -1094,6 +1162,43 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             let _ = fs::remove_file(&session_file);
             print_status("logged out", args.json)?;
         }
+        Command::Storage { org, command } => {
+            let client = bearer(&client, &session_file).await?;
+            let result = match command {
+                StorageCommand::Start { idempotency } => {
+                    let identity = client.me().await.map_err(|e| e.to_string())?;
+                    let actor = identity["public_id"]
+                        .as_str()
+                        .ok_or("IAM identity missing")?;
+                    let key = idempotency.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    eprintln!(
+                        "Authorization retry key: {key}. Review the returned consent_url, then use storage --org {org} complete with its authorization_id, state and --code-file. This does not start a speech request."
+                    );
+                    client.start_storage_authorization(&org, actor, &key).await
+                }
+                StorageCommand::Status { authorization_id } => {
+                    client
+                        .storage_authorization(&org, &authorization_id.to_string())
+                        .await
+                }
+                StorageCommand::Complete {
+                    authorization_id,
+                    code_file,
+                    state,
+                } => {
+                    let code = read_bounded_file(&code_file, 16384, "approval code")?;
+                    client
+                        .complete_storage_authorization(
+                            &org,
+                            &authorization_id.to_string(),
+                            code.trim(),
+                            &state,
+                        )
+                        .await
+                }
+            };
+            print_json(&result.map_err(|e| e.to_string())?)?;
+        }
         Command::Me => print_json(
             &bearer(&client, &session_file)
                 .await?
@@ -1227,8 +1332,14 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             let idempotency =
                 idempotency.unwrap_or_else(|| format!("waveform-cli-{}", uuid::Uuid::new_v4()));
             let request_id = request_id.unwrap_or_else(uuid::Uuid::new_v4);
-            let c = bearer(&client, &session_file)
-                .await?
+            let c = if let Some((app, token)) = &obo {
+                client
+                    .with_obo_token(app, token.expose_secret())
+                    .map_err(|e| e.to_string())?
+            } else {
+                bearer(&client, &session_file).await?
+            };
+            let c = c
                 .with_speech_request_id(request_id)
                 .map_err(|e| e.to_string())?;
             eprintln!(
@@ -1252,7 +1363,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                     &idempotency,
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| speech_error(e, &org, &idempotency, request_id))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
@@ -1272,8 +1383,14 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             let idempotency =
                 idempotency.unwrap_or_else(|| format!("waveform-cli-{}", uuid::Uuid::new_v4()));
             let request_id = request_id.unwrap_or_else(uuid::Uuid::new_v4);
-            let c = bearer(&client, &session_file)
-                .await?
+            let c = if let Some((app, token)) = &obo {
+                client
+                    .with_obo_token(app, token.expose_secret())
+                    .map_err(|e| e.to_string())?
+            } else {
+                bearer(&client, &session_file).await?
+            };
+            let c = c
                 .with_speech_request_id(request_id)
                 .map_err(|e| e.to_string())?;
             eprintln!(
@@ -1292,7 +1409,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                     &idempotency,
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| speech_error(e, &org, &idempotency, request_id))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
@@ -1436,6 +1553,42 @@ mod tests {
     use super::{Command, configure_home_at, read_slt};
     use clap::Parser as _;
     use std::fs;
+
+    #[test]
+    fn obo_requires_both_headers_and_never_accepts_a_token_argument() {
+        let base = [
+            "waveform", "tts", "Hello", "--org", "tos", "--actor", "legacy",
+        ];
+        assert!(
+            super::Args::try_parse_from(base.into_iter().chain([
+                "--obo-app",
+                "ting",
+                "--obo-token-file",
+                "private-token"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            super::Args::try_parse_from(base.into_iter().chain(["--obo-app", "ting"])).is_err()
+        );
+        assert!(
+            super::Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--obo-token-file", "private-token"])
+            )
+            .is_err()
+        );
+        let args = super::Args::try_parse_from(base.into_iter().chain([
+            "--obo-app",
+            "ting",
+            "--obo-token-file",
+            "-",
+            "--provider-key-file",
+            "openai=-",
+        ]))
+        .expect("CLI shape");
+        assert!(super::validate_stdin_sources(&args).is_err());
+    }
 
     #[test]
     fn tts_defaults_to_one_provider_and_controls_conflict_with_fallback() {

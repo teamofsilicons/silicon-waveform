@@ -216,3 +216,11 @@ works, but `--key-file` keeps the secret out of shell history and process argume
 Only one input may read stdin in a command. Key files contain only the key, with
 an optional final newline. Provider-key deletion restores normal selection on
 later requests.
+
+### Briefcase approval
+
+If speech reports `storage_authorization_required`, run `waveform storage --org ORG start`. Review the returned `consent_url` in IAM and select the destination account and organization. Save the single-use approval code in a private file, then run `waveform storage --org ORG complete AUTHORIZATION_ID --state STATE --code-file PATH`. `storage --org ORG status AUTHORIZATION_ID` shows its progress. Keep the same server and `--test` selection throughout.
+
+Approval does not submit speech. Retry your original command with the `--idempotency` and `--request-id` values shown by the failed attempt. Ordinary logout does not revoke separate Briefcase approval; manage that permission in IAM.
+
+Incoming application OBO speech can use `--obo-app ting --obo-token-file /private/token` with `tts` or `stt`. Use `-` to read one secret from stdin. Tokens are not command-line values, are never saved as a login, and cannot be used for account-management commands. Keep the same idempotency key and request ID for a logical retry.

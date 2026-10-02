@@ -74,6 +74,8 @@ pub(super) async fn prepare(
     let testing_environment_id = identity.plane.iam_environment_id;
     let iam = Arc::new(SourceStorageDelegator {
         testing: testing_environment_id.is_some(),
+        store: state.storage_grants()?,
+        plane: identity.plane.id,
         sdk: identity.plane.iam,
         application_id: state
             .app_id
@@ -85,7 +87,12 @@ pub(super) async fn prepare(
         .prepare_source_target(&actor, public_id, token, parsed.request_id, environment)
         .await
         .map_err(|error| match error {
-            BriefcaseError::Unauthorized => ControlError::unauthorized(),
+            BriefcaseError::Unauthorized | BriefcaseError::StorageAuthorizationRequired => {
+                ControlError {
+                    status: http::StatusCode::FORBIDDEN,
+                    code: "storage_authorization_required",
+                }
+            }
             BriefcaseError::Forbidden => ControlError::forbidden(),
             BriefcaseError::NotFound => ControlError::not_found(),
             _ => ControlError::unavailable("briefcase_unavailable"),

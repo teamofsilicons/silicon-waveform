@@ -448,3 +448,24 @@ test("IAM app_secret selects a sandbox and public IDs remain test-only", async (
   assert.equal(state.plane,"test");assert.equal(state.user.public_id,"test-carbon");
   assert.ok(!JSON.stringify(state).includes(s.fake.testKey));
 });
+
+
+test("Briefcase consent preserves the login and selected plane without sending speech", async () => {
+  const s = setup(); await s.login();
+  const start = await s.call("/api/v1/storage-authorizations", {}, "POST", {"idempotency-key":"storage-start-fixture"});
+  assert.equal(start.status,200);
+  const request = await start.json();
+  const upstream = s.fake.requests.at(-1);
+  assert.equal(upstream.headers.get("authorization"),"Bearer oat_production_fixture");
+  assert.equal(upstream.headers.get("x-org-id"),"tos");
+  assert.equal(upstream.headers.get("idempotency-key"),"storage-start-fixture");
+  const path = `/api/v1/storage-authorizations/${request.authorization_id}`;
+  assert.equal((await s.call(path+"/complete",{code:"obc_fixture",state:"wrong"})).status,403);
+  assert.equal((await s.call("/api/session")).status,200);
+  const done = await s.call(path+"/complete",{code:"obc_fixture",state:request.state});
+  assert.equal((await done.json()).status,"completed");
+  assert.equal(s.fake.requests.some(r=>["/api/v1/tts","/api/v1/stt"].includes(r.path)),false);
+  await s.call("/api/session/environment",{key:s.fake.testKey,org:"tos"});
+  await s.call("/api/session/login",{slt:"test-carbon",org:"tos"});
+  assert.equal((await s.call(path)).status,404);
+});

@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 /// Encryption key held outside PostgreSQL. Associated data binds every secret
 /// to its plane, owner and purpose, preventing encrypted-row substitution.
+#[derive(Clone)]
 pub struct Vault {
     key: Zeroizing<[u8; 32]>,
 }

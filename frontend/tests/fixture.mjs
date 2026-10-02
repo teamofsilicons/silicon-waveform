@@ -22,6 +22,7 @@ export function fixture() {
         preferences: structuredClone(defaults),
         keys: new Map(),
         jobs: [],
+        storage: new Map(),
       });
     return planes.get(key);
   }
@@ -92,6 +93,21 @@ export function fixture() {
       return Response.json({ cleaned: true });
     }
     if (!headers.has("authorization")) return error("sign_in_required", 401);
+    if (path === "/api/v1/storage-authorizations" && method === "POST") {
+      const id = randomUUID();
+      const entry = {authorization_id:id,consent_url:"https://iam.example/obo/consent?request="+id,state:"fixture-state",status:"pending",expires_at:new Date(Date.now()+600000).toISOString()};
+      p.storage.set(id,entry); return Response.json(entry);
+    }
+    const storage = path.match(/^\/api\/v1\/storage-authorizations\/([^/]+)(\/complete)?$/);
+    if (storage) {
+      const entry = p.storage.get(storage[1]);
+      if (!entry) return error("not_found",404);
+      if (storage[2] && method === "POST") {
+        if (body.state !== entry.state || body.code !== "obc_fixture") return error("invalid_approval",403);
+        entry.status = "completed";
+      }
+      return Response.json(entry);
+    }
     if (path === "/api/v1/auth/me") return Response.json(actor(key));
     if (path === "/api/v1/voice-profiles")
       return Response.json({ items: voiceProfiles });

@@ -1,9 +1,8 @@
-//! Exact-manifest operations authorized by a fresh IAM on-behalf-of proof.
+//! Delegated operations authorized by a reusable IAM OBO access token.
 //!
-//! Prepare a manifest first, mint a proof for its method, path, SHA-256 digest,
-//! endpoint ID and empty metadata, then send that same immutable manifest.
-//! This module neither mints proofs nor retries them. It sends no bearer token
-//! and performs no package maintenance before or after delegated operations.
+//! Each receiver verifies the selected endpoint and live authority online.
+//! Immutable manifests retain logical idempotency and content integrity; their
+//! digest is not a per-request IAM signature. No actor bearer is forwarded.
 
 use std::{fmt, marker::PhantomData};
 
@@ -43,11 +42,11 @@ pub const TRASH_ENTRY_ENDPOINT_ID: &str = "briefcase.entries.trash";
 /// Exact IAM request-binding path for recoverable deletion.
 pub const TRASH_ENTRY_PATH: &str = "/api/v1/obo/entries/trash";
 
-/// An opaque, single-use IAM proof supplied by the calling application.
-///
-/// Deliberately neither `Clone` nor serializable. Each SDK operation consumes
-/// its proof, even on an uncertain result. A retry needs a newly minted proof;
-/// the manifest and its logical mutation UUID can remain unchanged.
+/// A reusable IAM OBO access token supplied by the calling application.
+/// The historical type name is retained for source compatibility. Receivers
+/// accept only the current token class; a clone may authorize another request
+/// within the approved graph while its live authority remains valid.
+#[derive(Clone)]
 pub struct OboProof(SecretString);
 
 impl OboProof {
@@ -92,14 +91,14 @@ mod sealed {
 pub trait DelegatedOperation: sealed::Operation + Serialize {
     /// IAM endpoint identifier whose metadata schema is the empty object.
     const ENDPOINT_ID: &'static str;
-    /// Exact, versioned request path bound into the IAM proof.
+    /// Exact, versioned request path verified by the receiving endpoint.
     const PATH: &'static str;
 }
 
-/// Immutable exact bytes to hash before minting an IAM proof, then transmit.
+/// Immutable exact bytes to hash for integrity and logical idempotency, then transmit.
 ///
 /// Prepared manifests can be cloned or retained for logical retries, but
-/// proofs cannot. Changing the input DTO later cannot change these bytes.
+/// tokens may be reused while valid. Changing the DTO cannot change these bytes.
 #[derive(Clone)]
 pub struct DelegatedManifest<T: DelegatedOperation> {
     bytes: Vec<u8>,
@@ -131,25 +130,25 @@ impl<T: DelegatedOperation> DelegatedManifest<T> {
         &self.bytes
     }
 
-    /// Lowercase hexadecimal SHA-256 of `body_bytes()`, for IAM proof binding.
+    /// Lowercase hexadecimal SHA-256 of `body_bytes()`, for local integrity and logical idempotency.
     #[must_use]
     pub fn body_sha256(&self) -> &str {
         &self.sha256
     }
 
-    /// The HTTP method to bind into the fresh proof.
+    /// The HTTP method to bind into the OBO token.
     #[must_use]
     pub const fn method(&self) -> &'static str {
         METHOD
     }
 
-    /// The full versioned path to bind into the fresh proof.
+    /// The full versioned path to bind into the OBO token.
     #[must_use]
     pub const fn path(&self) -> &'static str {
         T::PATH
     }
 
-    /// The IAM endpoint to select when minting the fresh proof.
+    /// The IAM endpoint to select when minting the OBO token.
     #[must_use]
     pub const fn endpoint_id(&self) -> &'static str {
         T::ENDPOINT_ID
@@ -172,7 +171,7 @@ impl<T: DelegatedOperation> fmt::Debug for DelegatedManifest<T> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegatedCreateFolder {
-    /// Non-nil UUID retained with this unchanged manifest across fresh-proof retries.
+    /// Non-nil UUID retained with this unchanged manifest across logical retries.
     pub operation_id: Uuid,
     /// Existing parent path; an empty string selects the private application folder.
     pub parent_path: String,
@@ -180,7 +179,7 @@ pub struct DelegatedCreateFolder {
     pub name: String,
 }
 
-/// Lists the ordinary privacy-filtered entry view, with every input proof-bound.
+/// Lists the ordinary privacy-filtered entry view, with every input in an immutable manifest.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegatedListEntries {
@@ -190,7 +189,7 @@ pub struct DelegatedListEntries {
     pub path: Option<String>,
     /// Optional filter expression; without a parent, searches the visible tree.
     pub filter: Option<String>,
-    /// Opaque cursor from the preceding page; each page requires a fresh proof.
+    /// Opaque cursor from the preceding page; each page is verified online.
     pub cursor: Option<String>,
     /// Page size from 1 through 100, defaulting to 100.
     pub limit: Option<u16>,
@@ -222,7 +221,7 @@ impl DelegatedReadFile {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegatedTrashEntry {
-    /// Non-nil UUID retained with this unchanged manifest across fresh-proof retries.
+    /// Non-nil UUID retained with this unchanged manifest across logical retries.
     pub operation_id: Uuid,
     /// Non-nil UUID of the entry to trash.
     pub entry_id: Uuid,
@@ -235,7 +234,7 @@ macro_rules! delegated_operation {
             const PATH: &'static str = $path;
         }
         impl $request {
-            /// Freezes the exact manifest bytes before a caller mints its proof.
+            /// Freezes the exact manifest bytes before transmitting the request.
             ///
             /// # Errors
             ///
@@ -323,7 +322,7 @@ impl sealed::Operation for DelegatedTrashEntry {
 }
 
 impl Client {
-    /// Creates a folder using a fresh proof for the prepared manifest.
+    /// Creates a folder using current endpoint authority for the prepared manifest.
     ///
     /// # Errors
     ///
@@ -339,7 +338,7 @@ impl Client {
             .await
     }
 
-    /// Lists one page using a fresh proof for every bound filter and cursor.
+    /// Lists one page using the endpoint or shared-chain access token.
     ///
     /// # Errors
     ///
@@ -374,7 +373,7 @@ impl Client {
         Ok(ContentStream::new(response))
     }
 
-    /// Trashes an entry using a stable operation UUID and a fresh bound proof.
+    /// Trashes an entry using a stable operation UUID and a valid OBO token.
     ///
     /// # Errors
     ///
@@ -405,7 +404,7 @@ impl Client {
             .anonymous_request(Method::POST, url)
             .header("x-org-id", self.organization())
             .header("x-app-id", application.as_str())
-            .header("x-iam-obo-access-proof", proof.into_header()?)
+            .header("x-iam-obo-access-token", proof.into_header()?)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(manifest.bytes.clone()))
     }
@@ -415,7 +414,7 @@ impl Client {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegatedInvite {
-    /// Stable UUID reused with a fresh proof on retry.
+    /// Stable UUID reused with a valid OBO token on retry.
     pub operation_id: Uuid,
     /// Entry inside the calling application's namespace.
     pub entry_id: Uuid,
@@ -442,6 +441,10 @@ pub struct DelegatedLinkAccess {
     pub entry_id: Uuid,
     /// Desired explicit link setting.
     pub enabled: bool,
+    /// With `enabled`, makes this an expiring link that ends after 1 to 43,200
+    /// minutes. Part of the immutable request body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_minutes: Option<u32>,
 }
 impl sealed::Operation for DelegatedLinkAccess {
     fn validate(&self) -> Result<()> {
@@ -454,7 +457,7 @@ impl DelegatedOperation for DelegatedLinkAccess {
     const PATH: &'static str = "/api/v1/obo/link-access";
 }
 impl Client {
-    /// Invites a member with a fresh IAM proof for this critical endpoint.
+    /// Invites a member with a valid IAM OBO token for this critical endpoint.
     /// # Errors
     /// Returns proof, permission, recipient, or transport errors without retrying.
     pub async fn invite_on_behalf_of(
@@ -469,7 +472,7 @@ impl Client {
         )
         .await
     }
-    /// Sets anonymous read access using a fresh proof for this critical endpoint.
+    /// Sets anonymous read access using a valid OBO token for this critical endpoint.
     /// # Errors
     /// Returns proof, permission, protected-folder, or transport errors without retrying.
     pub async fn set_link_access_on_behalf_of(

@@ -7,6 +7,8 @@ use thiserror::Error;
 /// Stable machine-readable error code independent of HTTP status mapping.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ErrorCode {
+    /// The Briefcase feature needs separate consent.
+    StorageAuthorizationRequired,
     /// The selected provider failed with automatic fallback disabled.
     ProviderFailed,
     /// Request syntax or a validated value was invalid.
@@ -42,6 +44,7 @@ impl ErrorCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::StorageAuthorizationRequired => "storage_authorization_required",
             Self::ProviderFailed => "provider_failed",
             Self::InvalidRequest => "invalid_request",
             Self::Unauthenticated => "unauthenticated",
@@ -80,6 +83,9 @@ pub enum Dependency {
 /// Cohesive service failure consumed by the delivery layer.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum WaveformError {
+    /// The Briefcase feature needs separate consent.
+    #[error("Briefcase authorization is required")]
+    StorageAuthorizationRequired,
     /// A validated provider control is incompatible with the request.
     #[error("{0}")]
     InvalidProviderOptions(&'static str),
@@ -148,6 +154,7 @@ impl WaveformError {
     pub const fn code(&self) -> ErrorCode {
         match self {
             Self::InvalidProviderOptions(_) | Self::InvalidRequest => ErrorCode::InvalidRequest,
+            Self::StorageAuthorizationRequired => ErrorCode::StorageAuthorizationRequired,
             Self::ProviderFailed { .. } => ErrorCode::ProviderFailed,
             Self::Unauthenticated => ErrorCode::Unauthenticated,
             Self::Forbidden => ErrorCode::Forbidden,

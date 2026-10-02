@@ -23,7 +23,7 @@ const MAX_UPLOAD_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegatedReserveUpload {
-    /// Stable non-nil UUID retained across fresh-proof retries and status calls.
+    /// Stable non-nil UUID retained across logical retries and status calls.
     pub operation_id: Uuid,
     /// Existing folder path; empty selects the represented member's app folder.
     pub parent_path: String,
@@ -125,7 +125,7 @@ macro_rules! upload_operation {
             const PATH: &'static str = $path;
         }
         impl $request {
-            /// Freezes exact JSON bytes before obtaining a fresh IAM proof.
+            /// Freezes exact JSON bytes before obtaining a valid IAM OBO token.
             ///
             /// # Errors
             ///
@@ -308,7 +308,7 @@ impl<'de> Deserialize<'de> for UploadCapability {
 }
 
 impl Client {
-    /// Reserves a private upload with a fresh IAM proof over the exact manifest.
+    /// Reserves a private upload with a valid IAM OBO token over the exact manifest.
     ///
     /// # Errors
     ///
@@ -379,7 +379,7 @@ impl Client {
     ///
     /// Does not send an IAM bearer, parent token, proof or application secret.
     /// The selected organization and test plane still apply. A successful
-    /// transfer is not publication; obtain a fresh commit proof separately.
+    /// transfer is not publication; authorize publication with the current commit endpoint token separately.
     ///
     /// # Errors
     ///
@@ -415,6 +415,45 @@ impl Client {
             .header(CONTENT_LENGTH, size)
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(body)
+            .timeout(self.transfer_timeout());
+        self.receive_json(request).await
+    }
+
+    /// Transfer an already-open immutable staging file with only its upload capability.
+    /// This preserves descriptor ownership when the caller staged an anonymous file.
+    ///
+    /// # Errors
+    /// Rejects non-regular or oversized files, local I/O, and provider errors.
+    pub async fn transfer_delegated_upload_file(
+        &self,
+        upload_id: Uuid,
+        capability: UploadCapability,
+        mut file: tokio::fs::File,
+    ) -> Result<DelegatedUploadStatus> {
+        use tokio::io::AsyncSeekExt as _;
+        non_nil(upload_id, "upload_id")?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|_| Error::Configuration("could not inspect staging file".into()))?;
+        if !metadata.is_file() || metadata.len() > MAX_UPLOAD_BYTES {
+            return Err(Error::Configuration(
+                "staging source must be a bounded regular file".into(),
+            ));
+        }
+        file.rewind()
+            .await
+            .map_err(|_| Error::Configuration("could not rewind staging file".into()))?;
+        let url = self.api_url(&["obo", "uploads", &upload_id.to_string(), "content"])?;
+        let request = self
+            .anonymous_request(Method::PUT, url)
+            .header("x-org-id", self.organization())
+            .header("x-briefcase-upload-capability", capability.into_header()?)
+            .header(CONTENT_LENGTH, metadata.len())
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(reqwest::Body::wrap_stream(
+                tokio_util::io::ReaderStream::new(file),
+            ))
             .timeout(self.transfer_timeout());
         self.receive_json(request).await
     }

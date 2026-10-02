@@ -28,6 +28,9 @@ pub struct Invite {
     pub access: Vec<AccessRight>,
     /// Whether the grant applies to descendants.
     pub inherit: bool,
+    /// Makes this a read-only expiring share that ends after 1 to 43,200 minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_minutes: Option<u32>,
 }
 
 /// A current explicit invitation.
@@ -38,6 +41,34 @@ pub struct Invitation {
     /// Recipient and access policy.
     #[serde(flatten)]
     pub invitation: Invite,
+    /// When this expiring share ends (RFC 3339); absent for a permanent grant.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+/// How to change a live expiring share.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpiryChange {
+    /// Restart the share's clock: it now ends this many minutes (1 to 43,200)
+    /// from now, which extends or shortens it.
+    ExpireIn(u32),
+    /// Keep the access for good. When the recipient already holds a permanent
+    /// grant on the entry, the share folds into it.
+    Permanent,
+}
+
+impl Serialize for ExpiryChange {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::ExpireIn(minutes) => {
+                serde_json::json!({ "expires_in_minutes": minutes }).serialize(serializer)
+            }
+            Self::Permanent => serde_json::json!({ "permanent": true }).serialize(serializer),
+        }
+    }
 }
 
 /// Invitations on an entry.
@@ -64,6 +95,10 @@ pub struct LinkAccess {
     /// Absent on older servers or when link access is disabled.
     #[serde(default)]
     pub url: Option<url::Url>,
+    /// When this entry's own expiring link ends (RFC 3339); absent for a
+    /// permanent link or when this entry's own setting is off.
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 /// A retained, attributable audit event.
@@ -183,6 +218,34 @@ impl Client {
         .await
     }
 
+    /// Extends, shortens, or makes permanent a live expiring share.
+    /// # Errors
+    /// Returns not-found for an expired or unknown share, `not_an_expiring_share`
+    /// for a permanent grant, and access, idempotency, or transport errors.
+    pub async fn change_expiring_share(
+        &self,
+        id: Uuid,
+        grant: Uuid,
+        change: ExpiryChange,
+        key: &IdempotencyKey,
+    ) -> Result<Invitation> {
+        self.receive_json(
+            self.request(
+                Method::PATCH,
+                self.api_url(&[
+                    "entries",
+                    &id.to_string(),
+                    "invitations",
+                    &grant.to_string(),
+                ])?,
+            )
+            .header("idempotency-key", key.as_str())
+            .json(&change)
+            .timeout(self.request_timeout()),
+        )
+        .await
+    }
+
     /// Reads the explicit and inherited link setting.
     /// # Errors
     /// Returns visibility or transport errors.
@@ -213,6 +276,31 @@ impl Client {
             )
             .header("idempotency-key", key.as_str())
             .json(&serde_json::json!({"enabled":enabled}))
+            .timeout(self.request_timeout()),
+        )
+        .await
+    }
+
+    /// Turns on an expiring link: anyone with the link can view and download for
+    /// `minutes` (1 to 43,200), then it stops working. Calling it again on a
+    /// live expiring link restarts the clock; [`Self::set_link_access`] with
+    /// `true` makes it permanent and with `false` ends it.
+    /// # Errors
+    /// Returns `link_already_permanent` when a permanent link is already on,
+    /// and protected-folder, authorization, idempotency, or transport errors.
+    pub async fn set_expiring_link_access(
+        &self,
+        id: Uuid,
+        minutes: u32,
+        key: &IdempotencyKey,
+    ) -> Result<LinkAccess> {
+        self.receive_json(
+            self.request(
+                Method::PUT,
+                self.api_url(&["entries", &id.to_string(), "link-access"])?,
+            )
+            .header("idempotency-key", key.as_str())
+            .json(&serde_json::json!({"enabled":true,"expires_in_minutes":minutes}))
             .timeout(self.request_timeout()),
         )
         .await

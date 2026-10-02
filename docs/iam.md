@@ -1,49 +1,35 @@
 # IAM integration
 
-Waveform uses the official `silicon-iam-client` package. The server's IAm app
-ID and secret are deployment secrets. Browser or agent login supplies only a
-short-lived token to `/auth/login`; Waveform exchanges it and returns the IAM
-access and refresh tokens with `Cache-Control: no-store`. Every protected
-request rechecks current IAm authorization, so logout and membership changes
-apply immediately even if a webhook is delayed. IAM events are authenticated
-with the configured versioned signing key and retained only as content-free
-metadata for deduplication. Bearer introspection uses IAM's published
-`/api/v1/oauth/introspect` route. OBO speech remains fail-closed until the
-downstream actor-context exchange is defined by IAM. An inbound OBO proof is
-not an `oat_` token issued to Waveform and cannot be reused as an exchange subject.
+> **Integration preview for Waveform 0.5.0 / IAM 5.0.0 / Briefcase 3.0.0.** These guides precede the coordinated runtime rollout. Upgrade dependent services and clients together; public documentation alone does not indicate the new runtime is live.
 
-For login, refresh and logout, callers should send a stable `Idempotency-Key`
-(16–255 visible ASCII characters) and retain it across retries of that same
-operation. Waveform validates and forwards it unchanged to IAM in production and
-testing. This lets IAM replay its saved result after a response is lost, including
-when a login code or refresh token has already been consumed. Duplicate or invalid
-keys are rejected before contacting IAM. Omitting the header remains supported,
-but generates a new key per request and cannot recover a prior request's receipt.
+Waveform pins the official IAM 5.0.0 SDK at `52dd5ea7d48571e29e3b79371dfc27405644fbd9` and Briefcase 3.0.0 client at `de53ac8a0a62e184b8177019e1fb3e3509126d39`.
 
-The backend, Rust client and CLI use `silicon-iam-client` 1.8.0. Production
-introspection, test-plane authorization, login, webhooks and storage proof
-exchanges use the official SDK. Storage uses `briefcase-client` 1.1.0.
-For bearer speech, Waveform mints a separate proof for every delegated listing
-page, file read and upload. Proofs bind the SDK's exact request bytes and are
-never persisted in jobs or idempotency responses. See `testing.md` for the
-required Briefcase endpoint registration.
+Application login still exchanges an IAM `oac_` SLT for `oat_` and `ort_` credentials, bound to exactly one account and organization. Login, refresh and logout accept a stable 16–255 character `Idempotency-Key`; keep it across uncertain retries. Ordinary speech login now requests `self.identity.read`. Storage permission is requested separately when the feature is used; obsolete `obo:` login scopes must be removed from the Honeycomb application configuration and deployment overrides.
 
-IAM's short-lived login token uses the `oac_` authorization-code prefix; the
-login request field is still named `slt`. Access and refresh tokens use `oat_`
-and `ort_`. The default TTS permission is `obo:briefcase:briefcase.files.create`; STT
-requires `obo:briefcase:briefcase.files.read`. Waveform checks these before
-provider work. Current IAM uses explicit
-`app_scope.external` endpoint permissions for storage delegation; it no longer issues
-the old `obo.issue` scope. IAM checks the user’s consent and selected organization
-again for every endpoint-bound OBO exchange. Organization,
-application audience, actor identity, expiry, and test-plane checks still apply.
-Deployments may explicitly configure a stricter issued scope through
-`WAVEFORM_IAM_TTS_ACTION` and `WAVEFORM_IAM_STT_ACTION`.
+## Direct storage consent
 
-## Storage permission
+`POST /api/v1/storage-authorizations` with `{}`, the current bearer, selected `X-Org-ID`, and a stable idempotency key returns `{authorization_id,consent_url,state,status,expires_at}`. Open the trusted IAM consent URL. The user can choose a different account and organization for Briefcase. Enter the code at `POST /api/v1/storage-authorizations/{id}/complete` with `{code,state}`. `GET /api/v1/storage-authorizations/{id}` reads the status for the same account, organization and test plane. These routes return `Cache-Control: no-store`; tokens are never returned to the browser or CLI.
 
-Declare only the Briefcase private-file creation permission for generated audio. Do not request global file-write or administration scopes. Declare `briefcase.files.create`, plus `briefcase.entries.list` and `briefcase.files.read` for source reads and replay access checks. Include `self.identity.read`, `self.membership.read`, and `self.tags.read` for Briefcase’s resource authorization, alongside the existing `self.profile.read` permission. The generated-audio OBO endpoint is `briefcase.files.create`; the private application folder and actor are resolved by Briefcase. Source transcription still requires delegated read permission for the supplied file. See [Briefcase OBO](https://docs.briefcase.teamofsilicons.com/obo/) and [testing](testing.md) for request-bound downstream test credentials.
+The web speech form preserves the pending body and logical idempotency key in memory across manual consent, then requires an explicit retry. The CLI exposes `waveform storage --org ORG start`, `status`, and `complete --code-file FILE --state STATE`. A permission error does not log the user out. The same speech key and request ID must be retained when retrying.
 
-## Current hosted integration limit
+The broker encrypts IAM access/refresh credentials with `WAVEFORM_ENCRYPTION_KEY`, using authenticated data bound to the plane, origin account, org and endpoint. It rotates near-expiry tokens under a PostgreSQL row lock. A stable secret-derived upstream idempotency key recovers an uncertain refresh response. Removed consent produces `403 storage_authorization_required`; IAM outages remain retryable dependency errors. Ordinary Waveform logout does not delete the durable feature grant. IAM still enforces credential security revocation, membership, application state and graph changes.
 
-The September 13 deployment verifies app-secret discovery, public-ID login and endpoint-bound IAM exchange against live services. However, IAM proof verification currently returns only the delegated endpoint scope, with `org_role` and `tags` undisclosed. Briefcase requires those fields and rejects the upload. Adding the declared permissions alone does not resolve that upstream contract mismatch. See [deployment verification](verification-2026-09-13.md).
+## Incoming OBO and chaining
+
+Speech accepts `X-IAM-OBO-Access-Token: oba_…` together with `X-App-ID`, or an ordinary Bearer. The retired proof header and mixed credentials are rejected. Each request is verified online through IAM `POST /api/v1/obo-access/token-verifications` as Waveform's own authenticated app, against `waveform.tts` at `/api/v1/tts` or `waveform.stt` at `/api/v1/stt`. Repeated requests may use the same token while its authority remains live.
+
+Waveform forwards that same token to a declared Briefcase dependency, using IAM delegation only to validate the edge and resolve the recipient's selected subject, organization and testing secret. It never turns an incoming OBO request into an ordinary actor login or stores that incoming chain token. Downstream authority always uses Briefcase's selected account and organization.
+
+## Endpoint configuration and uploads
+
+Register the Briefcase endpoint roots `briefcase.uploads.reserve`, `briefcase.uploads.commit`, `briefcase.entries.list`, and `briefcase.files.read`. Declare TTS dependencies on reserve, commit and list; declare STT dependencies on list and read. Keep the corresponding exact `/api/v1/obo/...` paths in the catalog. App registrations and active private-provider visibility must allow these dependency graphs.
+
+TTS checks storage authority before paid generation. Briefcase then reserves the exact filename, size and SHA-256 under the stable speech operation UUID. Only a narrow staging capability goes with the raw bytes. Briefcase rechecks the commit access token before publication; Waveform resolves the committed entry with list authority and returns its verified permanent URL. The retired raw `/obo/files` route is never used. Source reads and cached speech responses recheck live resource access through the same approved endpoint tokens.
+
+Testing uses the selected Waveform app secret and IAM test context. An absent or mismatched downstream testing context fails closed. Clean/purge deletes broker authorization and grant rows while lifecycle fences exclude active operations. Nothing falls back to production.
+
+## Upgrade and rollback
+
+Apply additive PostgreSQL migration `0015_storage_consent.sql` before enabling the new runtime. It stores encrypted pending authorizations and durable grants, partitioned by plane, actor, organization and endpoint. Back up the database and preserve `WAVEFORM_ENCRYPTION_KEY`. The preceding binary can run with these unused additive tables, but old OBO calls require the old coordinated IAM and Briefcase runtimes; roll the integration set back together. Do not roll back schema or delete grants as an authentication repair.
+
+Update consumers to `X-IAM-OBO-Access-Token` and request feature consent after login. An ATA verification is app authority and cannot be supplied to these OBO routes. Test both actors, cross-organization destination selection, revoked consent, expired tokens, uncertain refreshes and test-plane cleanup before publishing the application.

@@ -12,6 +12,9 @@ const json = (value, status = 200) => Response.json(value, { status });
 const failure = (code, message, status = 400) =>
   json({ error: { code, message } }, status);
 const routes = [
+  ["POST", /^\/api\/v1\/storage-authorizations$/],
+  ["GET", /^\/api\/v1\/storage-authorizations\/[0-9a-f-]{36}$/],
+  ["POST", /^\/api\/v1\/storage-authorizations\/[0-9a-f-]{36}\/complete$/],
   ["GET", /^\/health\/(live|ready)$/],
   ["GET", /^\/api\/v1\/capabilities$/],
   ["GET", /^\/api\/v1\/auth\/me$/],
