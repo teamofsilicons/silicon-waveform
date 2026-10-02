@@ -44,17 +44,17 @@ refresh the copy in `frontend/public/` used by its isolated Docker build context
 CI rejects stale copies. The docs build copies the root manifest directly.
 Builds and artifact uploads do not roll out services or publish an application.
 
-## 0.3.3 — Recover access rejected before local expiry
+## 0.3.3 — Recover early access rejection
 
-The CLI verifies its saved session before an authenticated command and renews
-once when the server rejects access before its cached expiry. Rotation and
-verification share the session lock, retain pending refresh receipts, and save
-the successor before use. A temporary provider or network failure stays an error
-without discarding credentials. User commands and stdin are consumed only once.
+CLI and Honeycomb package 0.3.3 validate saved access before authenticated commands
+and renew once if the server rejects it before its advertised expiry. Recovery
+uses the durable session lock and persists the replacement credentials. Temporary
+service failures retain the login, and user commands run once. Backend 0.3.1,
+frontend 0.3.2 and Rust client 0.3.0 are unchanged.
 
-The backend, browser gateway and Rust client retain their 0.3.2-release behavior.
-[CLI release artifacts](https://github.com/teamofsilicons/silicon-waveform/releases/tag/v0.3.3)
-contain the six native targets and checksums.
+All six native targets and package validation passed.
+[Release artifacts](https://github.com/teamofsilicons/silicon-waveform/releases/tag/v0.3.3)
+are published through GitHub and Honeycomb; `waveform-cli 0.3.3` is on crates.io.
 
 ## 0.3.2 — Durable sessions and refresh recovery
 
