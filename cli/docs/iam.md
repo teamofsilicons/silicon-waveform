@@ -2,7 +2,7 @@
 
 > **Integration preview for Waveform 0.5.0 / IAM 5.0.0 / Briefcase 3.0.0.** These guides precede the coordinated runtime rollout. Upgrade dependent services and clients together; public documentation alone does not indicate the new runtime is live.
 
-Waveform pins the official IAM 5.0.0 SDK at `52dd5ea7d48571e29e3b79371dfc27405644fbd9` and Briefcase 3.0.0 client at `de53ac8a0a62e184b8177019e1fb3e3509126d39`.
+Waveform pins the official IAM 5.0.0 SDK at `f1e9c4768029aacabe337ca41be52e05023d1631` and Briefcase 3.0.0 client at `ba9e5211b2c4eebd3122f15607b28408bbe22fb6`.
 
 Application login still exchanges an IAM `oac_` SLT for `oat_` and `ort_` credentials, bound to exactly one account and organization. Login, refresh and logout accept a stable 16–255 character `Idempotency-Key`; keep it across uncertain retries. Ordinary speech login now requests `self.identity.read`. Storage permission is requested separately when the feature is used; obsolete `obo:` login scopes must be removed from the Honeycomb application configuration and deployment overrides.
 

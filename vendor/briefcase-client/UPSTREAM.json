@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/teamofsilicons/silicon-briefcase",
-  "commit": "de53ac8a0a62e184b8177019e1fb3e3509126d39",
+  "commit": "ba9e5211b2c4eebd3122f15607b28408bbe22fb6",
   "path": "clients/rust/crates/briefcase-client",
   "version": "3.0.0",
   "dirty": false
