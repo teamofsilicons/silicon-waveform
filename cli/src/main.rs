@@ -1,5 +1,6 @@
 //! Stateful Waveform CLI. Session material lives under a private `.waveform` directory.
 use clap::{Parser, Subcommand};
+use secrecy::ExposeSecret as _;
 mod daemon;
 mod updater;
 
@@ -24,6 +25,14 @@ use std::{
     after_long_help = include_str!("../README.md")
 )]
 struct Args {
+    /// Independent saved account and organization. Use a separate name for each login context.
+    #[arg(
+        long,
+        global = true,
+        env = "WAVEFORM_PROFILE",
+        default_value = "default"
+    )]
+    profile: String,
     /// Select an IAM test app_secret (ask_…) or a previously saved sandbox UUID.
     #[arg(
         long,
@@ -36,6 +45,12 @@ struct Args {
     /// Read an IAM test app_secret from a file (use - for stdin).
     #[arg(long, global = true, conflicts_with = "test")]
     app_secret_file: Option<PathBuf>,
+    /// Calling application for an incoming OBO speech request.
+    #[arg(long, global = true, requires = "obo_token_file")]
+    obo_app: Option<String>,
+    /// Read the reusable OBO access token from a private file (- for stdin).
+    #[arg(long, global = true, requires = "obo_app")]
+    obo_token_file: Option<PathBuf>,
     /// Waveform backend origin; defaults to the production service.
     #[arg(
         long,
@@ -91,6 +106,13 @@ enum Command {
         /// Backwards-compatible spelling of the positional SLT.
         #[arg(long = "slt", hide = true, conflicts_with = "slt")]
         slt_flag: Option<String>,
+    },
+    /// Approve Briefcase storage separately from login, then retry your speech request.
+    Storage {
+        #[arg(long)]
+        org: String,
+        #[command(subcommand)]
+        command: StorageCommand,
     },
     /// Synthesize text and return the stored file URLs.
     Tts {
@@ -354,6 +376,44 @@ enum TestEnvironmentCommand {
         org: String,
     },
 }
+#[derive(Subcommand, Debug)]
+enum StorageCommand {
+    /// Open the returned IAM link and review the selected account and organization.
+    Start {
+        /// Reuse this key if the authorization request is interrupted.
+        #[arg(long)]
+        idempotency: Option<String>,
+    },
+    /// Read the current request state.
+    Status { authorization_id: uuid::Uuid },
+    /// Save the approved grant with the single-use code returned by IAM.
+    Complete {
+        authorization_id: uuid::Uuid,
+        /// Read the approval code from a private file or - for stdin.
+        #[arg(long)]
+        code_file: PathBuf,
+        /// Correlation state returned by start.
+        #[arg(long)]
+        state: String,
+    },
+}
+
+fn speech_error(
+    error: silicon_waveform_client::Error,
+    org: &str,
+    key: &str,
+    request_id: uuid::Uuid,
+) -> String {
+    if matches!(&error, silicon_waveform_client::Error::Api{code,..} if code == "storage_authorization_required")
+    {
+        format!(
+            "Briefcase approval is required. Run waveform storage --org {org} start, complete the approval, then repeat the same speech command with --idempotency {key} --request-id {request_id}. Keep the same --profile, server and test options."
+        )
+    } else {
+        error.to_string()
+    }
+}
+
 fn default_home_dir() -> PathBuf {
     std::env::var_os("SILICON_HOME")
         .or_else(|| std::env::var_os("HOME"))
@@ -386,22 +446,43 @@ fn scope_digest(base: &str, environment: Option<&str>) -> String {
     digest.update(environment.unwrap_or("production").as_bytes());
     format!("{:x}", digest.finalize())
 }
-fn session_path(base: &str, environment: Option<&str>) -> PathBuf {
-    dirs_fallback().join(format!("session-{}.json", scope_digest(base, environment)))
+fn profile_directory(profile: &str) -> Result<PathBuf, String> {
+    if profile.is_empty()
+        || profile.len() > 64
+        || !profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err("profile must contain 1-64 letters, digits, underscores or hyphens".into());
+    }
+    let root = dirs_fallback();
+    Ok(if profile == "default" {
+        root
+    } else {
+        root.join("profiles").join(profile)
+    })
 }
-fn test_environments_path(base: &str) -> PathBuf {
-    dirs_fallback().join(format!(
+fn session_path(root: &std::path::Path, base: &str, environment: Option<&str>) -> PathBuf {
+    root.join(format!("session-{}.json", scope_digest(base, environment)))
+}
+fn test_environments_path(root: &std::path::Path, base: &str) -> PathBuf {
+    root.join(format!(
         "test-environments-{}.json",
         scope_digest(base, None)
     ))
 }
-fn read_local_test_key(base: &str, id: &str) -> Option<String> {
+fn read_local_test_key(root: &std::path::Path, base: &str, id: &str) -> Option<String> {
     let value: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(test_environments_path(base)).ok()?).ok()?;
+        serde_json::from_str(&fs::read_to_string(test_environments_path(root, base)).ok()?).ok()?;
     value.get(id)?.as_str().map(str::to_owned)
 }
-async fn write_local_test_key(base: &str, id: &str, key: &str) -> Result<(), String> {
-    let path = test_environments_path(base);
+async fn write_local_test_key(
+    root: &std::path::Path,
+    base: &str,
+    id: &str,
+    key: &str,
+) -> Result<(), String> {
+    let path = test_environments_path(root, base);
     let _lock = session_lock(&path).await?;
     let mut map: serde_json::Map<String, serde_json::Value> = fs::read_to_string(&path)
         .ok()
@@ -462,6 +543,17 @@ struct Session {
     expires_at: u64,
     #[serde(default)]
     refresh_started_at: Option<u64>,
+    #[serde(default)]
+    identity: Option<silicon_waveform_client::LoginStatus>,
+}
+impl Session {
+    fn identity(
+        &self,
+    ) -> Result<&silicon_waveform_client::LoginStatus, silicon_waveform_client::Error> {
+        let identity = self.identity.as_ref().ok_or_else(|| silicon_waveform_client::Error::Invalid("legacy session is not bound to an account and organization; log in again with this profile".into()))?;
+        identity.validate()?;
+        Ok(identity)
+    }
 }
 fn read_session(path: &std::path::Path) -> Option<Session> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
@@ -506,7 +598,13 @@ async fn refresh_session(
 ) -> Result<Session, silicon_waveform_client::Error> {
     use silicon_waveform_client::Error;
     let _lock = session_lock(path).await.map_err(Error::Invalid)?;
-    refresh_session_locked(client, path, force).await
+    let session = refresh_session_locked(client, path, force).await?;
+    let status = client
+        .with_bearer(session.access_token.clone())
+        .login_status()
+        .await?;
+    session.identity()?.ensure_matches(&status)?;
+    Ok(session)
 }
 
 async fn refresh_session_locked(
@@ -516,6 +614,7 @@ async fn refresh_session_locked(
 ) -> Result<Session, silicon_waveform_client::Error> {
     use silicon_waveform_client::Error;
     let mut session = read_session(path).ok_or_else(|| Error::Invalid("not logged in for this server and environment; run waveform login with the same --url and --test options".to_owned()))?;
+    session.identity()?;
     if !force
         && session.expires_at > now().saturating_add(60)
         && session.refresh_started_at.is_none()
@@ -535,9 +634,18 @@ async fn refresh_session_locked(
         use sha2::{Digest as _, Sha256};
         let key = format!("waveform-refresh-{:x}", Sha256::digest(refresh.as_bytes()));
         let tokens = client.refresh_with_key(refresh, &key).await?;
+        session.identity()?.verify_tokens(&tokens)?;
         let mut value = saved_tokens(&tokens).map_err(Error::Invalid)?;
+        value["identity"] = serde_json::to_value(session.identity()?)?;
         value["expires_at"] =
             serde_json::json!(started_at.saturating_add(tokens.expires_in.max(0) as u64));
+        if value["expires_at"].as_u64().unwrap_or_default() > now().saturating_add(60) {
+            let verified = client
+                .with_bearer(tokens.access_token.clone())
+                .login_status()
+                .await?;
+            session.identity()?.ensure_matches(&verified)?;
+        }
         write_session(path, &value).map_err(Error::Invalid)?;
         session = serde_json::from_value(value)?;
         if session.expires_at > now().saturating_add(60) {
@@ -566,15 +674,22 @@ async fn verified_session(
     use silicon_waveform_client::Error;
     let _lock = session_lock(path).await.map_err(Error::Invalid)?;
     let session = refresh_session_locked(client, path, false).await?;
-    let selected = client.with_bearer(session.access_token);
+    let selected = client.with_bearer(session.access_token.clone());
     let status = selected.login_status().await?;
-    if status.authenticated || session.refresh_token.is_none() {
+    if status.authenticated {
+        session.identity()?.ensure_matches(&status)?;
+        return Ok((selected.with_login_context(session.identity()?)?, status));
+    }
+    if session.refresh_token.is_none() {
         return Ok((selected, status));
     }
     let session = refresh_session_locked(client, path, true).await?;
-    let selected = client.with_bearer(session.access_token);
+    let selected = client.with_bearer(session.access_token.clone());
     let status = selected.login_status().await?;
-    Ok((selected, status))
+    if status.authenticated {
+        session.identity()?.ensure_matches(&status)?;
+    }
+    Ok((selected.with_login_context(session.identity()?)?, status))
 }
 
 async fn bearer(client: &Client, path: &std::path::Path) -> Result<Client, String> {
@@ -672,6 +787,7 @@ fn validate_stdin_sources(args: &Args) -> Result<(), String> {
             .count()
     };
     let sources = is_stdin(&args.app_secret_file)
+        + is_stdin(&args.obo_token_file)
         + match &args.command {
             Command::Tts {
                 provider_options_file,
@@ -756,7 +872,8 @@ fn read_slt(value: Option<String>) -> Result<String, String> {
 }
 fn command_org(command: &Command) -> Option<&str> {
     match command {
-        Command::Tts { org, .. }
+        Command::Storage { org, .. }
+        | Command::Tts { org, .. }
         | Command::Stt { org, .. }
         | Command::Jobs { org, .. }
         | Command::Preferences { org, .. }
@@ -877,6 +994,12 @@ async fn main() -> Result<(), String> {
 }
 
 async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
+    // Capture the profile and state directory once, before any network wait.
+    let profile_root = profile_directory(&args.profile)?;
+    let selected_org = args
+        .organization
+        .clone()
+        .or_else(|| std::env::var("SILICON_ORG").ok());
     if let Command::Docs { topic } = &args.command {
         print!(
             "{}",
@@ -937,10 +1060,25 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
         )?;
         return Ok(());
     }
+    if args.obo_token_file.is_some()
+        && !matches!(&args.command, Command::Tts { .. } | Command::Stt { .. })
+    {
+        return Err("OBO access tokens apply only to tts and stt; use an ordinary login for account management".into());
+    }
+    let obo = if let (Some(app), Some(path)) = (&args.obo_app, &args.obo_token_file) {
+        let token = read_bounded_file(path, 16_384, "OBO token")?;
+        Some((
+            app.clone(),
+            secrecy::SecretString::from(token.trim().to_owned()),
+        ))
+    } else {
+        None
+    };
     let mut client = Client::new(&args.url, Auth::Anonymous)
         .map_err(|e| e.to_string())?
         .with_auto_update(false);
-    let mut session_file = session_path(&args.url, None);
+    let mut session_file = session_path(&profile_root, &args.url, None);
+    let mut selected_world = "production".to_owned();
     let test_selector = args.test.clone();
     if let Some(selector) = test_selector.as_deref() {
         // Root keys are accepted directly. For ergonomic CLI use, UUIDs are
@@ -949,7 +1087,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
         let root_key = match TestEnvironmentKey::new(selector.to_owned()) {
             Ok(key) => key,
             Err(_) if uuid::Uuid::parse_str(selector).is_ok() => {
-                if let Some(key) = read_local_test_key(&args.url, selector) {
+                if let Some(key) = read_local_test_key(&profile_root, &args.url, selector) {
                     TestEnvironmentKey::new(key).map_err(|e| e.to_string())?
                 } else {
                     let production = bearer(&client, &session_file).await?;
@@ -966,28 +1104,52 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                         .get("key")
                         .and_then(serde_json::Value::as_str)
                         .ok_or("environment key response did not contain key")?;
-                    write_local_test_key(&args.url, selector, key).await?;
+                    write_local_test_key(&profile_root, &args.url, selector, key).await?;
                     TestEnvironmentKey::new(key.to_owned()).map_err(|e| e.to_string())?
                 }
             }
             Err(error) => return Err(error.to_string()),
         };
         let encoded_key = serde_json::to_string(&root_key).map_err(|e| e.to_string())?;
-        session_file = session_path(&args.url, Some(&encoded_key));
+        session_file = session_path(&profile_root, &args.url, Some(&encoded_key));
         client = client.with_test_environment(root_key);
         let metadata = client
             .current_test_environment()
             .await
             .map_err(|e| e.to_string())?;
+        let environment_id = metadata
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("testing environment did not identify its world")?;
+        let environment_id = uuid::Uuid::parse_str(environment_id)
+            .map_err(|_| "testing environment returned an invalid world")?;
+        if environment_id.is_nil() {
+            return Err("testing environment returned an invalid world".into());
+        }
+        selected_world = format!("testing:{environment_id}");
         if let Some(id) = metadata.get("id").and_then(serde_json::Value::as_str) {
             let value: String = serde_json::from_str(&encoded_key).map_err(|e| e.to_string())?;
-            write_local_test_key(&args.url, id, &value).await?;
+            write_local_test_key(&profile_root, &args.url, id, &value).await?;
         }
         *banner = Some(format!(
             "Test environment: {} ({})",
             metadata["name"].as_str().unwrap_or("unnamed"),
             metadata["id"].as_str().unwrap_or("unknown")
         ));
+    }
+    if obo.is_none()
+        && !matches!(
+            &args.command,
+            Command::Iam | Command::Contracts | Command::Capabilities
+        )
+        && let Some(expected) = selected_org.as_deref()
+        && let Some(identity) = read_session(&session_file).and_then(|session| session.identity)
+        && identity.org_id.as_deref() != Some(expected)
+    {
+        return Err(
+            "selected profile belongs to a different organization; choose the matching --profile"
+                .into(),
+        );
     }
     match args.command {
         Command::Docs { .. } | Command::Daemon { .. } => {
@@ -1042,7 +1204,17 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                 None => silicon_waveform_client::LoginStatus::default(),
             };
             if args.json {
-                print_json(&status)?;
+                let mut value = serde_json::to_value(&status).map_err(|e| e.to_string())?;
+                value["profile"] = serde_json::json!(args.profile);
+                value["url"] = serde_json::json!(args.url);
+                value["world"] = serde_json::json!(selected_world);
+                if !status.authenticated {
+                    value
+                        .as_object_mut()
+                        .ok_or("invalid status")?
+                        .remove("testing_environment_id");
+                }
+                print_json(&value)?;
             } else if let Some(actor) = status.actor {
                 println!(
                     "Authenticated as {} {}, organization {}",
@@ -1067,9 +1239,26 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             let slt = read_slt(slt.or(slt_flag))?;
             let _lock = session_lock(&session_file).await?;
             let tokens = client.login(&slt).await.map_err(|e| e.to_string())?;
-            write_session(&session_file, &saved_tokens(&tokens)?)?;
+            let identity = client
+                .with_bearer(tokens.access_token.clone())
+                .login_status()
+                .await
+                .map_err(|e| e.to_string())?;
+            identity.verify_tokens(&tokens).map_err(|e| e.to_string())?;
+            if let Some(expected) = selected_org.as_deref()
+                && identity.org_id.as_deref() != Some(expected)
+            {
+                return Err("login organization differs from the selected organization".into());
+            }
+            if let Some(previous) = read_session(&session_file).and_then(|session| session.identity)
+            {
+                previous.ensure_matches(&identity).map_err(|_| "this profile belongs to a different account, organization or world; choose a separate --profile".to_owned())?;
+            }
+            let mut saved = saved_tokens(&tokens)?;
+            saved["identity"] = serde_json::to_value(identity).map_err(|e| e.to_string())?;
+            write_session(&session_file, &saved)?;
             print_status(
-                "logged in; session saved for this server and environment",
+                "logged in; session saved for this profile, server and environment",
                 args.json,
             )?;
         }
@@ -1093,6 +1282,43 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             let _ = fs::remove_file(&session_file);
             print_status("logged out", args.json)?;
+        }
+        Command::Storage { org, command } => {
+            let client = bearer(&client, &session_file).await?;
+            let result = match command {
+                StorageCommand::Start { idempotency } => {
+                    let identity = client.me().await.map_err(|e| e.to_string())?;
+                    let actor = identity["public_id"]
+                        .as_str()
+                        .ok_or("IAM identity missing")?;
+                    let key = idempotency.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    eprintln!(
+                        "Authorization retry key: {key}. Review the returned consent_url, then use storage --org {org} complete with its authorization_id, state and --code-file. This does not start a speech request."
+                    );
+                    client.start_storage_authorization(&org, actor, &key).await
+                }
+                StorageCommand::Status { authorization_id } => {
+                    client
+                        .storage_authorization(&org, &authorization_id.to_string())
+                        .await
+                }
+                StorageCommand::Complete {
+                    authorization_id,
+                    code_file,
+                    state,
+                } => {
+                    let code = read_bounded_file(&code_file, 16384, "approval code")?;
+                    client
+                        .complete_storage_authorization(
+                            &org,
+                            &authorization_id.to_string(),
+                            code.trim(),
+                            &state,
+                        )
+                        .await
+                }
+            };
+            print_json(&result.map_err(|e| e.to_string())?)?;
         }
         Command::Me => print_json(
             &bearer(&client, &session_file)
@@ -1227,12 +1453,18 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             let idempotency =
                 idempotency.unwrap_or_else(|| format!("waveform-cli-{}", uuid::Uuid::new_v4()));
             let request_id = request_id.unwrap_or_else(uuid::Uuid::new_v4);
-            let c = bearer(&client, &session_file)
-                .await?
+            let c = if let Some((app, token)) = &obo {
+                client
+                    .with_obo_token(app, token.expose_secret())
+                    .map_err(|e| e.to_string())?
+            } else {
+                bearer(&client, &session_file).await?
+            };
+            let c = c
                 .with_speech_request_id(request_id)
                 .map_err(|e| e.to_string())?;
             eprintln!(
-                "Speech request {request_id}. Poll with jobs --org {org} --actor {actor} --job-id {request_id} --wait using the same server and test options."
+                "Speech request {request_id}. Poll with jobs --org {org} --actor {actor} --job-id {request_id} --wait using the same --profile, server and test options."
             );
             let value = c
                 .tts(
@@ -1252,7 +1484,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                     &idempotency,
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| speech_error(e, &org, &idempotency, request_id))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
@@ -1272,12 +1504,18 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
             let idempotency =
                 idempotency.unwrap_or_else(|| format!("waveform-cli-{}", uuid::Uuid::new_v4()));
             let request_id = request_id.unwrap_or_else(uuid::Uuid::new_v4);
-            let c = bearer(&client, &session_file)
-                .await?
+            let c = if let Some((app, token)) = &obo {
+                client
+                    .with_obo_token(app, token.expose_secret())
+                    .map_err(|e| e.to_string())?
+            } else {
+                bearer(&client, &session_file).await?
+            };
+            let c = c
                 .with_speech_request_id(request_id)
                 .map_err(|e| e.to_string())?;
             eprintln!(
-                "Speech request {request_id}. Poll with jobs --org {org} --actor {actor} --job-id {request_id} --wait using the same server and test options."
+                "Speech request {request_id}. Poll with jobs --org {org} --actor {actor} --job-id {request_id} --wait using the same --profile, server and test options."
             );
             let value = c
                 .stt(
@@ -1292,7 +1530,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                     &idempotency,
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| speech_error(e, &org, &idempotency, request_id))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
@@ -1331,7 +1569,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                     encoded.get("id").and_then(serde_json::Value::as_str),
                     encoded.get("key").and_then(serde_json::Value::as_str),
                 ) {
-                    write_local_test_key(&args.url, id, key).await?;
+                    write_local_test_key(&profile_root, &args.url, id, key).await?;
                 }
                 print_json(&encoded)?;
             }
@@ -1367,7 +1605,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                     .await
                     .map_err(|e| e.to_string())?;
                 if let Some(key) = value.get("key").and_then(serde_json::Value::as_str) {
-                    write_local_test_key(&args.url, &environment_id, key).await?;
+                    write_local_test_key(&profile_root, &args.url, &environment_id, key).await?;
                 }
                 print_json(&value)?;
             }
@@ -1381,7 +1619,7 @@ async fn run(args: Args, banner: &mut Option<String>) -> Result<(), String> {
                     .await
                     .map_err(|e| e.to_string())?;
                 if let Some(key) = value.get("key").and_then(serde_json::Value::as_str) {
-                    write_local_test_key(&args.url, &environment_id, key).await?;
+                    write_local_test_key(&profile_root, &args.url, &environment_id, key).await?;
                 }
                 print_json(&value)?;
             }
@@ -1436,6 +1674,42 @@ mod tests {
     use super::{Command, configure_home_at, read_slt};
     use clap::Parser as _;
     use std::fs;
+
+    #[test]
+    fn obo_requires_both_headers_and_never_accepts_a_token_argument() {
+        let base = [
+            "waveform", "tts", "Hello", "--org", "tos", "--actor", "legacy",
+        ];
+        assert!(
+            super::Args::try_parse_from(base.into_iter().chain([
+                "--obo-app",
+                "ting",
+                "--obo-token-file",
+                "private-token"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            super::Args::try_parse_from(base.into_iter().chain(["--obo-app", "ting"])).is_err()
+        );
+        assert!(
+            super::Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--obo-token-file", "private-token"])
+            )
+            .is_err()
+        );
+        let args = super::Args::try_parse_from(base.into_iter().chain([
+            "--obo-app",
+            "ting",
+            "--obo-token-file",
+            "-",
+            "--provider-key-file",
+            "openai=-",
+        ]))
+        .expect("CLI shape");
+        assert!(super::validate_stdin_sources(&args).is_err());
+    }
 
     #[test]
     fn tts_defaults_to_one_provider_and_controls_conflict_with_fallback() {

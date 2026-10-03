@@ -217,7 +217,16 @@ async fn compose_and_serve(
         IamHttpAdapter::new(&settings.iam)
             .map_err(|_| RuntimeError::IamConfiguration)?
             .with_storage_audience(&settings.briefcase.audience)
-            .with_identity_store(pool.clone()),
+            .with_identity_store(pool.clone())
+            .with_storage_grants(
+                settings
+                    .control
+                    .encryption_key
+                    .as_ref()
+                    .map(|key| crate::control::storage::StorageGrants::new(pool.clone(), key))
+                    .transpose()
+                    .map_err(|_| RuntimeError::IamConfiguration)?,
+            ),
     );
     let briefcase: Arc<dyn BriefcasePort> = Arc::new(
         FailClosedBriefcaseStore::new(&settings.briefcase)

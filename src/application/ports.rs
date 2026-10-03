@@ -125,6 +125,9 @@ pub trait IamPort: Send + Sync {
 /// Safe IAM failure category.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum IamError {
+    /// Storage feature consent is missing or was revoked.
+    #[error("Briefcase authorization is required")]
+    StorageAuthorizationRequired,
     /// Credential is absent, inactive, expired, malformed, or already consumed.
     #[error("IAM rejected the credential")]
     InvalidCredential,
@@ -224,6 +227,9 @@ pub trait BriefcasePort: Send + Sync {
 /// Safe Briefcase failure category.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum BriefcaseError {
+    /// Storage feature consent is missing or was revoked.
+    #[error("Briefcase authorization is required")]
+    StorageAuthorizationRequired,
     /// Delegated proof was rejected.
     #[error("Briefcase rejected delegated authorization")]
     Unauthorized,

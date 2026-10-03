@@ -1,17 +1,15 @@
 openapi: 3.1.0
 info:
   title: Silicon Waveform API
-  version: 0.3.0
+  version: 0.5.1
   summary: Provider-independent text-to-speech and speech-to-text
   description: |
     Synchronous speech operations for Carbons, Silicons, and IAM applications.
     TTS automatic fallback defaults to off; STT retains automatic fallback. TTS output is normalized to
-    MP3 and stored in the represented actor's Briefcase. OBO requests are
-    accepted only when the configured IAM and Briefcase request-bound contracts
-    are available. Test planes use deterministic speech with paired IAM and
-    Briefcase SDK uploads, delegated reads, and current replay access checks.
-    Inbound OBO speech is unavailable until IAM supports downstream delegation
-    from the initiating request. Bearer speech is implemented.
+    MP3 and stored in the selected Briefcase account and organization. Login and storage consent are separate.
+    Incoming OBO uses reusable access tokens and receiver verification through IAM 5.0.0; the approved graph
+    forwards the same token to declared Briefcase 3.0.0 dependencies. This contract is published ahead of the
+    coordinated runtime rollout. Test planes remain isolated and fail closed on mismatched downstream context.
 servers:
   - url: https://waveform.teamofsilicons.com/api/v1
 security:
@@ -26,6 +24,85 @@ tags:
   - name: Webhooks
 
 paths:
+  /storage-authorizations:
+    post:
+      operationId: startStorageAuthorization
+      summary: Request separate Briefcase feature consent
+      tags: [Authentication]
+      security: [{bearerAuth: []}]
+      description: Returns an IAM consent URL and correlation state. No storage tokens leave Waveform. Reuse the same idempotency key after uncertain results. Approval is separate from login and never starts speech generation.
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, minLength: 16, maxLength: 255}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false}
+      responses:
+        '200':
+          description: Pending or already completed authorization
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StorageAuthorization'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /storage-authorizations/{authorization_id}:
+    get:
+      operationId: getStorageAuthorization
+      summary: Read this account's storage authorization status
+      tags: [Authentication]
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - name: authorization_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Account, organization and testing plane bound status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StorageAuthorization'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {description: Authorization does not exist in the selected account and plane}
+  /storage-authorizations/{authorization_id}/complete:
+    post:
+      operationId: completeStorageAuthorization
+      summary: Exchange the manually supplied consent code
+      tags: [Authentication]
+      security: [{bearerAuth: []}]
+      description: Enter the IAM code and the state returned by start. Both are checked before exchanging the code. The same completed code and state safely replay; different values are rejected. Access and rotating refresh credentials are encrypted at rest and are never returned to the caller.
+      parameters:
+        - $ref: '#/components/parameters/OrgId'
+        - name: authorization_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code, state]
+              properties:
+                code: {type: string, maxLength: 16384, writeOnly: true}
+                state: {type: string, maxLength: 128, writeOnly: true}
+      responses:
+        '200':
+          description: Completed authorization, without credentials
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StorageAuthorization'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {description: State or code does not match}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /contracts:
     get:
       operationId: getApiContracts
@@ -699,9 +776,9 @@ components:
     oboAccess:
       type: apiKey
       in: header
-      name: X-IAM-OBO-Access-Proof
+      name: X-IAM-OBO-Access-Token
       description: |
-        Short-lived IAM proof bound to Waveform, the represented actor,
+        Reusable IAM access token for an approved endpoint graph, bound to the actor,
         organization, and requested action. X-App-ID is also required.
 
   parameters:
@@ -745,7 +822,7 @@ components:
       name: X-App-ID
       in: header
       required: false
-      description: Required with X-IAM-OBO-Access-Proof and omitted for Bearer requests.
+      description: Required with X-IAM-OBO-Access-Token and omitted for Bearer requests.
       schema:
         type: string
         minLength: 1
@@ -877,6 +954,15 @@ components:
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   schemas:
+    StorageAuthorization:
+      type: object
+      required: [authorization_id, consent_url, state, status, expires_at]
+      properties:
+        authorization_id: {type: string, format: uuid}
+        consent_url: {type: [string, 'null'], format: uri}
+        state: {type: string}
+        status: {type: string, enum: [pending, completed]}
+        expires_at: {type: string, format: date-time}
     VoiceProfileRef:
       type: object
       required: [id, revision]
@@ -1133,7 +1219,7 @@ components:
         public_id: { type: string, description: Immutable canonical Carbon or Silicon identity., example: saket }
         organization_id: { type: string, format: uuid }
         org_id: { type: string }
-        membership_id: { type: string, description: Canonical actor membership in the selected organization., example: "saket[tos]" }
+        membership_id: { type: string, description: Canonical actor membership in the selected organization., example: "c:saket[tos]" }
         membership_version: { type: integer, format: int64 }
         authorization_epoch: { type: integer, format: int64 }
         audience: { type: string }

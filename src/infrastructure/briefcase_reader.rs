@@ -79,7 +79,7 @@ impl BriefcaseSdkReader {
         &self,
         authority: &ReadAuthority<'_>,
         manifest: &DelegatedManifest<T>,
-    ) -> Result<(OboProof, Option<EnvironmentKey>), BriefcaseError> {
+    ) -> Result<(OboProof, Option<EnvironmentKey>, String, String), BriefcaseError> {
         let result = self
             .iam
             .delegate(DelegationRequest {
@@ -96,6 +96,9 @@ impl BriefcaseSdkReader {
             })
             .await
             .map_err(|error| match error {
+                crate::application::ports::IamError::StorageAuthorizationRequired => {
+                    BriefcaseError::StorageAuthorizationRequired
+                }
                 crate::application::ports::IamError::Forbidden
                 | crate::application::ports::IamError::OrganizationMismatch => {
                     BriefcaseError::Forbidden
@@ -124,6 +127,8 @@ impl BriefcaseSdkReader {
         Ok((
             OboProof::new(result.proof.expose_secret()).map_err(map_sdk)?,
             environment,
+            result.organization_id.as_str().to_owned(),
+            result.actor_id.ok_or(BriefcaseError::InvalidResponse)?,
         ))
     }
 
@@ -154,25 +159,32 @@ impl BriefcaseSdkReader {
             .connect(actor.organization_id.as_str(), environment)
             .await?;
         // Empty-path delegated list initializes only the current actor's native app folder.
-        self.source_list(
-            &client,
-            &authority,
-            DelegatedListEntries {
-                limit: Some(1),
-                ..Default::default()
-            },
-        )
-        .await?;
+        let (_, selected_org, selected_actor) = self
+            .source_list(
+                &client,
+                &authority,
+                DelegatedListEntries {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let public_id = selected_actor.as_str();
+        if !valid_public_id(public_id) {
+            return Err(BriefcaseError::InvalidResponse);
+        }
         let parent = format!("apps/{}/private", self.settings.app_id);
         let expected_path = format!("{parent}/{public_id}");
-        let expected_kind = match actor.actor.kind {
+        let expected_kind = match crate::infrastructure::actor_keys::canonical_kind(public_id)
+            .ok_or(BriefcaseError::InvalidResponse)?
+        {
             crate::domain::identity::ActorKind::Carbon => briefcase_client::ActorType::Carbon,
             crate::domain::identity::ActorKind::Silicon => briefcase_client::ActorType::Silicon,
         };
         let mut cursor = None;
         let mut seen = HashSet::new();
         for _ in 0..100 {
-            let page = self
+            let (page, org, subject) = self
                 .source_list(
                     &client,
                     &authority,
@@ -184,11 +196,14 @@ impl BriefcaseSdkReader {
                     },
                 )
                 .await?;
+            if org != selected_org || subject != selected_actor {
+                return Err(BriefcaseError::InvalidResponse);
+            }
             for entry in page.items {
                 if entry.path != expected_path {
                     continue;
                 }
-                if entry.org_id != actor.organization_id.as_str()
+                if entry.org_id != selected_org
                     || !entry.is_folder()
                     || entry.id.is_nil()
                     || entry.deleted_at.is_some()
@@ -225,29 +240,20 @@ impl BriefcaseSdkReader {
 
     async fn source_list(
         &self,
-        client: &Client,
+        _client: &Client,
         authority: &ReadAuthority<'_>,
         request: DelegatedListEntries,
-    ) -> Result<briefcase_client::EntryPage, BriefcaseError> {
+    ) -> Result<(briefcase_client::EntryPage, String, String), BriefcaseError> {
         let manifest = request.prepare().map_err(map_sdk)?;
-        let (proof, discovered_environment) = self.proof(authority, &manifest).await?;
-        let scoped;
-        let selected = if discovered_environment.is_some() {
-            scoped = self
-                .connect(
-                    authority.actor.organization_id.as_str(),
-                    discovered_environment,
-                )
-                .await?;
-            &scoped
-        } else {
-            client
-        };
+        let (proof, discovered_environment, org, subject) =
+            self.proof(authority, &manifest).await?;
+        let selected = self.connect(&org, discovered_environment).await?;
         let app = ApplicationId::new(&self.settings.app_id).map_err(map_sdk)?;
-        selected
+        let page = selected
             .list_entries_on_behalf_of(&app, proof, &manifest)
             .await
-            .map_err(map_sdk)
+            .map_err(map_sdk)?;
+        Ok((page, org, subject))
     }
 
     // Decode URL segments exactly once. A path is a lookup key, never a URL to fetch.
@@ -284,11 +290,16 @@ impl BriefcaseSdkReader {
 
     async fn resolve(
         &self,
-        client: &Client,
+        _client: &Client,
         authority: &ReadAuthority<'_>,
         url: &BriefcaseFileUrl,
     ) -> Result<uuid::Uuid, BriefcaseError> {
-        let file_path = self.path(url, authority.actor.organization_id.as_str())?;
+        let requested_org = url
+            .as_url()
+            .path_segments()
+            .and_then(|mut p| p.nth(1))
+            .ok_or(BriefcaseError::NotFound)?;
+        let file_path = self.path(url, requested_org)?;
         let (parent, _) = file_path.rsplit_once('/').ok_or(BriefcaseError::NotFound)?;
         let app = ApplicationId::new(&self.settings.app_id).map_err(map_sdk)?;
         let mut cursor = None;
@@ -302,19 +313,12 @@ impl BriefcaseSdkReader {
             }
             .prepare()
             .map_err(map_sdk)?;
-            let (proof, discovered_environment) = self.proof(authority, &manifest).await?;
-            let scoped;
-            let client = if discovered_environment.is_some() {
-                scoped = self
-                    .connect(
-                        authority.actor.organization_id.as_str(),
-                        discovered_environment,
-                    )
-                    .await?;
-                &scoped
-            } else {
-                client
-            };
+            let (proof, discovered_environment, selected_org, _) =
+                self.proof(authority, &manifest).await?;
+            if selected_org != requested_org {
+                return Err(BriefcaseError::Forbidden);
+            }
+            let client = self.connect(&selected_org, discovered_environment).await?;
             let page = client
                 .list_entries_on_behalf_of(&app, proof, &manifest)
                 .await
@@ -323,7 +327,7 @@ impl BriefcaseSdkReader {
                 if entry.path != file_path {
                     continue;
                 }
-                if entry.org_id != authority.actor.organization_id.as_str()
+                if entry.org_id != selected_org
                     || entry.is_folder()
                     || entry.id.is_nil()
                     || entry.deleted_at.is_some()
@@ -353,7 +357,12 @@ impl BriefcaseSdkReader {
         probe: bool,
     ) -> Result<briefcase_client::ContentStream, BriefcaseError> {
         // Validate before either discovery or IAM, and never connect to a caller URL.
-        self.path(url, authority.actor.organization_id.as_str())?;
+        let requested_org = url
+            .as_url()
+            .path_segments()
+            .and_then(|mut p| p.nth(1))
+            .ok_or(BriefcaseError::NotFound)?;
+        self.path(url, requested_org)?;
         if authority
             .actor
             .expires_at
@@ -374,19 +383,12 @@ impl BriefcaseSdkReader {
         }
         .prepare()
         .map_err(map_sdk)?;
-        let (proof, discovered_environment) = self.proof(authority, &manifest).await?;
-        let scoped;
-        let client = if discovered_environment.is_some() {
-            scoped = self
-                .connect(
-                    authority.actor.organization_id.as_str(),
-                    discovered_environment,
-                )
-                .await?;
-            &scoped
-        } else {
-            &client
-        };
+        let (proof, discovered_environment, selected_org, _) =
+            self.proof(authority, &manifest).await?;
+        if selected_org != requested_org {
+            return Err(BriefcaseError::Forbidden);
+        }
+        let client = self.connect(&selected_org, discovered_environment).await?;
         let app = ApplicationId::new(&self.settings.app_id).map_err(map_sdk)?;
         client
             .read_file_on_behalf_of(&app, proof, &manifest)
@@ -497,8 +499,8 @@ mod tests {
             base_url: "https://backend.briefcase.test".parse()?,
             permanent_origin: "https://briefcase.test".parse()?,
             cdn_origin: "https://cdn.briefcase.test".parse()?,
-            app_id: "tos>waveform".to_owned(),
-            audience: "tos>briefcase".to_owned(),
+            app_id: "waveform".to_owned(),
+            audience: "briefcase".to_owned(),
             timeout: std::time::Duration::from_secs(1),
             download_timeout: std::time::Duration::from_secs(1),
             max_download_bytes: 1024,
@@ -506,7 +508,7 @@ mod tests {
         let iam = Arc::new(crate::infrastructure::testing::FixtureIam::new(
             crate::domain::identity::ActorKind::Carbon,
             uuid::Uuid::new_v4(),
-            "tos>waveform".parse()?,
+            "waveform".parse()?,
         )?);
         let reader = BriefcaseSdkReader::new(settings, iam);
         let valid = BriefcaseFileUrl::new(

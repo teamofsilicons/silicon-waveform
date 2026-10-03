@@ -1,13 +1,13 @@
 # Waveform CLI
 
-Install with `honeycomb install 'tos>waveform'`. Commands use
+Install with `honeycomb install 'waveform'`. Commands use
 `https://backend.waveform.teamofsilicons.com` by default. Set `WAVEFORM_URL` or
 pass `--url <backend>` before the command to select another server; for local
 development, use `--url http://127.0.0.1:8080`.
 
 Build with `cargo build --manifest-path cli/Cargo.toml`; run
 `waveform --help` or `waveform <command> --help` for the complete grammar.
-The CLI stores IAM session tokens under `<home>/.waveform/dir/session-<scope-digest>.json`
+Select an independent account and organization with `--profile NAME` or `WAVEFORM_PROFILE` (default: `default`). Use a separate profile name for each account/organization pair. The default profile retains `<home>/.waveform/dir/session-<scope-digest>.json`; named profiles use `<home>/.waveform/dir/profiles/NAME/session-<scope-digest>.json`
 with private directory/file permissions. By default `<home>` is `SILICON_HOME`
 when that environment variable is present, otherwise `~`; use
 `waveform config home <existing-directory>` to select another home before
@@ -19,7 +19,7 @@ rotates the saved access/refresh pair; it never prompts for
 an IAM password. In an interactive terminal the SLT prompt disables echo so
 the token is not shown while typing; when stdin is piped, login reads one line
 so noninteractive jobs can provide an SLT without a terminal. `waveform logout`
-revokes the access token and removes the local session.
+revokes the selected refresh family and removes only that profile/server/world session.
 
 `waveform config home <location>` is local-only and does not contact Waveform.
 It rejects missing paths and files with `not a directory`; the selected
@@ -112,7 +112,7 @@ arguments, including `waveform login status --help`.
 without a saved login. Use the returned `app_id` when obtaining an IAM SLT:
 
 ```json
-{"app_id":"tos>waveform","iam_base_url":"https://backend.iam.teamofsilicons.com/","testing_environment_id":null}
+{"app_id":"waveform","iam_base_url":"https://backend.iam.teamofsilicons.com/","testing_environment_id":null}
 ```
 
 The IAM URL comes from server configuration. `testing_environment_id` is the
@@ -124,7 +124,7 @@ to discover another server.
 `GET /api/v1/auth/me`, then returns:
 
 ```json
-{"authenticated":true,"actor":{"actor_type":"carbon","public_id":"12345678"},"org_id":"tos","testing_environment_id":null}
+{"authenticated":true,"actor":{"actor_type":"carbon","public_id":"c:12345678"},"org_id":"tos","testing_environment_id":null,"profile":"work","url":"https://backend.waveform.teamofsilicons.com","world":"production"}
 ```
 
 `actor_type` identifies a `carbon` or `silicon`. With no saved session, or a
@@ -133,8 +133,8 @@ identity fields. These status results exit successfully; scripts should inspect
 `authenticated`. Network failures, server errors and malformed responses exit
 nonzero, with diagnostics on stderr. Authenticated commands, including status,
 automatically refresh within 60 seconds of access-token expiry. Saved sessions
-from older CLI versions refresh once to acquire an expiry timestamp. Refreshes
-serialize across processes, preserve the selected server and testing environment,
+from older CLI versions without a verified actor/org/world binding require an explicit fresh login; their files are retained. Refreshes
+serialize across processes, preserve the captured profile, server, actor, organization and testing environment,
 and reuse the same retry key after an uncertain response. Tokens are never
 printed. Without `--json`, status prints a readable identity or login guidance.
 
@@ -216,3 +216,24 @@ works, but `--key-file` keeps the secret out of shell history and process argume
 Only one input may read stdin in a command. Key files contain only the key, with
 an optional final newline. Provider-key deletion restores normal selection on
 later requests.
+
+### Briefcase approval
+
+If speech reports `storage_authorization_required`, run `waveform storage --org ORG start`. Review the returned `consent_url` in IAM and select the destination account and organization. Save the single-use approval code in a private file, then run `waveform storage --org ORG complete AUTHORIZATION_ID --state STATE --code-file PATH`. `storage --org ORG status AUTHORIZATION_ID` shows its progress. Keep the same `--profile`, server and `--test` selection throughout.
+
+Approval does not submit speech. Retry your original command with the `--idempotency` and `--request-id` values shown by the failed attempt. Ordinary logout does not revoke separate Briefcase approval; manage that permission in IAM.
+
+Incoming application OBO speech can use `--obo-app ting --obo-token-file /private/token` with `tts` or `stt`. Use `-` to read one secret from stdin. Tokens are not command-line values, are never saved as a login, and cannot be used for account-management commands. Keep the same idempotency key and request ID for a logical retry.
+
+## IAM 5 account contexts
+
+Login verifies `/auth/me` against the returned token actor and single organization before saving. An existing profile cannot change account, organization or IAM world; select a new profile for that login. `--organization`/`WAVEFORM_ORG` and the runner's `SILICON_ORG` assert the expected organization. Refresh validates the successor identity before replacing credentials; mismatched or uncertain responses retain the original retry receipt. Every ordinary command captures its profile and state directory before network work. Scoped commands reject `--org` or `--actor` values that differ from that login. OBO speech retains its separately supplied delegated identity.
+
+```sh
+waveform --profile personal login SLT
+waveform --profile work login SLT
+waveform --profile work login status --json
+waveform --profile work tts "Hello" --org tos --actor si:agent
+```
+
+Keep the original profile, server, test selection, request ID and idempotency key when resuming speech after storage approval. Login and approval completion do not send or replay speech automatically.

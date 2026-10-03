@@ -1486,3 +1486,8 @@ dialog .muted {
 }
 
 .testing-banner{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;padding:12px 24px;background:#fff2cc;color:#523600;border-bottom:1px solid #e5c765}.testing-banner .button{margin-left:auto}
+
+.storage-consent { border: 1px solid var(--border, #dce3ef); border-radius: 12px; padding: 20px; margin-block: 18px; background: var(--panel, #fff); }
+.storage-consent h3 { margin-top: 0; }
+.storage-consent p { line-height: 1.6; }
+.storage-consent .button { margin: 8px 8px 0 0; }

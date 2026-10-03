@@ -10,7 +10,7 @@ import { fixture } from "./fixture.mjs";
 const origin = "http://localhost:4325",
   backend = "http://127.0.0.1:4340",
   iam = "https://auth.iam.teamofsilicons.com",
-  appId = "tos>waveform";
+  appId = "waveform";
 function setup(t, wrap = (fetcher) => fetcher) {
   const directory = mkdtempSync(join(tmpdir(), "waveform-browser-session-")),
     fake = fixture();
@@ -76,6 +76,59 @@ function setup(t, wrap = (fetcher) => fetcher) {
   };
   return { call, login, restart, stored, directory, fake };
 }
+
+test("an uncertain approval start reuses its authority and operation after restart", async (t) => {
+  let loseResponse = true, retainedResponse;
+  const attempts = [];
+  const s = setup(t, (fetcher) => async (url, init) => {
+    if (new URL(url).pathname === "/api/v1/storage-authorizations") {
+      attempts.push({ key: init.headers.get("idempotency-key"), authority: init.headers.get("authorization"), body: init.body });
+      retainedResponse ||= await (await fetcher(url, init)).json();
+      if (loseResponse) throw new Error("Approval started but its response was lost");
+      return Response.json(retainedResponse);
+    }
+    return fetcher(url, init);
+  });
+  await s.login();
+  assert.equal((await s.call("/api/session/storage/start", { popup_nonce: "a".repeat(64) })).status, 502);
+  assert.ok(s.stored()[0].production.storagePending.startKey);
+  s.restart();
+  loseResponse = false;
+  assert.equal((await s.call("/api/session/storage/start", { popup_nonce: "b".repeat(64) })).status, 200);
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts[1], attempts[0]);
+  assert.equal(s.fake.requests.filter(r => r.path === "/api/v1/storage-authorizations").length, 1);
+  const callback = await s.call("/auth/storage/callback?state=fixture-state&code=obc_fixture");
+  assert.equal(new URL(callback.headers.get("location")).searchParams.get("result"), "ok");
+  assert.equal(s.stored()[0].production.storagePending, undefined);
+});
+
+test("an uncertain approval completion retains its encrypted original code after restart", async (t) => {
+  let loseResponse = true;
+  const attempts = [];
+  const s = setup(t, (fetcher) => async (url, init) => {
+    if (new URL(url).pathname.endsWith("/complete")) {
+      attempts.push({ url: String(url), key: init.headers.get("idempotency-key"), body: init.body });
+      const response = await fetcher(url, init);
+      if (loseResponse) throw new Error("Completion response lost");
+      return response;
+    }
+    return fetcher(url, init);
+  });
+  await s.login();
+  await s.call("/api/session/storage/start", { popup_nonce: "c".repeat(64) });
+  const failed = await s.call("/auth/storage/callback?state=fixture-state&code=obc_fixture");
+  assert.equal(new URL(failed.headers.get("location")).searchParams.get("result"), "error");
+  assert.equal(s.stored()[0].production.storagePending.code, "obc_fixture");
+  assert.doesNotMatch(readFileSync(join(s.directory, "sessions.sqlite")).toString("latin1"), /obc_fixture|oat_production/);
+  s.restart();
+  loseResponse = false;
+  const retry = await (await s.call("/api/session/storage/start", { popup_nonce: "d".repeat(64) })).json();
+  assert.equal(new URL(retry.redirect_url).searchParams.get("result"), "ok");
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts[1], attempts[0]);
+  assert.equal(s.stored()[0].production.storagePending, undefined);
+});
 
 test("encrypted browser login survives restart and days of inactivity, while logout remains removed", async (t) => {
   let now = Date.now();
@@ -495,3 +548,164 @@ for (const repeated of [false, true])
       "ort_next_2",
     );
   });
+
+test("saved accounts and multiple sandboxes retain independent tokens through restart", async (t) => {
+  let current = {
+      public_id: "first",
+      actor_type: "carbon",
+      org_id: "one-org",
+      scopes: [],
+    },
+    generation = 0;
+  const identities = new Map();
+  const s = setup(t, (fetcher) => async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/v1/auth/login") {
+      generation++;
+      const access = `oat_account_${generation}`;
+      identities.set(access, structuredClone(current));
+      return Response.json({
+        access_token: access,
+        refresh_token: `ort_account_${generation}`,
+        expires_in: 3600,
+      });
+    }
+    if (path === "/api/v1/auth/me") {
+      const identity = identities.get(
+        init.headers.get("authorization").slice(7),
+      );
+      return Response.json(identity);
+    }
+    return fetcher(url, init);
+  });
+  const first = await (await s.login()).json();
+  assert.equal(first.org, "one-org");
+  current = { ...current, public_id: "second" };
+  const second = await (await s.login()).json();
+  current = {
+    ...current,
+    public_id: "builder",
+    actor_type: "silicon",
+    org_id: "other-org",
+  };
+  const third = await (await s.login()).json();
+  assert.equal(third.contexts.length, 3);
+  assert.notEqual(first.contextId, second.contextId);
+  s.restart();
+  const switched = await (
+    await s.call("/api/session/context", { context_id: first.contextId })
+  ).json();
+  assert.equal(switched.user.public_id, "first");
+  assert.equal(switched.org, "one-org");
+  await s.call("/api/v1/preferences");
+  assert.equal(
+    s.fake.requests.at(-1).headers.get("authorization"),
+    "Bearer oat_account_1",
+  );
+  const before = s.fake.requests.length;
+  for (const path of [
+    "/api/session/logout",
+    "/api/v1/tts",
+    "/api/v1/storage-authorizations",
+  ]) {
+    const stale = await s.call(
+      path,
+      {},
+      { "x-waveform-context": third.context },
+    );
+    assert.equal(stale.status, 409);
+  }
+  assert.equal(s.fake.requests.length, before);
+  assert.equal(
+    (
+      await s.call("/api/v1/preferences", undefined, {
+        "x-org-id": "other-org",
+      })
+    ).status,
+    409,
+  );
+  assert.equal(s.fake.requests.length, before);
+  await s.call("/api/session/environment", { key: s.fake.testKey });
+  const testing = await (await s.login()).json();
+  const anotherKey = "ask_" + "B".repeat(43);
+  s.fake.environments.push({
+    id: "33333333-3333-4333-8333-333333333333",
+    name: "Other sandbox",
+    key: anotherKey,
+  });
+  await s.call("/api/session/environment", { key: anotherKey });
+  const another = await (await s.login()).json();
+  assert.equal(another.contexts.length, 5);
+  assert.notEqual(testing.contextId, another.contextId);
+  s.restart();
+  await s.call("/api/session/context", { context_id: testing.contextId });
+  await s.call("/api/v1/preferences");
+  assert.equal(
+    s.fake.requests.at(-1).headers.get("x-testing-environment-key"),
+    s.fake.testKey,
+  );
+  assert.equal(
+    s.fake.requests.at(-1).headers.get("authorization"),
+    "Bearer oat_account_4",
+  );
+  await s.call("/api/session/logout", {});
+  s.restart();
+  const remaining = await (await s.call("/api/session")).json();
+  assert.equal(remaining.contexts.length, 4);
+  assert.ok(
+    !remaining.contexts.some((entry) => entry.id === testing.contextId),
+  );
+  assert.doesNotMatch(
+    readFileSync(join(s.directory, "sessions.sqlite")).toString("latin1"),
+    /oat_account_|ort_account_|ask_B/,
+  );
+});
+
+test("selecting the current saved context does not revoke it", async (t) => {
+  const s = setup(t),
+    first = await (await s.login()).json();
+  const selected = await s.call("/api/session/context", {
+    context_id: first.contextId,
+  });
+  assert.equal(selected.status, 200);
+  assert.equal((await selected.json()).authenticated, true);
+  assert.equal((await s.call("/api/session/refresh", {})).status, 200);
+});
+
+for (const refresh of [false, true])
+  test(`${refresh ? "refresh" : "session verification"} rejects an organization change`, async (t) => {
+    let changed = false;
+    const s = setup(t, (fetcher) => async (url, init) => {
+      const result = await fetcher(url, init);
+      if (new URL(url).pathname === "/api/v1/auth/me" && changed)
+        return Response.json({
+          ...(await result.json()),
+          org_id: "another-org",
+        });
+      return result;
+    });
+    await s.login();
+    changed = true;
+    const result = await s.call(
+      refresh ? "/api/session/refresh" : "/api/session",
+      refresh ? {} : undefined,
+    );
+    assert.equal(result.status, 401);
+    assert.equal((await result.json()).error.code, "identity_mismatch");
+    changed = false;
+    assert.equal(
+      (await (await s.call("/api/session")).json()).authenticated,
+      false,
+    );
+  });
+
+test("pre-migration persisted credentials cannot be assigned an inferred context", async (t) => {
+  const s = setup(t);
+  await s.login();
+  s.stored((row) => {
+    delete row.production.contextId;
+  });
+  const result = await (await s.call("/api/session")).json();
+  assert.equal(result.authenticated, false);
+  assert.equal(result.contexts.length, 0);
+});

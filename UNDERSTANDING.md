@@ -247,7 +247,7 @@ every app cli must support the following commands:
 App Internals:
 All apps are suggested to make a rust library which is stateless. then 2 things that uses the rust library: always running daemon, and a cli interface that talks to the daemon.
 
-On the docs page, show `honeycomb install 'tos>waveform'` to install the CLI, followed by how to log in.
+On the docs page, show `honeycomb install 'waveform'` to install the CLI, followed by how to log in.
 
 CLI design should be focused on giving details and helping finding the right command to use. CLI will often have lots of commands and it should be like a tree that can be traversed using --help.
 
@@ -311,3 +311,9 @@ We ship highly configurable apps with sensible defaults. Very much like VS Code.
 # Updates
 
 For each Waveform app release, provide one .tar.gz with honeycomb.yaml at the archive root and the prebuilt waveform CLI for Linux, Windows and macOS on x86_64 and aarch64. The manifest maps the waveform command to each target's executable and uses the app release version. Run `honeycomb validate` and then `honeycomb pack`. Refer to [Honeycomb docs](https://docs.honeycomb.teamofsilicons.com/) for the package format. Honeycomb handles installation and updates; Waveform must not independently replace a Honeycomb-managed CLI.
+
+# Identifier schema
+
+Silicon IDs use `si:{silicon_id}` (for example `si:cos`), Carbon IDs use `c:{carbon_id}` (for example `c:saket`), and application IDs use the bare `{app_id}` (for example `briefcase`). The components after `si:` and `c:` are handles; each prefix appears exactly once. Silicon IDs and application IDs do not contain an organisation component. Organisation membership and application ownership are stored separately under `org_id`.
+
+Outside the schema patterns above, fields and standalone placeholders named `silicon_id`, `sid`, `carbon_id`, or `cid` carry the complete prefixed public ID; `app_id` carries the bare application ID. This applies to authentication, API and CLI inputs and outputs, configuration, permissions, URLs, events and stored identity references. Where a CLI selector uses `@`, it precedes the complete ID, such as `@si:cos` or `@c:saket`.

@@ -15,7 +15,7 @@ def main():
     args = parser.parse_args()
     manifest = (ROOT / "honeycomb.yaml").read_bytes()
     version = tomllib.loads((ROOT / "cli/Cargo.toml").read_text())["package"]["version"]
-    for field, expected in (("app_id", "tos>waveform"), ("version", version)):
+    for field, expected in (("app_id", "waveform"), ("version", version)):
         match = re.search(rf"^{field}:\s*(\S+)\s*$", manifest.decode(), re.MULTILINE)
         if not match or match.group(1) != expected:
             raise SystemExit(f"honeycomb.yaml {field} must be {expected}")
@@ -26,7 +26,7 @@ def main():
     else:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(manifest)
-    print("Honeycomb manifest is synchronized (tos>waveform)")
+    print("Honeycomb manifest is synchronized (waveform)")
 
 
 if __name__ == "__main__":

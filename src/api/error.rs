@@ -35,7 +35,9 @@ impl ApiError {
                 StatusCode::BAD_REQUEST
             }
             WaveformError::Unauthenticated => StatusCode::UNAUTHORIZED,
-            WaveformError::Forbidden => StatusCode::FORBIDDEN,
+            WaveformError::Forbidden | WaveformError::StorageAuthorizationRequired => {
+                StatusCode::FORBIDDEN
+            }
             WaveformError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             WaveformError::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             WaveformError::SourceNotFound => StatusCode::NOT_FOUND,
@@ -270,6 +272,9 @@ fn message_for_code(code: &str) -> &'static str {
     match code {
         "invalid_request" => "The request is malformed or contains an invalid value.",
         "unauthenticated" => "Valid IAM authentication is required.",
+        "storage_authorization_required" => {
+            "Authorize Briefcase storage to continue. Your Waveform login is still valid."
+        }
         "forbidden" => "The represented actor is not permitted to perform this action.",
         "payload_too_large" => "The request exceeds a synchronous service limit.",
         "unsupported_media_type" => "The Briefcase source media type is not supported.",

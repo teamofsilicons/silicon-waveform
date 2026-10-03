@@ -1,0 +1,150 @@
+/* UIArc free component ports, MIT © 2026 Elia Kuratli.
+   Pinned sources/adaptations: ../UIARC.md. License: /licenses/UIArc.txt. */
+:root {
+  --arc-control: 40px;
+  --arc-radius: 8px;
+  --arc-panel-radius: 12px;
+  --arc-fast: 140ms;
+  --arc-ease: cubic-bezier(.2, 0, 0, 1);
+  --arc-shadow: 0 1px 2px #16223b08;
+  --arc-focus: #346ed3;
+  --muted: #596576;
+  --line: #e2e6ed;
+  --blue: #275cc5;
+  --radius: var(--arc-panel-radius);
+  background: #fafbfc;
+}
+/* Button: same native button/link contract, with Arc's quiet variants and feedback. */
+.button {
+  position: relative;
+  display: inline-flex;
+  min-height: var(--arc-control);
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--arc-radius);
+  padding: 8px 16px;
+  color: var(--ink);
+  background: var(--surface);
+  font-size: .8125rem;
+  font-weight: 500;
+  line-height: 1.5;
+  -webkit-tap-highlight-color: transparent;
+  transition: color var(--arc-fast) var(--arc-ease), background var(--arc-fast) var(--arc-ease), border-color var(--arc-fast) var(--arc-ease), opacity var(--arc-fast) var(--arc-ease), box-shadow var(--arc-fast) var(--arc-ease);
+}
+.button:focus-visible { outline: 2px solid var(--arc-focus); outline-offset: 3px; }
+.button:disabled { cursor: not-allowed; opacity: .52; }
+.button[aria-busy="true"] { cursor: progress; }
+.button.primary { color: white; background: var(--blue); border-color: var(--blue); }
+.button:hover { filter: none; }
+.button.primary:active:not(:disabled) { opacity: .84; }
+.button:not(.primary):active:not(:disabled) { background: #f3f5f8; }
+@media (hover: hover) and (pointer: fine) {
+  .button.primary:hover:not(:disabled) { opacity: .91; box-shadow: var(--arc-shadow); }
+  .button:not(.primary):hover:not(:disabled) { background: #f5f7fa; box-shadow: var(--arc-shadow); }
+}
+/* Card surface/content adaptation; quick-look media dialogs are not used. */
+.panel, .storage-consent {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--arc-panel-radius);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: none;
+  transition: border-color var(--arc-fast) var(--arc-ease), box-shadow var(--arc-fast) var(--arc-ease);
+}
+.panel-heading { padding: 20px 24px; }
+.panel-heading h2 { font-weight: 500; letter-spacing: -.02em; }
+/* Input/Textarea: Arc field geometry, visible invalid/focus/disabled states. */
+input:not([type="checkbox"], [type="radio"]), select, textarea:not(.speech-text) {
+  min-height: var(--arc-control);
+  border: 1px solid #cbd2dc;
+  border-radius: var(--arc-radius);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 0 0 6px transparent;
+  transition: border-color var(--arc-fast) var(--arc-ease), box-shadow var(--arc-fast) var(--arc-ease), background-color var(--arc-fast) var(--arc-ease);
+}
+input:not([type="checkbox"], [type="radio"]):focus-visible, select:focus-visible, textarea:focus-visible {
+  border-color: var(--arc-focus);
+  box-shadow: 0 0 0 3px #346ed320;
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+}
+input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: #b63131; }
+input:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opacity: .52; background: #f5f7fa; }
+/* Application layout: compact composition, persistent context, restrained blue. */
+.sidebar { background: #f6f8fb; padding-top: 26px; }
+.workspace-context { padding-top: 30px; }
+.workspace-context .eyebrow { font: 500 .75rem Plex, sans-serif; letter-spacing: 0; margin-bottom: 10px; }
+.organization-button { font-size: .8125rem; padding: 10px; }
+.workspace-context .text-button { font-size: .72rem; margin-top: 10px; }
+.sidebar nav a { border-radius: var(--arc-radius); }
+.sidebar nav a.selected { background: #e8eefb; color: #214f9e; }
+.topbar { background: #fff; border-bottom-color: var(--line); }
+main { padding-top: 36px; }
+.page-heading { margin-bottom: 26px; }
+.page-heading .eyebrow { font: 500 .75rem Plex, sans-serif; letter-spacing: 0; color: var(--blue); margin-bottom: 10px; }
+h1 { font-weight: 500; letter-spacing: -.04em; }
+.page-heading .muted { margin-top: 8px; }
+.speech-layout { gap: 22px; }
+.composer .panel-heading { border-bottom: 0; padding-bottom: 12px; }
+.speech-text { min-height: 175px; padding: 10px 24px 14px; font-size: 1rem; line-height: 1.75; }
+.speech-text:focus { outline: 2px solid var(--arc-focus); outline-offset: -3px; }
+.speech-text::placeholder { color: #6b7687; }
+.text-count { padding: 0 24px 16px; color: var(--muted); }
+.text-count .mono { font-family: Plex, sans-serif; font-size: .75rem; font-variant-numeric: tabular-nums; }
+.composer-options { padding: 16px 24px; background: #fff; }
+.composer-voice { padding: 16px 24px; }
+.composer-footer { padding: 18px 24px; background: #fbfcfe; }
+.composer-footer .hint { font-size: .75rem; }
+.provider-controls, .request-key, .provider-controls-note { padding: 15px 24px; background: #fff; }
+.provider-controls summary, .request-key summary { font-size: .8125rem; color: var(--muted); }
+.routing .panel-heading { padding-bottom: 14px; }
+.routing > .hint { font-size: .78rem; line-height: 1.6; }
+.routing .order-list { margin-top: 18px; }
+.result-panel .panel-heading { border-bottom: 0; padding-bottom: 0; }
+.result-panel .empty { min-height: 160px; padding: 24px; gap: 9px; }
+.result-panel .empty-icon { width: 38px; height: 38px; border-radius: 10px; color: var(--blue); background: #f1f5fd; }
+.settings-voice { padding: 0 24px 24px; max-width: 660px; }
+.settings-actions { margin-bottom: 18px; }
+.settings-panel .panel-footer { flex-wrap: wrap; }
+.telemetry-setting { flex: 1 1 240px; line-height: 1.5; }
+.telemetry-setting input { flex: 0 0 14px; }
+.settings-panel .panel-footer > .actions { justify-content: flex-end; flex-wrap: wrap; }
+.mobile-context { display: none; }
+@media (min-width: 1600px) { .speech-text { min-height: 210px; } }
+@media (max-width: 700px) {
+  .topbar { min-height: 60px; height: auto; flex-wrap: wrap; padding: 14px 16px 0; gap: 12px; }
+  .topbar:has(.mobile-context) { padding-bottom: 0; }
+  .topbar:not(:has(.mobile-context)) { padding-bottom: 14px; }
+  .topbar > .mobile-context { display: flex; flex: 1 0 100%; align-items: center; min-width: 0; min-height: 38px; gap: 8px; margin-top: -2px; padding: 8px 0 10px; border: 0; border-top: 1px solid var(--line); background: none; text-align: left; font-size: .75rem; }
+  .mobile-context-label { color: var(--muted); }
+  .mobile-context strong { color: var(--blue); font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+  .mobile-context-actor { margin-left: auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; color: var(--muted); white-space: nowrap; }
+  .mobile-context svg { flex-shrink: 0; }
+  .sidebar { top: 95px; }
+  .app-shell:has(.topbar:not(:has(.mobile-context))) .sidebar { top: 60px; }
+  main { padding: 24px 16px 20px; }
+  .page-heading { margin-bottom: 22px; }
+  .page-heading .eyebrow { margin-bottom: 8px; }
+  .page-heading .muted { margin-top: 6px; }
+  .panel-heading { padding: 18px; }
+  .composer .panel-heading { padding-bottom: 10px; }
+  .speech-text { min-height: 136px; padding: 8px 18px 12px; }
+  .text-count { padding: 0 18px 14px; }
+  .composer-options { padding: 14px 18px; gap: 6px; }
+  .option-description { font-size: .7rem; line-height: 1.5; }
+  .composer-voice { padding: 14px 18px; }
+  .composer-footer { padding: 16px 18px; flex-direction: column-reverse; gap: 10px; }
+  .composer-footer .button { min-height: 44px; }
+  .composer-footer .hint { font-size: .72rem; }
+  .provider-controls, .request-key, .provider-controls-note { padding: 14px 18px; }
+  .result-panel .empty { min-height: 155px; }
+  .settings-voice { padding: 0 20px 20px; }
+  .telemetry-setting { flex-basis: auto; }
+  .settings-panel .panel-footer > .actions { width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) { .button, .panel, input, select, textarea { transition: none; } }
+@media (forced-colors: active) { .button.primary { border-color: ButtonText; } input:focus-visible, select:focus-visible, textarea:focus-visible { outline-color: Highlight; } }

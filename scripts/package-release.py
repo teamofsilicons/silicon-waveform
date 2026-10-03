@@ -76,7 +76,7 @@ def main() -> None:
     args = parser.parse_args()
     version = tomllib.loads((ROOT / "cli/Cargo.toml").read_text())["package"]["version"]
     manifest = (ROOT / "honeycomb.yaml").read_text()
-    for key, expected in (("app_id", "tos>waveform"), ("version", version)):
+    for key, expected in (("app_id", "waveform"), ("version", version)):
         match = re.search(rf"^{key}:\s*[\"']?([^\s\"'#]+)[\"']?\s*(?:#.*)?$", manifest, re.MULTILINE)
         if not match or match.group(1) != expected:
             raise SystemExit(f"honeycomb.yaml {key} must match {expected!r}")

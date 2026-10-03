@@ -58,13 +58,13 @@ def main():
     assert hashlib.sha256(a.archive.read_bytes()).hexdigest() == a.sha256, "Archive checksum mismatch"
     config = Path("/etc/waveform")
     old_env = env_file(config / "api.env")
-    assert old_env["WAVEFORM_IAM_APP_ID"] == "tos>waveform"
+    assert old_env["WAVEFORM_IAM_APP_ID"] == "waveform"
     secret = json.loads(json.loads(subprocess.check_output([
         "aws", "secretsmanager", "get-secret-value", "--region", a.region,
         "--secret-id", a.secret_arn, "--output", "json"]))["SecretString"])
     new_key = secret["WAVEFORM_IAM_APP_SECRET"]
     # Read-only credential preflight; the deliberately unknown token is inactive.
-    basic = base64.b64encode(("tos>waveform:" + new_key).encode()).decode()
+    basic = base64.b64encode(("waveform:" + new_key).encode()).decode()
     request = urllib.request.Request(old_env["WAVEFORM_IAM_BASE_URL"].rstrip("/") + "/api/v1/oauth/introspect",
         data=urllib.parse.urlencode({"token": "oat_" + "A" * 43}).encode(),
         headers={"authorization": "Basic " + basic, "content-type": "application/x-www-form-urlencoded"})
@@ -86,7 +86,7 @@ def main():
         package.extractall(release)
     manifest = json.loads((release / "build.json").read_text())
     assert manifest["source_revision"] == a.source_revision
-    assert manifest["app_id"] == "tos>waveform" and manifest["architecture"] == "aarch64"
+    assert manifest["app_id"] == "waveform" and manifest["architecture"] == "aarch64"
     expected = set()
     for line in (release / "SHA256SUMS").read_text().splitlines():
         digest, name = line.split("  ", 1)

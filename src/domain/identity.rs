@@ -136,25 +136,22 @@ impl FromStr for ApplicationId {
     type Err = IdentityError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if let Some((organization, handle)) = value.split_once('>') {
-            if organization.is_empty() || handle.is_empty() || handle.contains('>') {
-                return Err(IdentityError::InvalidCharacters {
-                    field: "application ID",
-                });
-            }
-            normalize_scoped_identifier(organization, "application ID", MAX_APPLICATION_ID_LENGTH)?;
-            normalize_scoped_identifier(handle, "application ID", MAX_APPLICATION_ID_LENGTH).map(
-                |normalized| {
-                    Self(format!(
-                        "{}>{normalized}",
-                        organization.to_ascii_lowercase()
-                    ))
-                },
-            )
-        } else {
-            normalize_scoped_identifier(value, "application ID", MAX_APPLICATION_ID_LENGTH)
-                .map(Self)
+        if !(1..=MAX_APPLICATION_ID_LENGTH).contains(&value.len()) {
+            return Err(IdentityError::InvalidLength {
+                field: "application ID",
+                max_length: MAX_APPLICATION_ID_LENGTH,
+            });
         }
+        if !value.as_bytes()[0].is_ascii_lowercase()
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            })
+        {
+            return Err(IdentityError::InvalidCharacters {
+                field: "application ID",
+            });
+        }
+        Ok(Self(value.to_owned()))
     }
 }
 
@@ -301,7 +298,7 @@ mod tests {
     #[test]
     fn scoped_identifiers_are_normalized() {
         let organization = OrganizationId::from_str("Team_Of-Silicons");
-        let application = ApplicationId::from_str("Silicon-Waveform");
+        let application = ApplicationId::from_str("silicon-waveform");
 
         assert_eq!(
             organization.map(|value| value.to_string()),
@@ -331,12 +328,15 @@ mod tests {
     }
 
     #[test]
-    fn application_ids_accept_canonical_organization_qualified_handles() {
+    fn application_ids_require_bare_handles() {
         assert_eq!(
-            ApplicationId::from_str("TOS>Waveform").map(|value| value.to_string()),
-            Ok("tos>waveform".to_owned())
+            ApplicationId::from_str("waveform").map(|value| value.to_string()),
+            Ok("waveform".to_owned())
         );
-        assert!(ApplicationId::from_str("tos>waveform>extra").is_err());
+        assert!(ApplicationId::from_str("Waveform").is_err());
+        assert!(ApplicationId::from_str("9waveform").is_err());
+        assert!(ApplicationId::from_str("waveform>extra").is_err());
+        assert!(ApplicationId::from_str("tos>waveform").is_err());
     }
 
     #[test]

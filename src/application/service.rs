@@ -5,7 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sha2::Digest as _;
 use thiserror::Error;
 
 use super::ports::{
@@ -432,7 +431,12 @@ impl WaveformService {
                 authorization,
                 match &context.credentials {
                     InboundCredentials::Bearer(token) => Some(token.clone()),
-                    InboundCredentials::OnBehalfOf(_) => None,
+                    InboundCredentials::OnBehalfOf(credentials) => {
+                        crate::domain::auth::AccessToken::new(
+                            credentials.proof.expose_secret().to_owned(),
+                        )
+                        .ok()
+                    }
                 },
                 request,
             )
@@ -562,7 +566,12 @@ impl WaveformService {
                 authorization,
                 match &context.credentials {
                     InboundCredentials::Bearer(token) => Some(token.clone()),
-                    InboundCredentials::OnBehalfOf(_) => None,
+                    InboundCredentials::OnBehalfOf(credentials) => {
+                        crate::domain::auth::AccessToken::new(
+                            credentials.proof.expose_secret().to_owned(),
+                        )
+                        .ok()
+                    }
                 },
                 request,
             )
@@ -696,8 +705,21 @@ impl WaveformService {
         subject_token: Option<crate::domain::auth::AccessToken>,
         request: TtsRequest,
     ) -> Result<TtsResult, WaveformError> {
-        // Mint the one-use storage proof only after normalization, because IAM
-        // binds it to the exact final bytes and gives it a short lifetime.
+        // Establish storage consent before any billable generation. Exact bytes
+        // are bound by the downstream reservation manifest.
+        let delegated_authorization = self
+            .iam
+            .delegate(DelegationRequest {
+                authorization: authorization.clone(),
+                purpose: DelegationPurpose::StoreGeneratedAudio,
+                request_id,
+                subject_token,
+                manifest: None,
+                upload: None,
+            })
+            .await
+            .map_err(map_iam_error)?;
+
         let requested_order = request.provider_order.as_deref().unwrap_or(&[]);
         let mut provider_order =
             crate::domain::provider::resolve_order(requested_order, &TTS_PROVIDER_CHAIN)
@@ -795,21 +817,6 @@ impl WaveformService {
         let (provider, audio) = successful_audio.ok_or(WaveformError::ProvidersExhausted)?;
         let duration = audio.duration();
         let filename = GeneratedAudioFileName::for_request(operation_started_at, request_id);
-        let delegated_authorization = self
-            .iam
-            .delegate(DelegationRequest {
-                authorization: authorization.clone(),
-                purpose: DelegationPurpose::StoreGeneratedAudio,
-                request_id,
-                subject_token,
-                manifest: None,
-                upload: Some(crate::domain::auth::DelegatedUploadBinding {
-                    filename: filename.clone(),
-                    body_sha256: format!("{:x}", sha2::Sha256::digest(audio.bytes())),
-                }),
-            })
-            .await
-            .map_err(map_iam_error)?;
         let stored = self
             .briefcase
             .store_generated_audio(StoreGeneratedAudioRequest {
@@ -1023,12 +1030,15 @@ pub enum ServiceConstructionError {
 fn subject_token(credentials: &InboundCredentials) -> Option<crate::domain::auth::AccessToken> {
     match credentials {
         InboundCredentials::Bearer(token) => Some(token.clone()),
-        InboundCredentials::OnBehalfOf(_) => None,
+        InboundCredentials::OnBehalfOf(credentials) => {
+            crate::domain::auth::AccessToken::new(credentials.proof.expose_secret().to_owned()).ok()
+        }
     }
 }
 
 fn map_iam_error(error: IamError) -> WaveformError {
     match error {
+        IamError::StorageAuthorizationRequired => WaveformError::StorageAuthorizationRequired,
         IamError::InvalidCredential => WaveformError::Unauthenticated,
         IamError::Forbidden | IamError::OrganizationMismatch => WaveformError::Forbidden,
         IamError::ContractUnavailable => WaveformError::DependencyContractUnavailable {
@@ -1054,11 +1064,12 @@ fn map_briefcase_error(error: BriefcaseError) -> WaveformError {
         BriefcaseError::ContractUnavailable => WaveformError::DependencyContractUnavailable {
             dependency: Dependency::Briefcase,
         },
-        BriefcaseError::Unauthorized | BriefcaseError::Unavailable => {
-            WaveformError::DependencyUnavailable {
-                dependency: Dependency::Briefcase,
-            }
+        BriefcaseError::Unauthorized | BriefcaseError::StorageAuthorizationRequired => {
+            WaveformError::StorageAuthorizationRequired
         }
+        BriefcaseError::Unavailable => WaveformError::DependencyUnavailable {
+            dependency: Dependency::Briefcase,
+        },
         BriefcaseError::Timeout => WaveformError::DependencyTimeout {
             dependency: Dependency::Briefcase,
         },
@@ -1157,6 +1168,7 @@ mod tests {
         authorized: AuthorizedActor,
         authorize_count: Mutex<usize>,
         delegated_request_ids: Mutex<Vec<RequestId>>,
+        delegation_error: Mutex<Option<IamError>>,
     }
 
     #[async_trait]
@@ -1179,7 +1191,14 @@ mod tests {
             request: DelegationRequest,
         ) -> Result<DelegatedAuthorization, IamError> {
             lock(&self.delegated_request_ids).push(request.request_id);
+            if let Some(error) = *lock(&self.delegation_error) {
+                return Err(error);
+            }
             Ok(DelegatedAuthorization {
+                organization_id: request.authorization.organization_id.clone(),
+                commit_proof: None,
+                list_proof: None,
+                actor_id: None,
                 testing_secret: None,
                 application_id: application_id("silicon-waveform"),
                 proof: secret_proof(),
@@ -1407,7 +1426,7 @@ mod tests {
             let mut request = tts_request();
             request.voice_profile = selected.map(str::to_owned);
             let context = if obo {
-                obo_context(request_id(78), "voice-profile", "tos>caller")
+                obo_context(request_id(78), "voice-profile", "caller")
             } else {
                 context(request_id(78), "voice-profile")
             };
@@ -2023,6 +2042,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_storage_consent_prevents_billable_provider_work() {
+        let fixture = fixture(
+            IdempotencyDecision::Acquired {
+                lease: lease(),
+                request_id: request_id(92),
+                operation_started_at: original_operation_start(),
+            },
+            provider_failures_for_tts(),
+            provider_failures_for_stt(),
+        );
+        *lock(&fixture.iam.delegation_error) = Some(IamError::StorageAuthorizationRequired);
+        let result = fixture
+            .service
+            .synthesize(
+                context(request_id(93), "needs-storage-approval"),
+                tts_request(),
+            )
+            .await;
+        assert_eq!(result, Err(WaveformError::StorageAuthorizationRequired));
+        assert!(
+            fixture
+                .tts
+                .iter()
+                .all(|provider| lock(&provider.request_ids).is_empty())
+        );
+        assert!(lock(&fixture.briefcase.store_requests).is_empty());
+    }
+
+    #[tokio::test]
     async fn history_write_failure_prevents_provider_work() {
         let fixture = fixture(
             IdempotencyDecision::Acquired {
@@ -2219,6 +2267,7 @@ mod tests {
             authorized,
             authorize_count: Mutex::new(0),
             delegated_request_ids: Mutex::new(Vec::new()),
+            delegation_error: Mutex::new(None),
         });
         let idempotency = Arc::new(FakeIdempotency {
             decisions: Mutex::new(VecDeque::from([Ok(decision)])),

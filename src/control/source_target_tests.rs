@@ -1,6 +1,6 @@
 //! Exact-request storage fixtures with real control-plane persistence.
 use super::*;
-use std::{collections::HashMap, sync::Mutex};
+use std::sync::Mutex;
 
 #[tokio::test]
 #[ignore = "requires disposable WAVEFORM_TEST_DATABASE_URL"]
@@ -21,6 +21,11 @@ async fn source_target_verifies_current_actor_world_and_actual_private_folder() 
             settings.permanent_origin = "https://briefcase.example.test".parse()?;
             let app = router(state.clone());
             let actor = Uuid::new_v4();
+            let public_actor = if kind == "carbon" {
+                "c:12345678"
+            } else {
+                "si:12345678"
+            };
             let authority = Arc::new(Mutex::new(snapshot(actor)));
             let current = authority.clone();
             Mock::given(path("/api/v1/oauth/introspect"))
@@ -45,33 +50,20 @@ async fn source_target_verifies_current_actor_world_and_actual_private_folder() 
             active["authorization"]["testing_environment_id"] = json!(world);
             active["authorization"]["org_id"] = json!("client-workspace");
             active["authorization"]["actor_type"] = json!(kind);
+            active["authorization"]["public_id"] = json!(public_actor);
             active["authorization"]["scopes"] =
                 json!(["waveform.stt", "self.identity.read", "self.membership.read"]);
             *authority.lock().map_err(|_| "snapshot")? = active.clone();
-            Mock::given(path("/api/v1/obo-access/applications/tos%3Ebriefcase/endpoints"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "application":{"app_id":"tos>briefcase","org_id":"tos"},
-                    "endpoints":[{"critical":false,"endpoint_id":"briefcase.entries.list","path":"/api/v1/obo/entries/list","metadata":{}}]
-                }))).mount(&iam).await;
-            let ledger = Arc::new(Mutex::new(HashMap::<String, String>::new()));
-            let issued = ledger.clone();
-            let emit_testing = Arc::new(std::sync::atomic::AtomicBool::new(testing));
-            let returned_plane = emit_testing.clone();
-            Mock::given(path("/api/v1/obo-access/exchanges"))
-                .respond_with(move |r: &wiremock::Request| {
-                    let b: Value = serde_json::from_slice(&r.body).expect("exchange");
-                    assert_eq!(b["org_id"], "client-workspace");
-                    assert_eq!(b["subject_token"], "oat_fixture");
-                    assert_eq!(b["audience"], "tos>briefcase");
-                    assert_eq!(b["endpoint_id"], "briefcase.entries.list");
-                    assert_eq!(b["request"]["method"], "POST");
-                    assert!(r.headers.contains_key("x-obo-signature"));
-                    assert_eq!(r.headers.contains_key("x-testing-environment-key"), testing && !discovered);
-                    assert_eq!(r.headers.contains_key("x-testing-application"), discovered);
-                    let proof = format!("obo_{}", Uuid::new_v4());
-                    issued.lock().expect("ledger").insert(proof.clone(), b["request"]["body_sha256"].as_str().expect("digest").to_owned());
-                    ResponseTemplate::new(201).set_body_json(json!({"testing_context": returned_plane.load(std::sync::atomic::Ordering::SeqCst).then(|| json!({"app_id":"tos>briefcase","app_secret":format!("ask_{}", "B".repeat(43)),"iam_test_key":"I".repeat(32)})), "access_proof":proof,"proof_id":Uuid::new_v4(),"expires_in":60,"expires_at":"2099-01-01T00:00:00Z"}))
-                }).mount(&iam).await;
+            let receiver = "si:chosen-storage";
+            seed_storage(
+                &state,
+                root.as_deref(),
+                "client-workspace",
+                "storage-workspace",
+                receiver,
+                testing,
+            )
+            .await?;
             Mock::given(path("/api/version"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -83,16 +75,16 @@ async fn source_target_verifies_current_actor_world_and_actual_private_folder() 
                 .mount(&storage)
                 .await;
             let folder_id = Uuid::new_v4();
-            let folder = json!({"id":folder_id,"org_id":"client-workspace","type":"folder","visibility":"full","name":"12345678",
-                "path":"apps/tos>waveform/private/12345678", "root_type":"private", "owner":{"type":kind,"id":"12345678"},
-                "created_at":null,"updated_at":null,"deleted_at":null,"origin_app_id":"tos>waveform","effective_access":["read","write"],
-                "permanent_url":"https://briefcase.example.test/org/client-workspace/apps/tos%3Ewaveform/private/12345678"});
+            let folder = json!({"id":folder_id,"org_id":"storage-workspace","type":"folder","visibility":"full","name":receiver,
+                "path":format!("apps/waveform/private/{receiver}"), "root_type":"private", "owner":{"type":"silicon","id":receiver},
+                "created_at":null,"updated_at":null,"deleted_at":null,"origin_app_id":"waveform","effective_access":["read","write"],
+                "permanent_url":format!("https://briefcase.example.test/org/storage-workspace/apps/waveform/private/{receiver}")});
             let returned = Arc::new(Mutex::new(folder.clone()));
             let entry = returned.clone();
             Mock::given(path("/api/v1/obo/entries/list"))
                 .respond_with(move |r: &wiremock::Request| {
-                    assert_eq!(r.headers.get("x-org-id").expect("org"), "client-workspace");
-                    assert_eq!(r.headers.get("x-app-id").expect("app"), "tos>waveform");
+                    assert_eq!(r.headers.get("x-org-id").expect("org"), "storage-workspace");
+                    assert_eq!(r.headers.get("x-app-id").expect("app"), "waveform");
                     assert!(!r.headers.contains_key("authorization"));
                     assert_eq!(r.headers.contains_key("x-briefcase-app-secret"), testing);
                     if testing {
@@ -101,23 +93,18 @@ async fn source_target_verifies_current_actor_world_and_actual_private_folder() 
                             &format!("ask_{}", "B".repeat(43))
                         );
                     }
-                    let proof = r
-                        .headers
-                        .get("x-iam-obo-access-proof")
-                        .expect("proof")
-                        .to_str()
-                        .expect("proof text");
-                    let digest = ledger
-                        .lock()
-                        .expect("ledger")
-                        .remove(proof)
-                        .expect("fresh proof");
-                    assert_eq!(digest, silicon_iam_client::api::obo::body_sha256(&r.body));
+                    assert_eq!(
+                        r.headers
+                            .get("x-iam-obo-access-token")
+                            .expect("access token"),
+                        "oba_briefcase.entries.list"
+                    );
+                    assert!(!r.headers.contains_key("x-iam-obo-access-proof"));
                     let b: Value = serde_json::from_slice(&r.body).expect("list");
                     let items = if b["path"].is_null() {
                         json!([])
                     } else {
-                        assert_eq!(b["path"], "apps/tos>waveform/private");
+                        assert_eq!(b["path"], "apps/waveform/private");
                         json!([entry.lock().expect("entry").clone()])
                     };
                     ResponseTemplate::new(200)
@@ -159,13 +146,29 @@ async fn source_target_verifies_current_actor_world_and_actual_private_folder() 
                     serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
                 assert_eq!(
                     data,
-                    json!({"org_id":"client-workspace","app_id":"tos>waveform","actor_id":"12345678",
-                    "folder_id":folder_id,"folder_path":"apps/tos>waveform/private/12345678","testing_environment_id":world})
+                    json!({"org_id":"storage-workspace","app_id":"waveform","actor_id":receiver,
+                    "folder_id":folder_id,"folder_path":format!("apps/waveform/private/{receiver}"),"testing_environment_id":world})
                 );
             }
-            emit_testing.store(!testing, std::sync::atomic::Ordering::SeqCst);
+            seed_storage(
+                &state,
+                root.as_deref(),
+                "client-workspace",
+                "storage-workspace",
+                receiver,
+                !testing,
+            )
+            .await?;
             assert_eq!(invoke().await?.status(), StatusCode::SERVICE_UNAVAILABLE);
-            emit_testing.store(testing, std::sync::atomic::Ordering::SeqCst);
+            seed_storage(
+                &state,
+                root.as_deref(),
+                "client-workspace",
+                "storage-workspace",
+                receiver,
+                testing,
+            )
+            .await?;
             // Current authority is checked again on retries; stale snapshots never
             // become cached successful targets or invoke any storage operation.
             for (key, bad) in [
@@ -174,7 +177,7 @@ async fn source_target_verifies_current_actor_world_and_actual_private_folder() 
                 ("public_id", Value::Null),
                 ("actor_type", Value::Null),
                 ("org_id", json!("other")),
-                ("audience", json!("other>app")),
+                ("audience", json!("app")),
                 ("testing_environment_id", json!(Uuid::new_v4())),
             ] {
                 let before = storage.received_requests().await.ok_or("requests")?.len();
@@ -192,7 +195,7 @@ async fn source_target_verifies_current_actor_world_and_actual_private_folder() 
                 ("owner", json!({"type":kind,"id":"other"})),
                 ("type", json!("file")),
                 ("org_id", json!("other")),
-                ("origin_app_id", json!("other>app")),
+                ("origin_app_id", json!("app")),
                 ("root_type", json!("public")),
                 ("effective_access", json!(["read"])),
                 ("deleted_at", json!("2026-01-01T00:00:00Z")),

@@ -14,7 +14,7 @@ use crate::domain::{
 
 const ORG_ID: &str = "x-org-id";
 const IDEMPOTENCY_KEY: &str = "idempotency-key";
-const OBO_PROOF: &str = "x-iam-obo-access-proof";
+const OBO_PROOF: &str = "x-iam-obo-access-token";
 const APP_ID: &str = "x-app-id";
 const REQUEST_ID: &str = "x-request-id";
 const MIN_IDEMPOTENCY_KEY_LENGTH: usize = 8;
@@ -58,6 +58,9 @@ impl SpeechHeaders {
 }
 
 fn parse_credentials(headers: &HeaderMap) -> Result<InboundCredentials, HeaderError> {
+    if headers.contains_key("x-iam-obo-access-proof") {
+        return Err(HeaderError::InvalidAuthorization);
+    }
     let bearer = optional_header(headers, AUTHORIZATION.as_str())?
         .map(parse_bearer)
         .transpose()?;
@@ -162,7 +165,7 @@ pub enum HeaderError {
     #[error("IAM authentication credentials are required")]
     MissingCredentials,
     /// OBO proof and application headers must be supplied together.
-    #[error("X-IAM-OBO-Access-Proof and X-App-ID must be supplied together")]
+    #[error("X-IAM-OBO-Access-Token and X-App-ID must be supplied together")]
     IncompleteOboCredentials,
     /// Bearer and OBO credentials cannot be combined.
     #[error("Bearer and OBO credentials cannot be combined")]

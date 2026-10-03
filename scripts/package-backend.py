@@ -65,7 +65,7 @@ def main():
             copyright = Path("/usr/share/doc") / package / "copyright"
             if copyright.is_file():
                 shutil.copyfile(copyright, stage / "share" / f"{package}-copyright")
-        metadata = {"app_id": "tos>waveform", "source_revision": revision,
+        metadata = {"app_id": "waveform", "source_revision": revision,
                     "architecture": "aarch64", "backend_linkage": "static-musl",
                     "ffmpeg_version": output(ffmpeg, "-version").splitlines()[0]}
         (stage / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")

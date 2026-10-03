@@ -14,13 +14,7 @@ Read the [usage and development documentation](https://docs.waveform.teamofsilic
 
 ## Current implementation status
 
-Bearer TTS and test-plane TTS use official IAM proof exchange and Briefcase
-uploads. Personal provider keys are selected per account, and CLI sessions
-are isolated by server and test plane. STT source reads and TTS/STT replay
-access checks use the Briefcase 1.0 delegated API. Inbound OBO speech remains
-unavailable because IAM does not issue a downstream subject token from a
-consumed proof. See [the implementation checklist](./docs/IMPLEMENTATION.md) for
-remaining work and the distinction between local mocks and deployed tests.
+Direct and testing speech use explicit Briefcase feature consent, encrypted rotating grants and reserve/transfer/commit uploads. Incoming OBO is verified on every request and forwards the same approved chain token downstream with the provider-selected account and organization. CLI and web storage approval remain separate from login. These October changes are locally implemented and require a coordinated IAM/Briefcase/Waveform release; see [IAM integration](docs/iam.md).
 
 ## Public API
 
@@ -149,28 +143,8 @@ Build and test with the same `CARGO_TARGET_DIR`, or set `WAVEFORM_TEST_CLI` to t
 built executable. Without either override they use `cli/target/debug/waveform`.
 A missing binary fails before creating database state or mock expectations.
 
-## Current dependency-contract blockers
+## Coordinated deployment boundary
 
-Waveform intentionally fails closed where neighboring contracts are incomplete:
+The new OBO flow replaces the retired exact-request proof protocol. Deploy IAM's shared-token runtime and selected-provider delegation metadata, the matching Briefcase receiver, migration `0015_storage_consent.sql`, and Waveform's backend/client/web together. Configure `WAVEFORM_ENCRYPTION_KEY`, use `/api/v1/obo-access/token-verifications`, and remove storage `obo:` scopes from ordinary login. Register TTS dependencies on Briefcase reserve/commit/list and STT dependencies on list/read before users approve the separate feature grant.
 
-- IAM's current OBO verifier binds proofs to the exact request method, path,
-  and body digest; the released Waveform adapter does not yet receive those
-  raw request bytes and therefore fails closed. IAM also has no operation to
-  exchange the verified actor context for a new Briefcase-audience proof.
-- Briefcase requires an upload `parent_id` but has no operation to resolve or
-  create the represented actor's `apps/{app_id}` folder.
-- Briefcase metadata and delivery-URL operations require an entry ID, while
-  Waveform receives a permanent file URL. Briefcase has no published
-  authenticated permanent-URL-to-entry-ID resolution or direct content-read
-  operation for that reference.
-
-The shipped composition therefore reports `503 not_ready` from
-`/health/ready`. Otherwise-valid speech work that reaches downstream delegation
-fails with `503` at the first missing contract boundary before any provider is
-called or billed.
-
-Those capabilities are ports with complete workflow tests; no audience-bound
-proof is forwarded and no caller URL is fetched directly. Once IAM and
-Briefcase publish the missing operations, their HTTP adapters can be completed
-without changing the public API or application services. See D-008, D-027, and
-D-051 in [`decisions.md`](./decisions.md) for the governing boundaries.
+Local mock and PostgreSQL tests establish authorization, isolation, retry and storage protocol behavior. A release must still verify real IAM consent, repeated receiver calls, refresh, revocation and a complete upload/read in both production and testing contexts. No caller-provided media URL is fetched directly. See [IAM integration](docs/iam.md) and [the implementation checklist](docs/IMPLEMENTATION.md).

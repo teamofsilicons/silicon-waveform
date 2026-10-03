@@ -22,7 +22,7 @@ pub(super) async fn describe(
         Ok(json!({"api_version":row.try_get::<String,_>("version")?,"contract_version":row.try_get::<String,_>("contract_version")?,"state":row.try_get::<String,_>("state")?,"successor":row.try_get::<Option<String>,_>("successor")?,"deprecated_at":date("deprecated_at")?,"sunset_at":date("sunset_at")?}))
     }).collect::<Result<Vec<_>,_>>()?;
     Ok(Json(
-        json!({"service":"silicon-waveform","default_api_version":"v1","protocol_versions":["1"],"contracts":contracts,"compatibility":[{"api_version":"v1","protocol_version":"1","rust_client":">=0.3.0, <0.4.0","cli":">=0.3.0, <0.4.0"}],"policy":{"quiet_days_before_sunset":7,"requires_active_successor":true,"guide":"https://docs.waveform.teamofsilicons.com/api-contracts/"}}),
+        json!({"service":"silicon-waveform","default_api_version":"v1","protocol_versions":["1"],"contracts":contracts,"compatibility":[{"api_version":"v1","protocol_version":"1","rust_client":">=0.5.0, <0.6.0","cli":">=0.5.0, <0.6.0"}],"policy":{"quiet_days_before_sunset":7,"requires_active_successor":true,"guide":"https://docs.waveform.teamofsilicons.com/api-contracts/"}}),
     ))
 }
 
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(response.headers()["x-waveform-api-version"], "v1");
         assert_eq!(response.headers()["x-waveform-protocol-version"], "1");
         let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
-        assert_eq!(body["app_id"], "tos>waveform");
+        assert_eq!(body["app_id"], "waveform");
         for (path, header, value) in [
             ("/api/v2/iam", "x-waveform-api-version", "v2"),
             ("/api/v1/iam", "x-waveform-api-version", "v2"),

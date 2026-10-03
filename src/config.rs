@@ -488,7 +488,7 @@ fn load_iam(source: &impl EnvironmentSource) -> Result<IamSettings, SettingsErro
             value_or(
                 source,
                 "WAVEFORM_IAM_OBO_VERIFY_PATH",
-                "/api/v1/obo-access/verify",
+                "/api/v1/obo-access/token-verifications",
             )?,
         )?,
         audience: bounded_string(
@@ -499,19 +499,11 @@ fn load_iam(source: &impl EnvironmentSource) -> Result<IamSettings, SettingsErro
         )?,
         tts_action: action_name(
             "WAVEFORM_IAM_TTS_ACTION",
-            value_or(
-                source,
-                "WAVEFORM_IAM_TTS_ACTION",
-                "obo:tos>briefcase:briefcase.files.create",
-            )?,
+            value_or(source, "WAVEFORM_IAM_TTS_ACTION", "self.identity.read")?,
         )?,
         stt_action: action_name(
             "WAVEFORM_IAM_STT_ACTION",
-            value_or(
-                source,
-                "WAVEFORM_IAM_STT_ACTION",
-                "obo:tos>briefcase:briefcase.files.read",
-            )?,
+            value_or(source, "WAVEFORM_IAM_STT_ACTION", "self.identity.read")?,
         )?,
         timeout: duration_seconds(source, "WAVEFORM_IAM_TIMEOUT_SECONDS", 5, 1, 60)?,
     })
@@ -548,7 +540,7 @@ fn load_briefcase(
         audience: bounded_string(
             "WAVEFORM_BRIEFCASE_AUDIENCE",
             optional(source, "WAVEFORM_BRIEFCASE_AUDIENCE")?
-                .unwrap_or_else(|| "tos>briefcase".to_owned()),
+                .unwrap_or_else(|| "briefcase".to_owned()),
             3,
             80,
         )?,
@@ -1294,14 +1286,8 @@ mod tests {
         let settings = Settings::from_source(&TestEnvironment::valid())?;
 
         assert_eq!(settings.environment, RuntimeEnvironment::Development);
-        assert_eq!(
-            settings.iam.tts_action,
-            "obo:tos>briefcase:briefcase.files.create"
-        );
-        assert_eq!(
-            settings.iam.stt_action,
-            "obo:tos>briefcase:briefcase.files.read"
-        );
+        assert_eq!(settings.iam.tts_action, "self.identity.read");
+        assert_eq!(settings.iam.stt_action, "self.identity.read");
         assert_eq!(settings.limits.max_text_chars, 4_096);
         assert_eq!(settings.limits.max_media_bytes, 25 * 1_024 * 1_024);
         assert_eq!(settings.idempotency.ttl, Duration::from_hours(24));

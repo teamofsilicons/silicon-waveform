@@ -12,6 +12,9 @@ const json = (value, status = 200) => Response.json(value, { status });
 const failure = (code, message, status = 400) =>
   json({ error: { code, message } }, status);
 const routes = [
+  ["POST", /^\/api\/v1\/storage-authorizations$/],
+  ["GET", /^\/api\/v1\/storage-authorizations\/[0-9a-f-]{36}$/],
+  ["POST", /^\/api\/v1\/storage-authorizations\/[0-9a-f-]{36}\/complete$/],
   ["GET", /^\/health\/(live|ready)$/],
   ["GET", /^\/api\/v1\/capabilities$/],
   ["GET", /^\/api\/v1\/auth\/me$/],
@@ -43,7 +46,7 @@ export function createGateway({
   backend = "https://backend.waveform.teamofsilicons.com",
   origin = "http://localhost:4325",
   iam = "https://auth.iam.teamofsilicons.com",
-  appId = "tos>waveform",
+  appId = "waveform",
   fetcher = fetch,
   sessionDirectory,
 } = {}) {
@@ -69,7 +72,20 @@ export function createGateway({
   try {
     for (const session of store?.load() || []) {
       if (session.until <= Date.now()) store.delete(session.id);
-      else sessions.set(session.id, session);
+      else {
+        // Legacy slots lack a trustworthy account+organization context. Keep
+        // test selectors, but require a new login for pre-migration bearers.
+        for (const plane of ["production", "test"]) {
+          const slot = session[plane];
+          if (slot?.access && (!slot.contextId || !slot.org || !slot.user))
+            session[plane] = {
+              key: slot.key,
+              environment: slot.environment,
+              org: slot.org,
+            };
+        }
+        sessions.set(session.id, session);
+      }
     }
   } catch (error) {
     store?.close();
@@ -90,8 +106,59 @@ export function createGateway({
       throw error;
     }
   };
+  const slots = (session) =>
+    [
+      { plane: "production", slot: session.production },
+      { plane: "test", slot: session.test },
+      ...Object.values(session.saved || {}),
+    ].filter((entry) => entry.slot);
   const currentSlot = (session, slot) =>
-    !slot.revoked && [session.production, session.test].includes(slot);
+    !slot.revoked && slots(session).some((entry) => entry.slot === slot);
+  const sameIdentity = (plane, a, b) =>
+    !!a?.user &&
+    !!b?.user &&
+    a.user.actor_type === b.user.actor_type &&
+    a.user.public_id === b.user.public_id &&
+    a.org === b.org &&
+    (plane === "production" ||
+      (a.environment?.id === b.environment?.id && a.key === b.key));
+  function installSlot(session, plane, next) {
+    const previous = session[plane],
+      saved = { ...session.saved },
+      retired = [];
+    if (previous === next) {
+      updateSession(session, { active: plane, context: id() });
+      return;
+    }
+    if (previous?.refresh || previous?.key) {
+      if (
+        sameIdentity(plane, previous, next) ||
+        (!previous.user && previous.key === next.key)
+      )
+        retired.push(previous);
+      else {
+        previous.contextId ||= id();
+        saved[previous.contextId] = { plane, slot: previous };
+      }
+    }
+    for (const [contextId, entry] of Object.entries(saved)) {
+      if (
+        entry.slot === next ||
+        (entry.plane === plane && sameIdentity(plane, entry.slot, next))
+      ) {
+        if (entry.slot !== next) retired.push(entry.slot);
+        delete saved[contextId];
+      }
+    }
+    updateSession(session, {
+      saved,
+      [plane]: next,
+      active: plane,
+      context: id(),
+      until: Date.now() + SESSION_TTL_MS,
+    });
+    for (const slot of retired) slot.revoked = true;
+  }
   const clearSlot = (slot) => {
     for (const key of [
       "access",
@@ -106,7 +173,8 @@ export function createGateway({
   const identity = (value) =>
     typeof value?.public_id === "string" &&
     ["carbon", "silicon"].includes(value.actor_type) &&
-    typeof value.org_id === "string";
+    typeof value.org_id === "string" &&
+    /^[a-z0-9][a-z0-9-]{0,254}$/.test(value.org_id);
   async function upstream(path, slot, method = "GET", body, extra = {}) {
     const headers = new Headers({ accept: "application/json", ...extra });
     if (body !== undefined) headers.set("content-type", "application/json");
@@ -302,7 +370,7 @@ export function createGateway({
     }
     return response;
   }
-  async function login(session, slot, slt) {
+  async function login(session, slot, slt, expectedKind) {
     if (
       typeof slt !== "string" ||
       !(slot.key
@@ -327,12 +395,47 @@ export function createGateway({
     );
     if (!response.ok) return response;
     tokens(slot, await response.json(), session.loginAttempt.started);
-    const me = await upstream("/api/v1/auth/me", slot);
+    const me = await upstream("/api/v1/auth/me", { ...slot, org: undefined });
     if (!me.ok) return me;
     slot.user = await me.json();
     if (!identity(slot.user)) throw new Error("Invalid account response");
+    if (expectedKind && slot.user.actor_type !== expectedKind) {
+      clearSlot(slot);
+      return failure("identity_kind_mismatch", "Choose the same account type you selected in Waveform.", 403);
+    }
     slot.org = slot.user.org_id;
+    slot.contextId = id();
     delete session.loginAttempt;
+    return null;
+  }
+  const popupLocation = (nonce, success) => {
+    const target = new URL("/", origin);
+    target.searchParams.set("iam_popup", "complete");
+    target.searchParams.set("nonce", nonce);
+    target.searchParams.set("result", success ? "ok" : "error");
+    return target.href;
+  };
+  const storageIdentity = (session, slot, pending) =>
+    pending && pending.until > Date.now() && pending.slotId === slot?.contextId &&
+    pending.plane === session.active && pending.org === slot?.org &&
+    pending.actor === slot?.user?.public_id && pending.kind === slot?.user?.actor_type &&
+    !!slot?.access && currentSlot(session, slot);
+  const storageContext = (session, slot, pending) =>
+    storageIdentity(session, slot, pending) && pending.context === session.context;
+  async function completeStorage(session, slot, pending) {
+    const response = await authorized(
+      `/api/v1/storage-authorizations/${pending.authorizationId}/complete`, session, slot,
+      "POST", { code: pending.code, state: pending.state },
+      { "idempotency-key": pending.startKey + "-complete" },
+    );
+    if (!response.ok) {
+      if (response.status === 412) delete slot.storagePending;
+      return response;
+    }
+    const value = await response.json();
+    if (value.authorization_id !== pending.authorizationId || value.state !== pending.state || value.status !== "completed")
+      return failure("approval_pending", "Approval could not be verified. Retry the original request.", 409);
+    delete slot.storagePending;
     return null;
   }
   const snapshot = (s) => ({
@@ -344,6 +447,16 @@ export function createGateway({
     productionAvailable: !!s.production?.access,
     testAvailable: !!s.test?.key,
     context: s.context,
+    contextId: s[s.active]?.contextId,
+    contexts: slots(s)
+      .filter(({ slot }) => slot.access && !slot.revoked)
+      .map(({ plane, slot }) => ({
+        id: slot.contextId,
+        plane,
+        user: slot.user,
+        org: slot.org,
+        environment: slot.environment ?? null,
+      })),
   });
   const handle = async function handle(request) {
     let sessionId, session, releaseChange, changing;
@@ -484,7 +597,8 @@ export function createGateway({
               !identity(user) ||
               (slot.user &&
                 (user.public_id !== slot.user.public_id ||
-                  user.actor_type !== slot.user.actor_type))
+                  user.actor_type !== slot.user.actor_type ||
+                  user.org_id !== slot.org))
             ) {
               clearSlot(slot);
               return finish(
@@ -500,9 +614,72 @@ export function createGateway({
         }
         return finish(json(snapshot(session)));
       }
+      if (path === "/api/session/storage/start" && request.method === "POST") {
+        const slot = session[session.active];
+        if (!slot?.access || !identity(slot.user)) return finish(failure("sign_in_required", "Sign in to approve Briefcase access.", 401));
+        if (!/^[a-f0-9]{64}$/.test(body.popup_nonce || "")) return finish(failure("invalid_popup", "Start approval from Waveform."));
+        let pending = slot.storagePending;
+        if (storageIdentity(session, slot, pending)) {
+          pending.popupNonce = body.popup_nonce;
+          pending.context = session.context;
+        } else {
+          pending = {
+            startKey: id(), context: session.context, slotId: slot.contextId,
+            plane: session.active, org: slot.org, actor: slot.user.public_id,
+            kind: slot.user.actor_type, popupNonce: body.popup_nonce, until: Date.now() + 600_000,
+          };
+          slot.storagePending = pending;
+        }
+        // Persist the logical start before calling IAM through the backend. A
+        // lost response or gateway restart must reuse this operation's key.
+        persist(session);
+        if (pending.code) {
+          const failed = await completeStorage(session, slot, pending);
+          if (failed) return finish(failed);
+          return finish(json({ redirect_url: popupLocation(body.popup_nonce, true) }));
+        }
+        if (!pending.authorizationId) {
+          const response = await authorized("/api/v1/storage-authorizations", session, slot, "POST", { redirect_uri: new URL("/auth/storage/callback", origin).href }, { "idempotency-key": pending.startKey });
+          if (!response.ok) {
+            if (response.status === 412) delete slot.storagePending;
+            return finish(response);
+          }
+          const value = await response.json();
+          if (typeof value.authorization_id !== "string" || !/^[a-f0-9-]{36}$/.test(value.authorization_id) || typeof value.state !== "string" || !value.state || typeof value.consent_url !== "string" || value.status !== "pending") return finish(failure("invalid_approval", "IAM returned an invalid approval request.", 502));
+          const consent = new URL(value.consent_url);
+          if ((consent.protocol !== "https:" && !(consent.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(consent.hostname))) || consent.username || consent.password || consent.hash) return finish(failure("invalid_approval", "IAM returned an invalid approval address.", 502));
+          consent.searchParams.set("display", "popup");
+          const until = Math.min(pending.until, Date.parse(value.expires_at));
+          if (!Number.isFinite(until) || until <= Date.now()) return finish(failure("invalid_approval", "IAM returned an invalid expiry.", 502));
+          Object.assign(pending, { authorizationId: value.authorization_id, state: value.state, consentUrl: consent.href, until });
+        }
+        return finish(json({ redirect_url: pending.consentUrl }));
+      }
+      if (path === "/auth/storage/callback" && request.method === "GET") {
+        const slot = session[session.active], pending = slot?.storagePending;
+        if (!storageContext(session, slot, pending) || pending.state !== url.searchParams.get("state")) return finish(failure("approval_expired", "This approval no longer belongs to the current workspace. Return to Waveform and start again.", 403));
+        const code = url.searchParams.get("code");
+        if (url.searchParams.get("error") || !code || !/^obc_[!-~]{1,16380}$/.test(code)) {
+          delete slot.storagePending;
+          return finish(Response.redirect(popupLocation(pending.popupNonce, false), 303));
+        }
+        // Keep the one-use code encrypted before exchange so an uncertain
+        // completion retries its original operation and authority after restart.
+        if (pending.code && pending.code !== code) return finish(failure("approval_code_changed", "Retry the original approval callback.", 409));
+        pending.code = code;
+        persist(session);
+        let success = false;
+        try { success = !(await completeStorage(session, slot, pending)); } catch { /* The encrypted receipt remains retryable. */ }
+        return finish(Response.redirect(popupLocation(pending.popupNonce, success), 303));
+      }
       if (path === "/auth/start" && request.method === "GET") {
+        const identityKind = url.searchParams.get("identity_kind");
+        const popupNonce = url.searchParams.get("popup_nonce");
+        if ((identityKind && !["carbon", "silicon"].includes(identityKind)) ||
+            (popupNonce && (!identityKind || !/^[a-f0-9]{64}$/.test(popupNonce))))
+          return finish(failure("invalid_login", "Choose Carbon or Silicon to sign in."));
         const state = id();
-        session.pending = { state, until: Date.now() + 600_000 };
+        session.pending = { state, identityKind, popupNonce, context: session.context, plane: session.active, until: Date.now() + 600_000 };
         const callback = new URL("/auth/callback", origin);
         callback.searchParams.set("state", state);
         const destination = new URL(
@@ -510,7 +687,9 @@ export function createGateway({
           iam,
         );
         destination.searchParams.set("app_id", appId);
-        // Login is unscoped; discover the workspace from verified IAM authority.
+        if (identityKind) destination.searchParams.set("identity_kind", identityKind);
+        if (popupNonce) destination.searchParams.set("display", "popup");
+        // IAM chooses one account and organization; verify that exact authority.
         destination.searchParams.set("redirect_uri", callback.href);
         return finish(Response.redirect(destination, 303));
       }
@@ -521,7 +700,8 @@ export function createGateway({
         if (
           !pending ||
           pending.until < Date.now() ||
-          pending.state !== url.searchParams.get("state")
+          pending.state !== url.searchParams.get("state") ||
+          pending.context !== session.context || pending.plane !== session.active
         )
           error = "Sign-in expired. Please start again.";
         else {
@@ -530,22 +710,20 @@ export function createGateway({
             session,
             slot,
             url.searchParams.get("slt"),
+            pending.identityKind,
           );
           if (failed)
             error = "IAM could not finish sign-in. Please try a fresh code.";
           else {
-            const previous = session.production;
-            updateSession(session, {
-              production: slot,
-              until: Date.now() + SESSION_TTL_MS,
-              active: "production",
-              context: id(),
-            });
-            if (previous) previous.revoked = true;
+            installSlot(session, "production", slot);
           }
         }
         const destination = new URL("/", origin);
-        if (error) destination.searchParams.set("auth_error", error);
+        if (pending?.popupNonce) {
+          destination.searchParams.set("iam_popup", "complete");
+          destination.searchParams.set("nonce", pending.popupNonce);
+          destination.searchParams.set("result", error ? "error" : "ok");
+        } else if (error) destination.searchParams.set("auth_error", error);
         return finish(Response.redirect(destination, 303));
       }
       if (path === "/api/session/login" && request.method === "POST") {
@@ -563,12 +741,7 @@ export function createGateway({
         };
         const failed = await login(session, slot, body.slt);
         if (failed) return finish(failed);
-        updateSession(session, {
-          [session.active]: slot,
-          until: Date.now() + SESSION_TTL_MS,
-          context: id(),
-        });
-        if (previous) previous.revoked = true;
+        installSlot(session, session.active, slot);
         return finish(json(snapshot(session)));
       }
       if (path === "/api/session/environment" && request.method === "POST") {
@@ -583,14 +756,24 @@ export function createGateway({
         const response = await upstream("/api/v1/testing-environment", slot);
         if (!response.ok) return finish(response);
         slot.environment = await response.json();
-        const previous = session.test;
-        updateSession(session, {
-          test: slot,
-          until: Date.now() + SESSION_TTL_MS,
-          active: "test",
-          context: id(),
-        });
-        if (previous) previous.revoked = true;
+        slot.contextId = id();
+        installSlot(session, "test", slot);
+        return finish(json(snapshot(session)));
+      }
+      if (path === "/api/session/context" && request.method === "POST") {
+        const selected = slots(session).find(
+          ({ slot }) =>
+            slot.contextId === body.context_id && slot.access && !slot.revoked,
+        );
+        if (!selected)
+          return finish(
+            failure(
+              "context_not_found",
+              "That saved workspace is unavailable.",
+              404,
+            ),
+          );
+        installSlot(session, selected.plane, selected.slot);
         return finish(json(snapshot(session)));
       }
       if (path === "/api/session/switch" && request.method === "POST") {
@@ -671,6 +854,17 @@ export function createGateway({
           failure(
             "test_environment_required",
             "Connect a test environment first.",
+          ),
+        );
+      if (
+        request.headers.has("x-org-id") &&
+        request.headers.get("x-org-id") !== slot?.org
+      )
+        return finish(
+          failure(
+            "organization_context_mismatch",
+            "Sign in to this organization separately.",
+            409,
           ),
         );
       const extra = {};

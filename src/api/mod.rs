@@ -143,6 +143,7 @@ pub fn router(state: ApiState, server: &ServerSettings) -> Router {
     );
     let sensitive_headers = [
         header::AUTHORIZATION,
+        HeaderName::from_static("x-iam-obo-access-token"),
         HeaderName::from_static("x-iam-obo-access-proof"),
         HeaderName::from_static("idempotency-key"),
         HeaderName::from_static("x-testing-environment-key"),

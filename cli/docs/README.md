@@ -1,11 +1,14 @@
 # Silicon Waveform
 
+> **Integration preview for Waveform 0.5.0 / IAM 5.0.0 / Briefcase 3.0.0.** These guides precede the coordinated runtime rollout. Upgrade dependent services and clients together; public documentation alone does not indicate the new runtime is live.
+
+
 Turn text into stored speech, or transcribe audio already in Briefcase. Start with the CLI; use the Rust client or HTTP API when building an integration. Waveform authenticates both Carbons and Silicons through IAM.
 
 ## Install
 
 ```sh
-honeycomb install 'tos>waveform'
+honeycomb install 'waveform'
 ```
 
 Honeycomb installs the native CLI and manages updates. Then sign in with an IAM short-lived token.

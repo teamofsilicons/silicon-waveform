@@ -10,6 +10,7 @@ mod lifecycle;
 mod reporting;
 mod sessions;
 mod source_target;
+pub(crate) mod storage;
 #[cfg(test)]
 mod tests;
 mod vault;
@@ -210,6 +211,18 @@ impl ControlState {
         {
             return Err(ControlError::forbidden());
         }
+        let public_id = authority
+            .public_id
+            .as_deref()
+            .ok_or_else(ControlError::forbidden)?;
+        let kind = match authority.actor_type {
+            Some(models::ApplicationAuthorizationActorType::Carbon) => ActorKind::Carbon,
+            Some(models::ApplicationAuthorizationActorType::Silicon) => ActorKind::Silicon,
+            _ => return Err(ControlError::forbidden()),
+        };
+        if crate::infrastructure::actor_keys::canonical_kind(public_id) != Some(kind) {
+            return Err(ControlError::forbidden());
+        }
         let storage_actor_id = crate::infrastructure::actor_keys::resolve(
             &self.pool,
             plane.id,
@@ -252,25 +265,63 @@ impl ControlState {
         headers: &HeaderMap,
         required_scope: &str,
     ) -> Result<TestSpeechContext, ControlError> {
-        let identity = self.identity(headers).await?;
-        if identity.plane.id.is_nil() {
+        let (plane, actor) = if headers.contains_key("x-iam-obo-access-token") {
+            let plane = self.plane(headers).await?;
+            let parsed = crate::api::headers::SpeechHeaders::parse(headers)
+                .map_err(|_| ControlError::unauthorized())?;
+            let crate::domain::auth::InboundCredentials::OnBehalfOf(credentials) =
+                &parsed.credentials
+            else {
+                return Err(ControlError::unauthorized());
+            };
+            let request = crate::domain::auth::AuthorizationRequest {
+                credentials: parsed.credentials.clone(),
+                organization_id: parsed.organization_id,
+                request_id: parsed.request_id,
+                action: if required_scope == "tts" {
+                    crate::domain::auth::WaveformAction::SynthesizeSpeech
+                } else {
+                    crate::domain::auth::WaveformAction::TranscribeSpeech
+                },
+            };
+            let actor = crate::infrastructure::auth::verify_obo(
+                &plane.iam,
+                Some(&self.pool),
+                plane.id,
+                plane.iam_environment_id,
+                &self
+                    .app_id
+                    .parse()
+                    .map_err(|_| ControlError::unavailable("invalid_application"))?,
+                &request,
+                credentials,
+            )
+            .await
+            .map_err(|error| match error {
+                crate::application::ports::IamError::InvalidCredential => {
+                    ControlError::unauthorized()
+                }
+                crate::application::ports::IamError::Forbidden => ControlError::forbidden(),
+                _ => ControlError::unavailable("iam_unavailable"),
+            })?;
+            (plane, actor)
+        } else {
+            let identity = self.identity(headers).await?;
+            let scope = if required_scope == "tts" {
+                &self.tts_scope
+            } else {
+                &self.stt_scope
+            };
+            if !identity.authority.scopes.contains(scope) {
+                return Err(ControlError::forbidden());
+            }
+            let actor = Self::authorized_actor_from_identity(&identity)?;
+            (identity.plane, actor)
+        };
+        if plane.id.is_nil() {
             return Err(ControlError::bad_request("test_environment_required"));
         }
-        let required_scope = if required_scope == "tts" {
-            &self.tts_scope
-        } else {
-            &self.stt_scope
-        };
-        if !identity
-            .authority
-            .scopes
-            .iter()
-            .any(|scope| scope == required_scope)
-        {
-            return Err(ControlError::forbidden());
-        }
-        let plane_id = identity.plane.id;
-        let actor = Self::authorized_actor_from_identity(&identity)?;
+        let plane_id = plane.id;
         let cipher: Vec<u8> = sqlx::query_scalar("SELECT briefcase_key_cipher FROM waveform_environments WHERE id=$1 AND deleted_at IS NULL")
             .bind(plane_id).fetch_one(&self.pool).await?;
         let environment = if cipher.is_empty() {
@@ -287,7 +338,9 @@ impl ControlState {
             )
         };
         let iam = Arc::new(crate::infrastructure::auth::TestStorageDelegator {
-            sdk: identity.plane.iam,
+            store: self.storage_grants()?,
+            plane: plane.id,
+            sdk: plane.iam,
             application_id: self
                 .app_id
                 .parse()
@@ -306,7 +359,7 @@ impl ControlState {
         Ok(TestSpeechContext {
             authorization: actor,
             plane_id,
-            fence: identity.plane.fence,
+            fence: plane.fence,
             iam,
             briefcase: Arc::new(briefcase),
         })
@@ -413,6 +466,9 @@ pub fn router(state: Arc<ControlState>) -> Router {
         .route("/api/v1/auth/refresh", post(sessions::refresh))
         .route("/api/v1/auth/logout", post(sessions::logout))
         .route("/api/v1/auth/me", get(sessions::me))
+        .route("/api/v1/storage-authorizations", post(storage::start))
+        .route("/api/v1/storage-authorizations/{id}", get(storage::status))
+        .route("/api/v1/storage-authorizations/{id}/complete", post(storage::complete))
         .route("/api/v1/stt/source-target", post(source_target::prepare))
         .route("/api/v1/jobs", get(jobs::list))
         .route("/api/v1/jobs/{job_id}", get(jobs::get))
@@ -477,7 +533,8 @@ fn single_header<'a>(
 }
 
 fn bearer(headers: &HeaderMap) -> Result<&str, ControlError> {
-    if single_header(headers, "x-iam-obo-access-proof")?.is_some()
+    if single_header(headers, "x-iam-obo-access-token")?.is_some()
+        || single_header(headers, "x-iam-obo-access-proof")?.is_some()
         || single_header(headers, "x-app-id")?.is_some()
     {
         return Err(ControlError::bad_request("unsupported_authentication_mode"));

@@ -205,11 +205,19 @@ pub struct DelegatedUploadBinding {
 /// New credential minted specifically for a downstream audience.
 #[derive(Clone, Debug)]
 pub struct DelegatedAuthorization {
+    /// Organization selected for Briefcase in feature consent.
+    pub organization_id: OrganizationId,
+    /// Commit endpoint authority; may share the incoming whole-chain token.
+    pub commit_proof: Option<OboProof>,
+    /// Listing authority to resolve the committed file.
+    pub list_proof: Option<OboProof>,
+    /// Public actor selected for Briefcase.
+    pub actor_id: Option<String>,
     /// Request-local downstream testing secret from IAM; never persisted.
     pub testing_secret: Option<secrecy::SecretString>,
     /// Application identity Briefcase expects alongside the proof.
     pub application_id: ApplicationId,
-    /// Short-lived proof that must never be replaced by the inbound proof.
+    /// Reusable endpoint or whole-chain access token.
     pub proof: OboProof,
     /// Purpose to which the proof was bound.
     pub purpose: DelegationPurpose,

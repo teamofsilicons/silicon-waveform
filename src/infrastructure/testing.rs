@@ -358,6 +358,10 @@ impl IamPort for FixtureIam {
         let proof = crate::domain::auth::OboProof::new("test-plane-fixture-proof".to_owned())
             .map_err(|_| IamError::InvalidResponse)?;
         Ok(DelegatedAuthorization {
+            organization_id: request.authorization.organization_id.clone(),
+            commit_proof: Some(proof.clone()),
+            list_proof: Some(proof.clone()),
+            actor_id: None,
             testing_secret: None,
             application_id: self.briefcase_application.clone(),
             proof,
@@ -710,7 +714,7 @@ mod tests {
                 )
                 .await?;
             let entry = &manifest["clips"][&profile.id];
-            let hash = silicon_iam_client::api::obo::body_sha256(artifact.bytes());
+            let hash = crate::infrastructure::auth::test_digest(artifact.bytes());
             assert_eq!(entry["sha256"], hash);
             assert!(hashes.insert(hash));
             assert_eq!(entry["voice"], profile.gemini_voice);
@@ -771,7 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_request_boundary_records_each_tts_upload() {
-        let app = ApplicationId::from_str("tos>briefcase").unwrap_or_else(|_| unreachable!());
+        let app = ApplicationId::from_str("briefcase").unwrap_or_else(|_| unreachable!());
         let iam = FixtureIam::new(ActorKind::Carbon, Uuid::from_u128(9), app.clone())
             .unwrap_or_else(|_| unreachable!());
         let ledger = FixtureUploadLedger::default();
@@ -853,8 +857,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn fixture_service_runs_tts_and_stt_request_workflows_without_network() {
-        let application =
-            ApplicationId::from_str("tos>briefcase").unwrap_or_else(|_| unreachable!());
+        let application = ApplicationId::from_str("briefcase").unwrap_or_else(|_| unreachable!());
         let iam = Arc::new(
             FixtureIam::new(ActorKind::Silicon, Uuid::from_u128(12), application.clone())
                 .unwrap_or_else(|_| unreachable!()),

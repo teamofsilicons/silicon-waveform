@@ -9,6 +9,7 @@ import {
 import {
   acceptSession,
   api,
+  bindApi,
   recordEvent,
   contextVersion,
   session,
@@ -17,6 +18,7 @@ import {
 } from "./api";
 import { Brand, Heading, Icon, Modal, Notice } from "./ui";
 import Speech from "./Speech";
+import { completeIamPopup, openIamPopup, type IdentityKind } from "./iam-popup";
 import History from "./History";
 import Settings from "./Settings";
 import Environments from "./Environments";
@@ -53,6 +55,7 @@ export default function App() {
   });
   const initialError = new URL(location.href).searchParams.get("auth_error");
   onMount(async () => {
+    if (completeIamPopup()) return;
     const hash = () => {
       if (location.hash === "#main-content") return;
       setPage(readPage());
@@ -79,6 +82,19 @@ export default function App() {
     setOrg(session()?.org || "tos");
     setError();
     setLogin(true);
+  }
+  async function signInAs(kind: IdentityKind) {
+    const getSession = bindApi();
+    setBusy(true);
+    setError();
+    try {
+      await openIamPopup(nonce => `/auth/start?identity_kind=${kind}&popup_nonce=${nonce}`);
+      const current = await getSession<Session>("/api/session");
+      if (!current.authenticated || current.user?.actor_type !== kind) throw new Error("The selected account could not be verified. Please sign in again.");
+      acceptSession(current);
+      setLogin(false);
+    } catch (err) { setError(err); }
+    finally { setBusy(false); }
   }
   async function signIn(e: SubmitEvent) {
     e.preventDefault();
@@ -133,20 +149,36 @@ export default function App() {
         <aside class="sidebar" classList={{ open: menu() }}>
           <Brand />
           <div class="workspace-context">
-            <span class="eyebrow">ORGANIZATION</span>
-            <button
+            <label class="eyebrow" for="workspace-context">
+              ACCOUNT & ORGANIZATION
+            </label>
+            <select
+              id="workspace-context"
               class="organization-button"
-              onClick={() => {
-                location.hash = "account";
-                setMenu(false);
-              }}
+              value={session()?.contextId || ""}
+              disabled={busy()}
+              onChange={(event) =>
+                void sessionAction("context", {
+                  context_id: event.currentTarget.value,
+                }).catch(setError)
+              }
             >
-              <span>
-                {session()?.org === "tos"
-                  ? "Team of Silicons"
-                  : session()?.org || "Your workspace"}
-              </span>
-              <Icon name="down" size={14} />
+              <Show when={!session()?.authenticated}>
+                <option value="">Choose a saved workspace</option>
+              </Show>
+              <For each={session()?.contexts || []}>
+                {(saved) => (
+                  <option value={saved.id}>
+                    {saved.user.public_id} · {saved.org}
+                    {saved.plane === "test"
+                      ? ` · ${saved.environment?.name || "Test"}`
+                      : ""}
+                  </option>
+                )}
+              </For>
+            </select>
+            <button class="text-button" onClick={signin}>
+              Add an account or organization
             </button>
           </div>
           <nav aria-label="Main navigation">
@@ -239,12 +271,31 @@ export default function App() {
                 {session()?.authenticated ? "Sign out" : "Sign in"}
               </button>
             </div>
+            <Show when={session()?.authenticated}>
+              <button class="mobile-context" aria-label="Change account or organization" onClick={() => setMenu(!menu())} aria-expanded={menu()}>
+                <span class="mobile-context-label">Workspace</span>
+                <strong>{session()?.org}</strong>
+                <span class="mobile-context-actor">{session()?.user?.public_id}</span>
+                <Icon name="down" size={14} />
+              </button>
+            </Show>
           </header>
           <Show when={session()?.plane === "test"}>
             <div class="testing-banner" role="status">
               <strong>Test environment · {session()?.environment?.name}</strong>
-              <span>Identity: {session()?.user?.public_id || "Not signed in"}</span>
-              <button class="button" onClick={() => void sessionAction("switch", {plane:"production"}).catch(setError)}>Exit testing mode</button>
+              <span>
+                Identity: {session()?.user?.public_id || "Not signed in"}
+              </span>
+              <button
+                class="button"
+                onClick={() =>
+                  void sessionAction("switch", { plane: "production" }).catch(
+                    setError,
+                  )
+                }
+              >
+                Exit testing mode
+              </button>
             </div>
           </Show>
           <main id="main-content" tabindex="-1">
@@ -273,7 +324,13 @@ export default function App() {
                       <History signin={signin} />
                     </Show>
                     <Show when={page() === "settings"}>
-                      <Settings signin={signin} connect={() => {setKey("");setConnect(true);}} />
+                      <Settings
+                        signin={signin}
+                        connect={() => {
+                          setKey("");
+                          setConnect(true);
+                        }}
+                      />
                     </Show>
                     <Show when={page() === "environments"}>
                       <Environments
@@ -319,7 +376,7 @@ export default function App() {
                           <div class="actions">
                             <button class="button primary" onClick={signin}>
                               {session()?.authenticated
-                                ? "Switch identity or organization"
+                                ? "Add an account or organization"
                                 : "Sign in with IAM"}
                             </button>
                             <Show when={session()?.authenticated}>
@@ -439,11 +496,23 @@ export default function App() {
                 </form>
               }
             >
-              <a class="button primary" href="/auth/start">
-                Continue with IAM <Icon name="arrow" />
-              </a>
+              <div class="stack">
+                <button class="button primary" disabled={busy()} onClick={() => void signInAs("carbon")}>Continue as Carbon <Icon name="arrow" /></button>
+                <button class="button" disabled={busy()} onClick={() => void signInAs("silicon")}>Continue as Silicon <Icon name="arrow" /></button>
+                <Show when={!busy()}>
+                  <p class="hint">If popups are unavailable, continue in this tab as <a href="/auth/start?identity_kind=carbon">Carbon</a> or <a href="/auth/start?identity_kind=silicon">Silicon</a>.</p>
+                </Show>
+              </div>
             </Show>
-            <button class="button" onClick={() => {setLogin(false);setConnect(true);}}>Use a test app_secret</button>
+            <button
+              class="button"
+              onClick={() => {
+                setLogin(false);
+                setConnect(true);
+              }}
+            >
+              Use a test app_secret
+            </button>
             <Notice error={error()} />
             <p class="hint">
               Access tokens stay on the frontend server. Waveform never asks for
@@ -465,7 +534,9 @@ export default function App() {
         >
           <form class="stack" onSubmit={connectEnvironment}>
             <p class="muted">
-              Enter Waveform’s IAM testing app_secret. We discover the sandbox automatically. Then sign in with a test SLT or an existing test identity’s public ID.
+              Enter Waveform’s IAM testing app_secret. We discover the sandbox
+              automatically. Then sign in with a test SLT or an existing test
+              identity’s public ID.
             </p>
             <label>
               Organization handle

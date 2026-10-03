@@ -1,5 +1,8 @@
 # Waveform API
 
+> **Integration preview for Waveform 0.5.0 / IAM 5.0.0 / Briefcase 3.0.0.** These guides precede the coordinated runtime rollout. Upgrade dependent services and clients together; public documentation alone does not indicate the new runtime is live.
+
+
 The backend base is `https://backend.waveform.teamofsilicons.com/api/v1`; local runs
 normally use `http://127.0.0.1:8080`. Speech calls use `X-Org-ID`,
 `Idempotency-Key`, and exactly one IAM bearer or OBO credential. `POST /tts`

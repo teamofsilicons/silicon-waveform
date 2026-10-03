@@ -43,7 +43,7 @@ command = ['/usr/bin/docker', 'run', '--name', 'waveform-frontend', '--network',
     '-e', 'WAVEFORM_SESSION_DIRECTORY=/var/lib/waveform/sessions',
     '-e', 'WAVEFORM_FRONTEND_ORIGIN=https://waveform.teamofsilicons.com',
     '-e', 'WAVEFORM_BACKEND_URL=https://backend.waveform.teamofsilicons.com',
-    '-e', 'WAVEFORM_IAM_AUTH_ORIGIN=https://auth.iam.teamofsilicons.com', '-e', 'WAVEFORM_APP_ID=tos>waveform', args.image]
+    '-e', 'WAVEFORM_IAM_AUTH_ORIGIN=https://auth.iam.teamofsilicons.com', '-e', 'WAVEFORM_APP_ID=waveform', args.image]
 if len(re.findall(r'^ExecStart=', previous, re.MULTILINE)) != 1:
     raise SystemExit('Expected exactly one frontend ExecStart')
 candidate = re.sub(r'^ExecStart=.*$', lambda _: 'ExecStart=' + shlex.join(command), previous, flags=re.MULTILINE)

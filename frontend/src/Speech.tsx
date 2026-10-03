@@ -8,7 +8,7 @@ import {
   Show,
 } from "solid-js";
 import {
-  api,
+  bindApi,
   recordEvent,
   ApiError,
   duration,
@@ -25,20 +25,38 @@ import {
 } from "./api";
 import { Copy, Empty, Heading, Icon, Notice, Order } from "./ui";
 import VoiceProfilePicker from "./VoiceProfilePicker";
+import StorageConsent from "./StorageConsent";
 import type { VoiceProfile } from "./api";
 import ProviderControls from "./ProviderControls";
-import { publicRequestSignature, speechRequest } from "./speech-request";
+import {
+  publicRequestSignature,
+  speechRequest,
+  type SpeechDraft,
+} from "./speech-request";
+const drafts = new Map<string, Omit<SpeechDraft, "requestKey" | "operation">>();
+
 export default function Speech(props: {
   operation: Operation;
   signin: () => void;
 }) {
-  const [text, setText] = createSignal(""),
-    [url, setUrl] = createSignal(""),
-    [language, setLanguage] = createSignal("");
-  const [custom, setCustom] = createSignal(false),
-    [order, setOrder] = createSignal<Provider[]>([]);
-  const [autoFallback, setAutoFallback] = createSignal(false),
-    [providerOptions, setProviderOptions] = createSignal<TtsProviderOptions>({}),
+  const api = bindApi(),
+    originalContext = session()?.context;
+  const draftKey =
+    (session()?.contextId || session()?.context || "anonymous") +
+    "|" +
+    props.operation;
+  const draft = drafts.get(draftKey);
+  const [text, setText] = createSignal(draft?.text || ""),
+    [url, setUrl] = createSignal(draft?.url || ""),
+    [language, setLanguage] = createSignal(draft?.language || "");
+  const [custom, setCustom] = createSignal(draft?.customOrder || false),
+    [order, setOrder] = createSignal<Provider[]>(draft?.order || []);
+  const [autoFallback, setAutoFallback] = createSignal(
+      draft?.autoFallback || false,
+    ),
+    [providerOptions, setProviderOptions] = createSignal<TtsProviderOptions>(
+      draft?.providerOptions || {},
+    ),
     [requestKey, setRequestKey] = createSignal("");
   const selectedProvider = () => order()[0];
   createEffect(on(selectedProvider, () => setRequestKey(""), { defer: true }));
@@ -55,18 +73,47 @@ export default function Speech(props: {
     () => api<Preferences>("/api/v1/preferences"),
   );
   createEffect(() => {
-    if (!prefs.error && prefs()) setOrder(prefs()![`${props.operation}_order`]);
+    if (!custom() && !prefs.error && prefs())
+      setOrder(prefs()![`${props.operation}_order`]);
   });
-  const [voice, setVoice] = createSignal("");
+  const [voice, setVoice] = createSignal(draft?.voice || "");
   const [profiles] = createResource(
     () => session()?.authenticated && props.operation === "tts",
     () => api<{ items: VoiceProfile[] }>("/api/v1/voice-profiles"),
   );
   const count = () => [...text()].length;
   let attempt: { signature: string; key: string; id: string } | undefined;
+  const [needsStorage, setNeedsStorage] = createSignal(false);
+  const [storageApproved, setStorageApproved] = createSignal(false);
+  // Retain only in memory until explicit retry/cancel; never serialize provider keys.
+  let pendingStorage:
+    | {
+        body: ReturnType<typeof speechRequest>;
+        attempt: NonNullable<typeof attempt>;
+      }
+    | undefined;
+  function cancelStorage() {
+    pendingStorage = undefined;
+    attempt = undefined;
+    setNeedsStorage(false);
+    setStorageApproved(false);
+    setError();
+  }
   let mounted = true;
   onCleanup(() => {
+    drafts.set(draftKey, {
+      text: text(),
+      url: url(),
+      language: language(),
+      voice: voice(),
+      order: [...order()],
+      customOrder: custom(),
+      autoFallback: autoFallback(),
+      providerOptions: structuredClone(providerOptions()),
+    });
     mounted = false;
+    pendingStorage = undefined;
+    setRequestKey("");
   });
   async function submit(e: SubmitEvent) {
     e.preventDefault();
@@ -75,6 +122,7 @@ export default function Speech(props: {
       props.signin();
       return;
     }
+    if (pendingStorage) cancelStorage();
     setError();
     setResult();
     if (props.operation === "tts" && (!text().trim() || count() > 4096)) {
@@ -105,15 +153,29 @@ export default function Speech(props: {
       providerOptions: providerOptions(),
       requestKey: requestKey(),
     });
-    const usesRequestKey = !!body.provider_keys;
     const signature = publicRequestSignature(body);
-    if (usesRequestKey || !attempt || attempt.signature !== signature)
+    if (body.provider_keys || !attempt || attempt.signature !== signature)
       attempt = {
         signature,
         key: crypto.randomUUID(),
         id: crypto.randomUUID(),
       };
-    setRequestId(attempt.id);
+    await runSpeech(body, attempt);
+  }
+  async function retryStorage() {
+    const pending = pendingStorage;
+    if (!pending || busy()) return;
+    setNeedsStorage(false);
+    setStorageApproved(false);
+    setError();
+    await runSpeech(pending.body, pending.attempt);
+  }
+  async function runSpeech(
+    body: ReturnType<typeof speechRequest>,
+    currentAttempt: { signature: string; key: string; id: string },
+  ) {
+    const usesRequestKey = !!body.provider_keys;
+    setRequestId(currentAttempt.id);
     setRequestKey("");
     setBusy(true);
     setElapsed(0);
@@ -125,18 +187,46 @@ export default function Speech(props: {
       const response = await api<SpeechResult>(`/api/v1/${props.operation}`, {
         method: "POST",
         body,
-        headers: { "idempotency-key": attempt.key, "x-request-id": attempt.id },
+        headers: {
+          "idempotency-key": currentAttempt.key,
+          "x-request-id": currentAttempt.id,
+        },
       });
       if (mounted) {
         setResult(response);
         setRequestId(response.request_id);
       }
-      recordEvent("speech_completed", Math.round(performance.now() - started));
+      recordEvent(
+        "speech_completed",
+        Math.round(performance.now() - started),
+        originalContext,
+      );
       attempt = undefined;
+      pendingStorage = undefined;
     } catch (err) {
-      recordEvent("speech_failed", Math.round(performance.now() - started));
-      if (mounted) setError(err);
+      recordEvent(
+        "speech_failed",
+        Math.round(performance.now() - started),
+        originalContext,
+      );
+      const storageRequired =
+        err instanceof ApiError &&
+        ([
+          "storage_authorization_required",
+          "obo_authorization_required",
+        ].includes(err.code) ||
+          err.status === 412);
+      if (mounted) {
+        if (storageRequired) {
+          pendingStorage = { body, attempt: currentAttempt };
+          setNeedsStorage(true);
+        } else {
+          setError(err);
+          pendingStorage = undefined;
+        }
+      }
       if (
+        !storageRequired &&
         err instanceof ApiError &&
         [400, 403, 404, 413, 415].includes(err.status)
       )
@@ -144,14 +234,14 @@ export default function Speech(props: {
     } finally {
       clearInterval(timer);
       // Never retry a key-bearing attempt with different or cleared credentials.
-      if (usesRequestKey) attempt = undefined;
+      if (usesRequestKey && !pendingStorage) attempt = undefined;
       if (mounted) setBusy(false);
     }
   }
   return (
     <>
       <Heading
-        eyebrow="SPEECH WORKSPACE"
+        eyebrow="Create with Waveform"
         title={props.operation === "tts" ? "Text to speech" : "Speech to text"}
       >
         {props.operation === "tts"
@@ -172,9 +262,6 @@ export default function Speech(props: {
           <form onSubmit={submit}>
             <div class="panel-heading">
               <h2>{props.operation === "tts" ? "Your text" : "Your audio"}</h2>
-              <span class="mono muted">
-                {props.operation === "tts" ? "01 / COMPOSE" : "01 / SOURCE"}
-              </span>
             </div>
             <Show
               when={props.operation === "tts"}
@@ -273,37 +360,37 @@ export default function Speech(props: {
                 </Show>
               </div>
             </Show>
-            <Show when={props.operation === "tts" && selectedProvider()}>
-              <Show
-                when={!autoFallback()}
-                fallback={<p class="provider-controls-note hint">Automatic fallback is on. Provider voice controls are unavailable because each provider handles them differently. Your voice profile is used across providers.</p>}
-              >
-                <ProviderControls
-                  provider={selectedProvider()}
-                  options={providerOptions()}
-                  change={setProviderOptions}
-                  disabled={busy()}
-                />
-              </Show>
+            <Show when={needsStorage()}>
+              <StorageConsent
+                cancel={cancelStorage}
+                approved={() => {
+                  setNeedsStorage(false);
+                  setStorageApproved(true);
+                }}
+              />
             </Show>
-            <Show when={session()?.authenticated && selectedProvider()}>
-              <details class="request-key">
-                <summary>Use your own API key for this request <span class="label-note">optional</span></summary>
-                <label>
-                  {providerNames[selectedProvider()]} API key
-                  <input
-                    type="password"
-                    autocomplete="off"
-                    spellcheck={false}
-                    value={requestKey()}
-                    onInput={(e) => setRequestKey(e.currentTarget.value)}
-                    maxlength={16384}
-                    disabled={busy()}
-                    placeholder="Use a saved key or Waveform’s shared key"
-                  />
-                </label>
-                <p class="hint">Used only for {providerNames[selectedProvider()]} on this request and cleared after you submit. Leave blank to use your saved key, or Waveform’s shared key if none is saved. <a class="text-link" href="#settings">Manage saved keys</a></p>
-              </details>
+            <Show when={storageApproved()}>
+              <div class="storage-consent" role="status">
+                <p>
+                  Briefcase access is ready. Your original request is preserved.
+                </p>
+                <button
+                  class="button primary"
+                  type="button"
+                  onClick={retryStorage}
+                  disabled={busy()}
+                >
+                  Retry original request
+                </button>
+                <button
+                  class="button"
+                  type="button"
+                  onClick={cancelStorage}
+                  disabled={busy()}
+                >
+                  Discard request
+                </button>
+              </div>
             </Show>
             <Notice error={error()} />
             <Show when={busy()}>
@@ -324,6 +411,7 @@ export default function Speech(props: {
               </span>
               <button
                 class="button primary"
+                aria-busy={busy()}
                 disabled={
                   busy() ||
                   (props.operation === "tts"
@@ -340,6 +428,54 @@ export default function Speech(props: {
                 <Icon name="arrow" />
               </button>
             </div>
+            <Show when={props.operation === "tts" && selectedProvider()}>
+              <Show
+                when={!autoFallback()}
+                fallback={
+                  <p class="provider-controls-note hint">
+                    Automatic fallback is on. Provider voice controls are
+                    unavailable because each provider handles them differently.
+                    Your voice profile is used across providers.
+                  </p>
+                }
+              >
+                <ProviderControls
+                  provider={selectedProvider()}
+                  options={providerOptions()}
+                  change={setProviderOptions}
+                  disabled={busy()}
+                />
+              </Show>
+            </Show>
+            <Show when={session()?.authenticated && selectedProvider()}>
+              <details class="request-key">
+                <summary>
+                  Use your own API key for this request{" "}
+                  <span class="label-note">optional</span>
+                </summary>
+                <label>
+                  {providerNames[selectedProvider()]} API key
+                  <input
+                    type="password"
+                    autocomplete="off"
+                    spellcheck={false}
+                    value={requestKey()}
+                    onInput={(e) => setRequestKey(e.currentTarget.value)}
+                    maxlength={16384}
+                    disabled={busy()}
+                    placeholder="Use a saved key or Waveform’s shared key"
+                  />
+                </label>
+                <p class="hint">
+                  Used only for {providerNames[selectedProvider()]} on this
+                  request and cleared after you submit. Leave blank to use your
+                  saved key, or Waveform’s shared key if none is saved.{" "}
+                  <a class="text-link" href="#settings">
+                    Manage saved keys
+                  </a>
+                </p>
+              </details>
+            </Show>
             <Show when={requestId()}>
               <p class="request-foot mono">Request {requestId()}</p>
             </Show>
@@ -367,7 +503,10 @@ export default function Speech(props: {
               />
               Automatic fallback
             </label>
-            <p class="hint">Off by default for text to speech. Turn on to try other providers automatically.</p>
+            <p class="hint">
+              Off by default for text to speech. Turn on to try other providers
+              automatically.
+            </p>
           </Show>
           <Show
             when={!prefs.error && prefs()}
@@ -416,7 +555,6 @@ export default function Speech(props: {
           <h2>
             {props.operation === "tts" ? "Generated audio" : "Transcript"}
           </h2>
-          <span class="mono muted">02 / RESULT</span>
         </div>
         <Show
           when={result()}

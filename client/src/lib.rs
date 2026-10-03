@@ -14,6 +14,7 @@ use std::{
 use thiserror::Error;
 use url::Url;
 
+mod context;
 /// Optional local Space Station integration, supported on Unix hosts only.
 #[cfg(unix)]
 pub mod telemetry;
@@ -59,8 +60,23 @@ pub struct IamInfo {
     pub testing_environment_id: Option<String>,
 }
 
-/// Verified identity of the carbon or silicon using Waveform.
+/// Progress of an explicit Briefcase consent request. Tokens stay on the server.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StorageAuthorization {
+    /// Opaque authorization record.
+    pub authorization_id: String,
+    /// IAM review URL, available while approval is pending.
+    pub consent_url: Option<String>,
+    /// Correlation value required alongside the single-use code.
+    pub state: String,
+    /// Pending or completed; status does not itself approve anything.
+    pub status: String,
+    /// Expiration timestamp in RFC 3339 format.
+    pub expires_at: String,
+}
+
+/// Verified identity of the carbon or silicon using Waveform.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LoginActor {
     /// Carbon or silicon identity type.
     pub actor_type: silicon_iam_client::models::ApplicationAuthorizationActorType,
@@ -69,7 +85,7 @@ pub struct LoginActor {
 }
 
 /// Current authentication status, without access or refresh tokens.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LoginStatus {
     /// True only after the server verifies the selected bearer token.
     pub authenticated: bool,
@@ -336,6 +352,11 @@ impl<'de> Deserialize<'de> for TestEnvironmentKey {
 pub enum Auth {
     Anonymous,
     Bearer(SecretString),
+    /// Reusable approved IAM endpoint graph token, paired with its calling app.
+    OnBehalfOf {
+        application_id: String,
+        access_token: SecretString,
+    },
 }
 
 /// A 32-character alphanumeric root key selecting one isolated test plane.
@@ -383,6 +404,7 @@ pub struct Client {
     credential: Auth,
     environment: Option<TestEnvironmentKey>,
     speech_request_id: Option<uuid::Uuid>,
+    login_context: Option<LoginStatus>,
     updater: Arc<update::AutomaticUpdater>,
 }
 impl std::fmt::Debug for Auth {
@@ -390,6 +412,7 @@ impl std::fmt::Debug for Auth {
         match self {
             Self::Anonymous => f.write_str("Anonymous"),
             Self::Bearer(_) => f.write_str("Bearer(<redacted>)"),
+            Self::OnBehalfOf { .. } => f.write_str("OnBehalfOf(<redacted>)"),
         }
     }
 }
@@ -429,6 +452,7 @@ impl Client {
             credential,
             environment: None,
             speech_request_id: None,
+            login_context: None,
             updater: update::AutomaticUpdater::new(update::UpdatePolicy::from_environment()),
         })
     }
@@ -481,6 +505,48 @@ impl Client {
             ..self.clone()
         }
     }
+    /// Pins actor, organization and world for subsequent status and scoped requests.
+    /// Capture this from verified login status and retain it when rotating credentials.
+    pub fn with_login_context(&self, context: &LoginStatus) -> Result<Self> {
+        context.validate()?;
+        if let Some(previous) = &self.login_context {
+            previous.ensure_matches(context)?;
+        }
+        Ok(Self {
+            login_context: Some(context.clone()),
+            ..self.clone()
+        })
+    }
+    /// Uses a reusable IAM OBO access token for speech operations. Neither the
+    /// current actor bearer nor a refresh credential is forwarded with it.
+    pub fn with_obo_token(
+        &self,
+        application_id: impl Into<String>,
+        access_token: impl Into<String>,
+    ) -> Result<Self> {
+        let application_id = application_id.into();
+        let token = access_token.into();
+        if application_id.is_empty()
+            || application_id.len() > 80
+            || !application_id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+            || !token.starts_with("oba_")
+            || token.len() > 16_384
+            || !token.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(Error::Invalid(
+                "use a canonical app ID and an IAM OBO access token".into(),
+            ));
+        }
+        Ok(Self {
+            credential: Auth::OnBehalfOf {
+                application_id,
+                access_token: SecretString::from(token),
+            },
+            ..self.clone()
+        })
+    }
     /// Executes subsequent calls in a selected test plane.
     pub fn with_test_environment(&self, key: TestEnvironmentKey) -> Self {
         Self {
@@ -504,13 +570,18 @@ impl Client {
         &self,
         refresh_token: &str,
     ) -> Result<silicon_iam_client::models::OAuthTokenResponse> {
-        self.request(
-            Method::POST,
-            "auth/refresh",
-            Some(serde_json::json!({"refresh_token": refresh_token})),
-            None,
-        )
-        .await
+        let tokens = self
+            .request(
+                Method::POST,
+                "auth/refresh",
+                Some(serde_json::json!({"refresh_token": refresh_token})),
+                None,
+            )
+            .await?;
+        if let Some(expected) = &self.login_context {
+            expected.verify_tokens(&tokens)?;
+        }
+        Ok(tokens)
     }
 
     /// Rotates a refresh token with a retry key retained across uncertain responses.
@@ -536,7 +607,11 @@ impl Client {
         if let Some(environment) = &self.environment {
             request = request.header("x-testing-environment-key", environment.0.expose_secret());
         }
-        self.send_response(request).await
+        let tokens = self.send_response(request).await?;
+        if let Some(expected) = &self.login_context {
+            expected.verify_tokens(&tokens)?;
+        }
+        Ok(tokens)
     }
     /// Generates speech synchronously.
     pub async fn tts(
@@ -713,8 +788,16 @@ impl Client {
 
     /// Reads the authenticated actor and organization authorization.
     pub async fn me(&self) -> Result<serde_json::Value> {
-        self.request(Method::GET, "auth/me", None::<&()>, None)
-            .await
+        let value: serde_json::Value = self
+            .request(Method::GET, "auth/me", None::<&()>, None)
+            .await?;
+        if let Some(expected) = &self.login_context {
+            let authority = serde_json::from_value::<
+                silicon_iam_client::models::ApplicationAuthorization,
+            >(value.clone())?;
+            expected.ensure_matches(&LoginStatus::from_authority(authority)?)?;
+        }
+        Ok(value)
     }
 
     /// Reads public IAM metadata without requiring a login.
@@ -740,19 +823,16 @@ impl Client {
             }) => return Ok(LoginStatus::default()),
             Err(error) => return Err(error),
         };
-        Ok(LoginStatus {
-            authenticated: true,
-            actor: Some(LoginActor {
-                actor_type: authority.actor_type.ok_or_else(|| {
-                    Error::Invalid("IAM did not identify a Carbon or Silicon".into())
-                })?,
-                public_id: authority
-                    .public_id
-                    .ok_or_else(|| Error::Invalid("IAM did not return a public identity".into()))?,
-            }),
-            org_id: Some(authority.org_id),
-            testing_environment_id: authority.testing_environment_id.map(|id| id.to_string()),
-        })
+        let status = LoginStatus::from_authority(authority)?;
+        if self.environment.is_some() != status.testing_environment_id.is_some() {
+            return Err(Error::Invalid(
+                "login authority belongs to a different world".into(),
+            ));
+        }
+        if let Some(expected) = &self.login_context {
+            expected.ensure_matches(&status)?;
+        }
+        Ok(status)
     }
 
     /// Discovers the selected sandbox, without needing an organization or a login.
@@ -786,6 +866,58 @@ impl Client {
         )
         .await
     }
+    /// Starts separate Briefcase consent without submitting speech or sharing login authority.
+    pub async fn start_storage_authorization(
+        &self,
+        organization: &str,
+        actor: &str,
+        idempotency_key: &str,
+    ) -> Result<StorageAuthorization> {
+        self.request(
+            Method::POST,
+            "storage-authorizations",
+            Some(serde_json::json!({})),
+            Some((organization, actor, idempotency_key)),
+        )
+        .await
+    }
+
+    /// Reads one authorization in the current account, organization and test plane.
+    pub async fn storage_authorization(
+        &self,
+        organization: &str,
+        id: &str,
+    ) -> Result<StorageAuthorization> {
+        uuid::Uuid::parse_str(id)
+            .map_err(|_| Error::Invalid("authorization ID is invalid".into()))?;
+        self.org_request(
+            Method::GET,
+            &format!("storage-authorizations/{id}"),
+            organization,
+            None::<&()>,
+        )
+        .await
+    }
+
+    /// Exchanges an explicitly approved IAM code. Access and refresh credentials are never returned.
+    pub async fn complete_storage_authorization(
+        &self,
+        organization: &str,
+        id: &str,
+        code: &str,
+        state: &str,
+    ) -> Result<StorageAuthorization> {
+        uuid::Uuid::parse_str(id)
+            .map_err(|_| Error::Invalid("authorization ID is invalid".into()))?;
+        self.org_request(
+            Method::POST,
+            &format!("storage-authorizations/{id}/complete"),
+            organization,
+            Some(serde_json::json!({"code":code,"state":state})),
+        )
+        .await
+    }
+
     /// Reads stable service capabilities without authentication.
     pub async fn capabilities(&self) -> Result<Capabilities> {
         self.request(Method::GET, "capabilities", None::<&()>, None)
@@ -909,6 +1041,7 @@ impl Client {
     }
     /// Fetches one actor-scoped job by its durable identifier.
     pub async fn job(&self, job_id: &str, organization: &str, actor: &str) -> Result<Job> {
+        self.verify_scope(organization, Some(actor))?;
         if uuid::Uuid::parse_str(job_id).is_err() || organization.is_empty() || actor.is_empty() {
             return Err(Error::Invalid(
                 "job ID, organization and actor are required".into(),
@@ -930,7 +1063,11 @@ impl Client {
             .header("x-actor-id", actor)
             .bearer_auth(match &self.credential {
                 Auth::Bearer(token) => token.expose_secret(),
-                Auth::Anonymous => return Err(Error::Invalid("authentication is required".into())),
+                Auth::Anonymous | Auth::OnBehalfOf { .. } => {
+                    return Err(Error::Invalid(
+                        "an ordinary account login is required".into(),
+                    ));
+                }
             });
         let req = if let Some(env) = &self.environment {
             req.header("x-testing-environment-key", env.0.expose_secret())
@@ -1032,6 +1169,7 @@ impl Client {
         organization: &str,
         body: Option<B>,
     ) -> Result<R> {
+        self.verify_scope(organization, None)?;
         if organization.is_empty() {
             return Err(Error::Invalid("organization is required".into()));
         }
@@ -1052,6 +1190,17 @@ impl Client {
         req = match &self.credential {
             Auth::Anonymous => req,
             Auth::Bearer(token) => req.bearer_auth(token.expose_secret()),
+            Auth::OnBehalfOf {
+                application_id,
+                access_token,
+            } => {
+                let mut token =
+                    reqwest::header::HeaderValue::from_str(access_token.expose_secret())
+                        .map_err(|_| Error::Invalid("invalid OBO token".into()))?;
+                token.set_sensitive(true);
+                req.header("x-app-id", application_id)
+                    .header("x-iam-obo-access-token", token)
+            }
         };
         if let Some(env) = &self.environment {
             req = req.header("x-testing-environment-key", env.0.expose_secret());
@@ -1068,6 +1217,7 @@ impl Client {
         path: &str,
         organization: &str,
     ) -> Result<()> {
+        self.verify_scope(organization, None)?;
         if organization.is_empty() {
             return Err(Error::Invalid("organization is required".into()));
         }
@@ -1088,6 +1238,17 @@ impl Client {
         req = match &self.credential {
             Auth::Anonymous => req,
             Auth::Bearer(token) => req.bearer_auth(token.expose_secret()),
+            Auth::OnBehalfOf {
+                application_id,
+                access_token,
+            } => {
+                let mut token =
+                    reqwest::header::HeaderValue::from_str(access_token.expose_secret())
+                        .map_err(|_| Error::Invalid("invalid OBO token".into()))?;
+                token.set_sensitive(true);
+                req.header("x-app-id", application_id)
+                    .header("x-iam-obo-access-token", token)
+            }
         };
         if let Some(env) = &self.environment {
             req = req.header("x-testing-environment-key", env.0.expose_secret());
@@ -1102,6 +1263,7 @@ impl Client {
         actor: &str,
         query: Vec<(&str, String)>,
     ) -> Result<R> {
+        self.verify_scope(organization, Some(actor))?;
         let mut url = self.base.clone();
         {
             let mut segments = url
@@ -1123,6 +1285,17 @@ impl Client {
             .header("x-actor-id", actor);
         req = match &self.credential {
             Auth::Bearer(token) => req.bearer_auth(token.expose_secret()),
+            Auth::OnBehalfOf {
+                application_id,
+                access_token,
+            } => {
+                let mut token =
+                    reqwest::header::HeaderValue::from_str(access_token.expose_secret())
+                        .map_err(|_| Error::Invalid("invalid OBO token".into()))?;
+                token.set_sensitive(true);
+                req.header("x-app-id", application_id)
+                    .header("x-iam-obo-access-token", token)
+            }
             Auth::Anonymous => return Err(Error::Invalid("authentication is required".into())),
         };
         if let Some(env) = &self.environment {
@@ -1172,6 +1345,9 @@ impl Client {
         body: Option<B>,
         scope: Option<(&str, &str, &str)>,
     ) -> Result<()> {
+        if let Some((org, actor, _)) = scope {
+            self.verify_scope(org, Some(actor))?;
+        }
         let mut url = self.base.clone();
         {
             let mut segments = url
@@ -1186,6 +1362,17 @@ impl Client {
         req = match &self.credential {
             Auth::Anonymous => req,
             Auth::Bearer(token) => req.bearer_auth(token.expose_secret()),
+            Auth::OnBehalfOf {
+                application_id,
+                access_token,
+            } => {
+                let mut token =
+                    reqwest::header::HeaderValue::from_str(access_token.expose_secret())
+                        .map_err(|_| Error::Invalid("invalid OBO token".into()))?;
+                token.set_sensitive(true);
+                req.header("x-app-id", application_id)
+                    .header("x-iam-obo-access-token", token)
+            }
         };
         if let Some(env) = &self.environment {
             req = req.header("x-testing-environment-key", env.0.expose_secret());
@@ -1231,6 +1418,9 @@ impl Client {
         body: Option<B>,
         scope: Option<(&str, &str, &str)>,
     ) -> Result<R> {
+        if let Some((org, actor, _)) = scope {
+            self.verify_scope(org, Some(actor))?;
+        }
         let mut url = self.base.clone();
         {
             let mut segments = url
@@ -1245,6 +1435,17 @@ impl Client {
         req = match &self.credential {
             Auth::Anonymous => req,
             Auth::Bearer(token) => req.bearer_auth(token.expose_secret()),
+            Auth::OnBehalfOf {
+                application_id,
+                access_token,
+            } => {
+                let mut token =
+                    reqwest::header::HeaderValue::from_str(access_token.expose_secret())
+                        .map_err(|_| Error::Invalid("invalid OBO token".into()))?;
+                token.set_sensitive(true);
+                req.header("x-app-id", application_id)
+                    .header("x-iam-obo-access-token", token)
+            }
         };
         if let Some(env) = &self.environment {
             req = req.header("x-testing-environment-key", env.0.expose_secret());
@@ -1369,6 +1570,52 @@ async fn decode_response<R: DeserializeOwned>(mut response: reqwest::Response) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reusable_obo_transport_replaces_bearer_and_preserves_test_selection()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, path},
+        };
+        let server = MockServer::start().await;
+        let client = Client::new(
+            &server.uri(),
+            Auth::Bearer(SecretString::from("oat_never_forward")),
+        )?
+        .with_auto_update(false)
+        .with_obo_token("ting", "oba_shared_token")?
+        .with_test_environment(TestEnvironmentKey::new(format!("ask_{}", "A".repeat(43)))?);
+        assert!(!format!("{:?}", client.credential).contains("oba_shared_token"));
+        Mock::given(path("/api/v1/tts"))
+            .and(header("x-app-id", "ting"))
+            .and(header("x-iam-obo-access-token", "oba_shared_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        for _ in 0..2 {
+            let _: serde_json::Value = client
+                .request(
+                    Method::POST,
+                    "tts",
+                    Some(serde_json::json!({"text":"Hi"})),
+                    Some(("tos", "legacy", "stable-retry-key")),
+                )
+                .await?;
+        }
+        for r in server.received_requests().await.ok_or("requests")? {
+            assert!(!r.headers.contains_key("authorization"));
+            assert!(!r.headers.contains_key("x-iam-obo-access-proof"));
+            assert_eq!(
+                r.headers["x-testing-environment-key"],
+                format!("ask_{}", "A".repeat(43))
+            );
+        }
+        assert!(client.with_obo_token("ting", "ata_wrong_class").is_err());
+        assert!(client.with_obo_token("wrong/app", "oba_token").is_err());
+        Ok(())
+    }
 
     #[test]
     fn provider_controls_and_request_keys_are_typed_and_redacted()
@@ -1508,6 +1755,65 @@ mod tests {
         assert!(job.is_terminal());
         job.status = "completed".into();
         assert!(job.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn storage_approval_stays_separate_and_preserves_test_plane()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_json, header, method, path},
+        };
+        let server = MockServer::start().await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = "A".repeat(32);
+        let pending = serde_json::json!({"authorization_id":id,"consent_url":"https://iam.example/obo/consent?request=1","state":"opaque-state","status":"pending","expires_at":"2030-01-01T00:00:00Z"});
+        Mock::given(method("POST"))
+            .and(path("/api/v1/storage-authorizations"))
+            .and(header("authorization", "Bearer oat_fixture"))
+            .and(header("x-org-id", "tos"))
+            .and(header("x-testing-environment-key", root.as_str()))
+            .and(header("idempotency-key", "storage-fixture-1"))
+            .and(body_json(serde_json::json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&pending))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/api/v1/storage-authorizations/{id}/complete"
+            )))
+            .and(header("authorization", "Bearer oat_fixture"))
+            .and(header("x-org-id", "tos"))
+            .and(header("x-testing-environment-key", root.as_str()))
+            .and(body_json(
+                serde_json::json!({"code":"obc_approved","state":"opaque-state"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&pending))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::new(
+            &server.uri(),
+            Auth::Bearer(SecretString::from("oat_fixture")),
+        )?
+        .with_auto_update(false)
+        .with_test_environment(TestEnvironmentKey::new(root)?);
+        let request = client
+            .start_storage_authorization("tos", "c:fixture", "storage-fixture-1")
+            .await?;
+        assert_eq!(request.authorization_id, id);
+        client
+            .complete_storage_authorization("tos", &id, "obc_approved", &request.state)
+            .await?;
+        assert!(
+            client
+                .storage_authorization("tos", "../auth/logout")
+                .await
+                .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        Ok(())
     }
 
     #[tokio::test]
