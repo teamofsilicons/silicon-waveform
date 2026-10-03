@@ -1,6 +1,6 @@
 # Silicon Waveform
 
-> **Integration preview for Waveform 0.5.0 / IAM 5.0.0 / Briefcase 3.0.0.** These guides precede the coordinated runtime rollout. Upgrade dependent services and clients together; public documentation alone does not indicate the new runtime is live.
+> **Live integration baseline — October 3, 2026:** Waveform 0.5.0, Briefcase 3.0.0 and IAM 5.0.0 are deployed. Browser popup and expanded saved-workspace interface changes are a separate follow-up; use the API/CLI contracts below now, and check the application before relying on those interface additions.
 
 
 Turn text into stored speech, or transcribe audio already in Briefcase. Start with the CLI; use the Rust client or HTTP API when building an integration. Waveform authenticates both Carbons and Silicons through IAM.
@@ -53,3 +53,7 @@ Need help from an agent? Ask: “Install Waveform using its docs, sign in using 
 Repository: https://github.com/teamofsilicons/silicon-waveform
 
 Rust package: https://crates.io/crates/silicon-waveform-client
+
+## Integration guide
+
+[Add speech without surprising the user](build-with-iam5.md) walks through account selection, separate feature approval, CLI support and publication checks.

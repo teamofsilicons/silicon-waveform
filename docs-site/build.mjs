@@ -11,7 +11,7 @@ const pages=[];
 async function collect(dir){for(const entry of await readdir(dir,{withFileTypes:true})){const file=join(dir,entry.name);if(entry.isDirectory()) await collect(file);else if(entry.name.endsWith('.md')){const source=relative(join(root,'docs'),file);const text=await readFile(file,'utf8');const route=source==='README.md'?'/':`/${source.replace(/README\.md$/,'').replace(/\.md$/,'').replace(/\/$/,'')}/`;pages.push({source,text,route,title:text.match(/^# (.+)$/m)?.[1]||entry.name});}}}
 await collect(join(root,'docs'));
 const bySource=new Map(pages.map(p=>[p.source,p.route]));
-const groups=[['Start here',['README.md','testing.md']],['Use Waveform',['cli.md','voice-profiles.md','configuration.md']],['Build with Waveform',['client.md','api.md','iam.md','development.md','api-contracts.md','honeycomb-lifecycle.md','releases.md']]];
+const groups=[['Start here',['README.md','testing.md']],['Use Waveform',['cli.md','voice-profiles.md','configuration.md']],['Build with Waveform',['build-with-iam5.md','client.md','api.md','iam.md','development.md','api-contracts.md','honeycomb-lifecycle.md','releases.md']]];
 await rm(out,{recursive:true,force:true});await mkdir(out,{recursive:true});
 await cp(join(here,'style.css'),join(out,'style.css'));
 await cp(join(root,'openapi.yaml'),join(out,'openapi.yaml'));
