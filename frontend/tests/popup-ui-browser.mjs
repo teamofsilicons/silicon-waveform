@@ -17,7 +17,7 @@ const signed = { context: "fixture-context", contextId: "fixture-slot", contexts
 async function scenario(name, authenticated, run) {
   const context = await browser.newContext();
   const page = await context.newPage(), backend = fixture(), errors = [];
-  const state = { session: authenticated ? signed : { ...signed, authenticated: false, user: null, contexts: [] }, cancels: [], starts: [], completions: [], statuses: [], speech: [], authCancelFailures: 0, storageCancelFailures: 0, storageCompletionFailures: 0, approved: false, pending: undefined };
+  const state = { session: authenticated ? signed : { ...signed, authenticated: false, user: null, contexts: [] }, cancels: [], starts: [], completions: [], statuses: [], speech: [], authCancelFailures: 0, storageCancelFailures: 0, storageCompletionFailures: 0, storageCompletedResponseFailures: 0, approved: false, pending: undefined };
   page.on("pageerror", e => errors.push(e.message));
   await page.addInitScript(() => {
     window.__popups = [];
@@ -45,6 +45,8 @@ async function scenario(name, authenticated, run) {
     }
     if (path === "/api/session/storage/start") {
       state.starts.push(body);
+      if (body.authorization_id) { assert.equal(body.authorization_id, state.pending.authorization_id); assert.equal(body.state, state.pending.state); }
+      if (!body.authorization_id && state.pending?.status === "completed") state.pending = undefined;
       state.pending ??= { authorization_id: "11111111-1111-4111-8111-111111111111", state: "fixture-bound-state", consent_url: "https://iam.example/fixture-review", redirect_url: `${origin}/fixture-review`, manual: !body.popup_nonce, code_saved: false, status: "pending", expires_at: new Date(Date.now() + 600000).toISOString() };
       return json(state.pending);
     }
@@ -60,6 +62,7 @@ async function scenario(name, authenticated, run) {
       assert.equal(body.authorization_id, state.pending.authorization_id);
       assert.equal(body.state, state.pending.state);
       state.approved = true; state.pending.status = "completed";
+      if (state.storageCompletedResponseFailures-- > 0) return route.abort("failed");
       return json(state.pending);
     }
     if (path === "/api/v1/tts") {
@@ -174,6 +177,34 @@ try {
     assert.equal(state.statuses.length, 1);
     assert.equal(state.statuses[0].authorization_id, state.pending.authorization_id);
     assert.equal(state.speech.length, 1);
+  });
+  await scenario("lost completed response survives pause/remount and does not reuse authority for a later denial", true, async ({ page, state }) => {
+    let panel = await needStorage(page);
+    await panel.getByRole("button", { name: "Review manually" }).click();
+    await expect(panel.getByLabel("Approval code")).toBeVisible();
+    const original = { authorization_id: state.pending.authorization_id, state: state.pending.state };
+    state.storageCompletedResponseFailures = 1;
+    await panel.getByLabel("Approval code").fill("obc_browser_fixture");
+    await panel.getByRole("button", { name: "Complete approval" }).click();
+    await expect(panel.getByRole("button", { name: "Retry completion" })).toBeEnabled();
+    assert.equal(state.pending.status, "completed");
+    await panel.getByRole("button", { name: "Cancel review" }).click();
+    await page.getByRole("button", { name: "Resume approval" }).click();
+    panel = page.getByRole("region", { name: "Briefcase approval" });
+    await panel.getByRole("button", { name: "Review manually" }).click();
+    await expect(page.getByRole("button", { name: "Retry original request" })).toBeVisible();
+    assert.equal(state.starts[1].authorization_id, original.authorization_id);
+    assert.equal(state.starts[1].state, original.state);
+    assert.equal(state.completions.length, 1);
+    assert.equal(state.speech.length, 1);
+    await expect(page.getByLabel("Text to speak")).toHaveValue("Preserve this synthetic speech draft.");
+    state.approved = false;
+    await page.getByRole("button", { name: "Retry original request" }).click();
+    await expect(panel).toBeVisible();
+    await panel.getByRole("button", { name: "Review manually" }).click();
+    await expect.poll(() => state.starts.length).toBe(3);
+    assert.equal(state.starts[2].authorization_id, undefined);
+    assert.deepEqual(state.speech[1], state.speech[0]);
   });
   console.log(JSON.stringify({ local_only: true, results }, null, 2));
 } finally {

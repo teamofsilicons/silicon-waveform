@@ -5,14 +5,15 @@ import { openIamPopup } from "./iam-popup";
 import { createLoginCancellation, createLoginLifecycle } from "./login-lifecycle";
 import { storageAuthorization, type StorageAuthorization } from "./storage-authorization";
 
-type Review = StorageAuthorization & { redirect_url?: string; manual?: boolean; code_saved?: boolean };
+export type StorageReview = StorageAuthorization & { redirect_url?: string; manual?: boolean; code_saved?: boolean };
 /** Approval is explicit and resumable. Dismissing this UI never revokes a grant. */
-export default function StorageConsent(props: { approved: () => void; cancel: () => void }) {
+export default function StorageConsent(props: { approved: () => void; cancel: () => void; receipt?: StorageReview; saveReceipt: (value: StorageReview | undefined) => void }) {
   const api = bindApi(), context = session()?.context;
   const [busy, setBusy] = createSignal(false), [error, setError] = createSignal<unknown>();
-  const [review, setReview] = createSignal<Review>(), [code, setCode] = createSignal("");
+  const [review, updateReview] = createSignal<StorageReview | undefined>(props.receipt), [code, setCode] = createSignal("");
   const [hasRetryCode, setHasRetryCode] = createSignal(false);
   let retryCode: string | undefined;
+  const setReview = (value?: StorageReview) => { updateReview(value); props.saveReceipt(value); };
   const lifecycle = createLoginLifecycle(setBusy);
   const current = () => session()?.context === context;
   const cancellation = createLoginCancellation(
@@ -44,7 +45,7 @@ export default function StorageConsent(props: { approved: () => void; cancel: ()
       await stopped.done;
       if (!attempt.current() || !current()) throw new Error("Approval was cancelled.");
       const reviewNonce = nonce(); cancellation.remember(reviewNonce);
-      const value = await api<Review>("/api/session/storage/start", { method: "POST", body: { review_nonce: reviewNonce, ...(popupNonce ? { popup_nonce: popupNonce } : {}) }, signal: attempt.signal });
+      const value = await api<StorageReview>("/api/session/storage/start", { method: "POST", body: { review_nonce: reviewNonce, ...(review() ? { authorization_id: review()!.authorization_id, state: review()!.state } : {}), ...(popupNonce ? { popup_nonce: popupNonce } : {}) }, signal: attempt.signal });
       storageAuthorization(value);
       if (!attempt.current() || !current()) throw new Error("Approval was cancelled.");
       setReview(value);
@@ -65,7 +66,7 @@ export default function StorageConsent(props: { approved: () => void; cancel: ()
   async function check(attempt = lifecycle.begin()) {
     const expected = review(); if (!expected) { attempt.finish(); return; }
     try {
-      const value = await api<Review>("/api/session/storage/status", { method: "POST", body: { authorization_id: expected.authorization_id, state: expected.state }, signal: attempt.signal });
+      const value = await api<StorageReview>("/api/session/storage/status", { method: "POST", body: { authorization_id: expected.authorization_id, state: expected.state }, signal: attempt.signal });
       storageAuthorization(value, expected);
       if (!attempt.current() || !current()) return;
       setReview(value);
@@ -79,10 +80,11 @@ export default function StorageConsent(props: { approved: () => void; cancel: ()
     const attempt = lifecycle.begin(), supplied = code().trim() || retryCode;
     retryCode = supplied; setHasRetryCode(!!retryCode); setCode(""); setError();
     try {
-      const value = await api<Review>("/api/session/storage/complete", { method: "POST", body: { authorization_id: expected.authorization_id, state: expected.state, ...(supplied ? { code: supplied } : {}) }, signal: attempt.signal });
+      const value = await api<StorageReview>("/api/session/storage/complete", { method: "POST", body: { authorization_id: expected.authorization_id, state: expected.state, ...(supplied ? { code: supplied } : {}) }, signal: attempt.signal });
       storageAuthorization(value, expected);
       if (!attempt.current() || !current()) return;
       if (value.status !== "completed") throw new Error("Approval is still pending.");
+      setReview(value);
       approved();
     } catch (err) {
       if (attempt.current() && current()) failed(err);

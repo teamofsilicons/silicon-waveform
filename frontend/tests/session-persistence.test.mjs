@@ -743,5 +743,14 @@ test("manual code retry and cancellation fences survive gateway restart without 
   assert.equal((await s.call("/api/session/storage/complete",bound)).status,200);
   assert.equal((await s.call("/api/session/storage/complete",{...bound,code:"obc_changed"})).status,409);
   assert.equal(attempts.length,2);
+  // The response was lost, then the user paused/unmounted and resumed with the exact UI receipt.
+  await s.call("/api/session/storage/cancel",{review_nonce:"b".repeat(64)});
+  s.restart();
+  const resumed=await(await s.call("/api/session/storage/start",{...bound,review_nonce:"c".repeat(64)})).json();
+  assert.equal(resumed.status,"completed"); assert.equal(resumed.authorization_id,review.authorization_id);
+  assert.equal(s.fake.requests.filter(r=>r.path==="/api/v1/storage-authorizations").length,1);
+  // An explicit new operation without that receipt must not inherit old completed authority.
+  const fresh=await(await s.call("/api/session/storage/start",{review_nonce:"d".repeat(64)})).json();
+  assert.equal(fresh.status,"pending"); assert.notEqual(fresh.authorization_id,review.authorization_id);
   assert.equal(s.fake.requests.some(r=>r.path==="/api/v1/tts"||r.path.endsWith("/revoke")),false);
 });

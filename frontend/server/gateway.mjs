@@ -636,6 +636,14 @@ export function createGateway({
         const reviewNonce = body.review_nonce || body.popup_nonce;
         if (reviewNonce !== undefined && !/^[a-f0-9]{64}$/.test(reviewNonce)) return finish(failure("invalid_review", "Start approval from Waveform."));
         if (session.storageCancelled?.some(entry => entry.nonce === reviewNonce && entry.until > Date.now())) return finish(failure("approval_cancelled", "This review was cancelled.", 409));
+        // A paused UI carries its exact nonsecret receipt. Reconcile only that
+        // completed request, never infer usable grants from an old completion.
+        if (body.authorization_id !== undefined || body.state !== undefined) {
+          const retained = slot.storagePending || slot.storageCompleted;
+          if (!storageIdentity(session, slot, retained) || body.authorization_id !== retained.authorizationId || body.state !== retained.state)
+            return finish(failure("approval_expired", "This approval no longer belongs to the current workspace. Start a new review.", 403));
+          if (retained.completed) return finish(json({ ...storageView(retained), ...(body.popup_nonce ? { redirect_url: popupLocation(body.popup_nonce, true) } : {}) }));
+        }
         let pending = slot.storagePending;
         if (storageIdentity(session, slot, pending)) {
           pending.popupNonce = body.popup_nonce;

@@ -25,7 +25,7 @@ import {
 } from "./api";
 import { Copy, Empty, Heading, Icon, Notice, Order } from "./ui";
 import VoiceProfilePicker from "./VoiceProfilePicker";
-import StorageConsent from "./StorageConsent";
+import StorageConsent, { type StorageReview } from "./StorageConsent";
 import type { VoiceProfile } from "./api";
 import ProviderControls from "./ProviderControls";
 import {
@@ -86,6 +86,7 @@ export default function Speech(props: {
   const [needsStorage, setNeedsStorage] = createSignal(false);
   const [storageApproved, setStorageApproved] = createSignal(false);
   const [storagePaused, setStoragePaused] = createSignal(false);
+  const [storageReceipt, setStorageReceipt] = createSignal<StorageReview>();
   // Retain only in memory until explicit retry/cancel; never serialize provider keys.
   let pendingStorage:
     | {
@@ -96,6 +97,7 @@ export default function Speech(props: {
   function cancelStorage() {
     pendingStorage = undefined;
     attempt = undefined;
+    setStorageReceipt();
     setNeedsStorage(false);
     setStorageApproved(false);
     setStoragePaused(false);
@@ -210,6 +212,7 @@ export default function Speech(props: {
       );
       attempt = undefined;
       pendingStorage = undefined;
+      setStorageReceipt();
     } catch (err) {
       recordEvent(
         "speech_failed",
@@ -225,6 +228,7 @@ export default function Speech(props: {
           err.status === 412);
       if (mounted) {
         if (storageRequired) {
+          if (storageReceipt()?.status === "completed") setStorageReceipt();
           pendingStorage = { body, attempt: currentAttempt };
           setNeedsStorage(true);
         } else {
@@ -369,6 +373,8 @@ export default function Speech(props: {
             </Show>
             <Show when={needsStorage()}>
               <StorageConsent
+                receipt={storageReceipt()}
+                saveReceipt={setStorageReceipt}
                 cancel={pauseStorage}
                 approved={() => {
                   setNeedsStorage(false);
