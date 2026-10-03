@@ -495,3 +495,164 @@ for (const repeated of [false, true])
       "ort_next_2",
     );
   });
+
+test("saved accounts and multiple sandboxes retain independent tokens through restart", async (t) => {
+  let current = {
+      public_id: "first",
+      actor_type: "carbon",
+      org_id: "one-org",
+      scopes: [],
+    },
+    generation = 0;
+  const identities = new Map();
+  const s = setup(t, (fetcher) => async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/v1/auth/login") {
+      generation++;
+      const access = `oat_account_${generation}`;
+      identities.set(access, structuredClone(current));
+      return Response.json({
+        access_token: access,
+        refresh_token: `ort_account_${generation}`,
+        expires_in: 3600,
+      });
+    }
+    if (path === "/api/v1/auth/me") {
+      const identity = identities.get(
+        init.headers.get("authorization").slice(7),
+      );
+      return Response.json(identity);
+    }
+    return fetcher(url, init);
+  });
+  const first = await (await s.login()).json();
+  assert.equal(first.org, "one-org");
+  current = { ...current, public_id: "second" };
+  const second = await (await s.login()).json();
+  current = {
+    ...current,
+    public_id: "builder",
+    actor_type: "silicon",
+    org_id: "other-org",
+  };
+  const third = await (await s.login()).json();
+  assert.equal(third.contexts.length, 3);
+  assert.notEqual(first.contextId, second.contextId);
+  s.restart();
+  const switched = await (
+    await s.call("/api/session/context", { context_id: first.contextId })
+  ).json();
+  assert.equal(switched.user.public_id, "first");
+  assert.equal(switched.org, "one-org");
+  await s.call("/api/v1/preferences");
+  assert.equal(
+    s.fake.requests.at(-1).headers.get("authorization"),
+    "Bearer oat_account_1",
+  );
+  const before = s.fake.requests.length;
+  for (const path of [
+    "/api/session/logout",
+    "/api/v1/tts",
+    "/api/v1/storage-authorizations",
+  ]) {
+    const stale = await s.call(
+      path,
+      {},
+      { "x-waveform-context": third.context },
+    );
+    assert.equal(stale.status, 409);
+  }
+  assert.equal(s.fake.requests.length, before);
+  assert.equal(
+    (
+      await s.call("/api/v1/preferences", undefined, {
+        "x-org-id": "other-org",
+      })
+    ).status,
+    409,
+  );
+  assert.equal(s.fake.requests.length, before);
+  await s.call("/api/session/environment", { key: s.fake.testKey });
+  const testing = await (await s.login()).json();
+  const anotherKey = "ask_" + "B".repeat(43);
+  s.fake.environments.push({
+    id: "33333333-3333-4333-8333-333333333333",
+    name: "Other sandbox",
+    key: anotherKey,
+  });
+  await s.call("/api/session/environment", { key: anotherKey });
+  const another = await (await s.login()).json();
+  assert.equal(another.contexts.length, 5);
+  assert.notEqual(testing.contextId, another.contextId);
+  s.restart();
+  await s.call("/api/session/context", { context_id: testing.contextId });
+  await s.call("/api/v1/preferences");
+  assert.equal(
+    s.fake.requests.at(-1).headers.get("x-testing-environment-key"),
+    s.fake.testKey,
+  );
+  assert.equal(
+    s.fake.requests.at(-1).headers.get("authorization"),
+    "Bearer oat_account_4",
+  );
+  await s.call("/api/session/logout", {});
+  s.restart();
+  const remaining = await (await s.call("/api/session")).json();
+  assert.equal(remaining.contexts.length, 4);
+  assert.ok(
+    !remaining.contexts.some((entry) => entry.id === testing.contextId),
+  );
+  assert.doesNotMatch(
+    readFileSync(join(s.directory, "sessions.sqlite")).toString("latin1"),
+    /oat_account_|ort_account_|ask_B/,
+  );
+});
+
+test("selecting the current saved context does not revoke it", async (t) => {
+  const s = setup(t),
+    first = await (await s.login()).json();
+  const selected = await s.call("/api/session/context", {
+    context_id: first.contextId,
+  });
+  assert.equal(selected.status, 200);
+  assert.equal((await selected.json()).authenticated, true);
+  assert.equal((await s.call("/api/session/refresh", {})).status, 200);
+});
+
+for (const refresh of [false, true])
+  test(`${refresh ? "refresh" : "session verification"} rejects an organization change`, async (t) => {
+    let changed = false;
+    const s = setup(t, (fetcher) => async (url, init) => {
+      const result = await fetcher(url, init);
+      if (new URL(url).pathname === "/api/v1/auth/me" && changed)
+        return Response.json({
+          ...(await result.json()),
+          org_id: "another-org",
+        });
+      return result;
+    });
+    await s.login();
+    changed = true;
+    const result = await s.call(
+      refresh ? "/api/session/refresh" : "/api/session",
+      refresh ? {} : undefined,
+    );
+    assert.equal(result.status, 401);
+    assert.equal((await result.json()).error.code, "identity_mismatch");
+    changed = false;
+    assert.equal(
+      (await (await s.call("/api/session")).json()).authenticated,
+      false,
+    );
+  });
+
+test("pre-migration persisted credentials cannot be assigned an inferred context", async (t) => {
+  const s = setup(t);
+  await s.login();
+  s.stored((row) => {
+    delete row.production.contextId;
+  });
+  const result = await (await s.call("/api/session")).json();
+  assert.equal(result.authenticated, false);
+  assert.equal(result.contexts.length, 0);
+});

@@ -94,7 +94,13 @@ export class SessionStore {
       !["production", "test"].includes(session.active) ||
       !session[session.active] ||
       session.production?.key ||
-      (session.test && !session.test.key)
+      (session.test && !session.test.key) ||
+      Object.values(session.saved || {}).some(
+        ({ plane, slot }) =>
+          !["production", "test"].includes(plane) ||
+          !slot ||
+          (plane === "production" ? !!slot.key : !slot.key),
+      )
     )
       throw new Error("Invalid Waveform session or testing boundary.");
   }
@@ -135,7 +141,10 @@ export class SessionStore {
       !session.production?.refresh &&
       !session.test?.key &&
       !session.pending &&
-      !session.loginAttempt
+      !session.loginAttempt &&
+      !Object.values(session.saved || {}).some(
+        ({ slot }) => slot.refresh || slot.key,
+      )
     )
       return this.delete(session.id);
     const id = this.hash(session.id),

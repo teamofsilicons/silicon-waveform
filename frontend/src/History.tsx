@@ -1,7 +1,16 @@
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
-import { api, date, duration, providerNames, session, type Job } from "./api";
+import {
+  bindApi,
+  date,
+  duration,
+  providerNames,
+  session,
+  type Job,
+} from "./api";
 import { Copy, Empty, Heading, Modal, Notice } from "./ui";
 export default function History(props: { signin: () => void }) {
+  const api = bindApi(),
+    originalContext = session()?.context;
   const [jobs, setJobs] = createSignal<Job[]>([]),
     [filter, setFilter] = createSignal(""),
     [cursor, setCursor] = createSignal<string | null>(null),

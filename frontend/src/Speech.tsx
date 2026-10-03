@@ -8,7 +8,7 @@ import {
   Show,
 } from "solid-js";
 import {
-  api,
+  bindApi,
   recordEvent,
   ApiError,
   duration,
@@ -28,18 +28,35 @@ import VoiceProfilePicker from "./VoiceProfilePicker";
 import StorageConsent from "./StorageConsent";
 import type { VoiceProfile } from "./api";
 import ProviderControls from "./ProviderControls";
-import { publicRequestSignature, speechRequest } from "./speech-request";
+import {
+  publicRequestSignature,
+  speechRequest,
+  type SpeechDraft,
+} from "./speech-request";
+const drafts = new Map<string, Omit<SpeechDraft, "requestKey" | "operation">>();
+
 export default function Speech(props: {
   operation: Operation;
   signin: () => void;
 }) {
-  const [text, setText] = createSignal(""),
-    [url, setUrl] = createSignal(""),
-    [language, setLanguage] = createSignal("");
-  const [custom, setCustom] = createSignal(false),
-    [order, setOrder] = createSignal<Provider[]>([]);
-  const [autoFallback, setAutoFallback] = createSignal(false),
-    [providerOptions, setProviderOptions] = createSignal<TtsProviderOptions>({}),
+  const api = bindApi(),
+    originalContext = session()?.context;
+  const draftKey =
+    (session()?.contextId || session()?.context || "anonymous") +
+    "|" +
+    props.operation;
+  const draft = drafts.get(draftKey);
+  const [text, setText] = createSignal(draft?.text || ""),
+    [url, setUrl] = createSignal(draft?.url || ""),
+    [language, setLanguage] = createSignal(draft?.language || "");
+  const [custom, setCustom] = createSignal(draft?.customOrder || false),
+    [order, setOrder] = createSignal<Provider[]>(draft?.order || []);
+  const [autoFallback, setAutoFallback] = createSignal(
+      draft?.autoFallback || false,
+    ),
+    [providerOptions, setProviderOptions] = createSignal<TtsProviderOptions>(
+      draft?.providerOptions || {},
+    ),
     [requestKey, setRequestKey] = createSignal("");
   const selectedProvider = () => order()[0];
   createEffect(on(selectedProvider, () => setRequestKey(""), { defer: true }));
@@ -56,9 +73,10 @@ export default function Speech(props: {
     () => api<Preferences>("/api/v1/preferences"),
   );
   createEffect(() => {
-    if (!prefs.error && prefs()) setOrder(prefs()![`${props.operation}_order`]);
+    if (!custom() && !prefs.error && prefs())
+      setOrder(prefs()![`${props.operation}_order`]);
   });
-  const [voice, setVoice] = createSignal("");
+  const [voice, setVoice] = createSignal(draft?.voice || "");
   const [profiles] = createResource(
     () => session()?.authenticated && props.operation === "tts",
     () => api<{ items: VoiceProfile[] }>("/api/v1/voice-profiles"),
@@ -68,14 +86,34 @@ export default function Speech(props: {
   const [needsStorage, setNeedsStorage] = createSignal(false);
   const [storageApproved, setStorageApproved] = createSignal(false);
   // Retain only in memory until explicit retry/cancel; never serialize provider keys.
-  let pendingStorage: { body: ReturnType<typeof speechRequest>; attempt: NonNullable<typeof attempt> } | undefined;
+  let pendingStorage:
+    | {
+        body: ReturnType<typeof speechRequest>;
+        attempt: NonNullable<typeof attempt>;
+      }
+    | undefined;
   function cancelStorage() {
-    pendingStorage = undefined; attempt = undefined;
-    setNeedsStorage(false); setStorageApproved(false); setError();
+    pendingStorage = undefined;
+    attempt = undefined;
+    setNeedsStorage(false);
+    setStorageApproved(false);
+    setError();
   }
   let mounted = true;
   onCleanup(() => {
-    mounted = false; pendingStorage = undefined;
+    drafts.set(draftKey, {
+      text: text(),
+      url: url(),
+      language: language(),
+      voice: voice(),
+      order: [...order()],
+      customOrder: custom(),
+      autoFallback: autoFallback(),
+      providerOptions: structuredClone(providerOptions()),
+    });
+    mounted = false;
+    pendingStorage = undefined;
+    setRequestKey("");
   });
   async function submit(e: SubmitEvent) {
     e.preventDefault();
@@ -127,10 +165,15 @@ export default function Speech(props: {
   async function retryStorage() {
     const pending = pendingStorage;
     if (!pending || busy()) return;
-    setNeedsStorage(false); setStorageApproved(false); setError();
+    setNeedsStorage(false);
+    setStorageApproved(false);
+    setError();
     await runSpeech(pending.body, pending.attempt);
   }
-  async function runSpeech(body: ReturnType<typeof speechRequest>, currentAttempt: {signature:string;key:string;id:string}) {
+  async function runSpeech(
+    body: ReturnType<typeof speechRequest>,
+    currentAttempt: { signature: string; key: string; id: string },
+  ) {
     const usesRequestKey = !!body.provider_keys;
     setRequestId(currentAttempt.id);
     setRequestKey("");
@@ -144,27 +187,49 @@ export default function Speech(props: {
       const response = await api<SpeechResult>(`/api/v1/${props.operation}`, {
         method: "POST",
         body,
-        headers: { "idempotency-key": currentAttempt.key, "x-request-id": currentAttempt.id },
+        headers: {
+          "idempotency-key": currentAttempt.key,
+          "x-request-id": currentAttempt.id,
+        },
       });
       if (mounted) {
         setResult(response);
         setRequestId(response.request_id);
       }
-      recordEvent("speech_completed", Math.round(performance.now() - started));
-      attempt = undefined; pendingStorage = undefined;
+      recordEvent(
+        "speech_completed",
+        Math.round(performance.now() - started),
+        originalContext,
+      );
+      attempt = undefined;
+      pendingStorage = undefined;
     } catch (err) {
-      recordEvent("speech_failed", Math.round(performance.now() - started));
-      const storageRequired = err instanceof ApiError && err.code === "storage_authorization_required";
+      recordEvent(
+        "speech_failed",
+        Math.round(performance.now() - started),
+        originalContext,
+      );
+      const storageRequired =
+        err instanceof ApiError &&
+        ([
+          "storage_authorization_required",
+          "obo_authorization_required",
+        ].includes(err.code) ||
+          err.status === 412);
       if (mounted) {
         if (storageRequired) {
-          pendingStorage = {body, attempt: currentAttempt};
+          pendingStorage = { body, attempt: currentAttempt };
           setNeedsStorage(true);
-        } else { setError(err); pendingStorage = undefined; }
+        } else {
+          setError(err);
+          pendingStorage = undefined;
+        }
       }
-      if (!storageRequired && (
+      if (
+        !storageRequired &&
         err instanceof ApiError &&
         [400, 403, 404, 413, 415].includes(err.status)
-      ))
+      )
         attempt = undefined;
     } finally {
       clearInterval(timer);
@@ -301,7 +366,13 @@ export default function Speech(props: {
             <Show when={props.operation === "tts" && selectedProvider()}>
               <Show
                 when={!autoFallback()}
-                fallback={<p class="provider-controls-note hint">Automatic fallback is on. Provider voice controls are unavailable because each provider handles them differently. Your voice profile is used across providers.</p>}
+                fallback={
+                  <p class="provider-controls-note hint">
+                    Automatic fallback is on. Provider voice controls are
+                    unavailable because each provider handles them differently.
+                    Your voice profile is used across providers.
+                  </p>
+                }
               >
                 <ProviderControls
                   provider={selectedProvider()}
@@ -313,7 +384,10 @@ export default function Speech(props: {
             </Show>
             <Show when={session()?.authenticated && selectedProvider()}>
               <details class="request-key">
-                <summary>Use your own API key for this request <span class="label-note">optional</span></summary>
+                <summary>
+                  Use your own API key for this request{" "}
+                  <span class="label-note">optional</span>
+                </summary>
                 <label>
                   {providerNames[selectedProvider()]} API key
                   <input
@@ -327,17 +401,46 @@ export default function Speech(props: {
                     placeholder="Use a saved key or Waveform’s shared key"
                   />
                 </label>
-                <p class="hint">Used only for {providerNames[selectedProvider()]} on this request and cleared after you submit. Leave blank to use your saved key, or Waveform’s shared key if none is saved. <a class="text-link" href="#settings">Manage saved keys</a></p>
+                <p class="hint">
+                  Used only for {providerNames[selectedProvider()]} on this
+                  request and cleared after you submit. Leave blank to use your
+                  saved key, or Waveform’s shared key if none is saved.{" "}
+                  <a class="text-link" href="#settings">
+                    Manage saved keys
+                  </a>
+                </p>
               </details>
             </Show>
             <Show when={needsStorage()}>
-              <StorageConsent cancel={cancelStorage} approved={() => {setNeedsStorage(false); setStorageApproved(true);}} />
+              <StorageConsent
+                cancel={cancelStorage}
+                approved={() => {
+                  setNeedsStorage(false);
+                  setStorageApproved(true);
+                }}
+              />
             </Show>
             <Show when={storageApproved()}>
               <div class="storage-consent" role="status">
-                <p>Briefcase access is ready. Your original request is preserved.</p>
-                <button class="button primary" type="button" onClick={retryStorage} disabled={busy()}>Retry original request</button>
-                <button class="button" type="button" onClick={cancelStorage} disabled={busy()}>Discard request</button>
+                <p>
+                  Briefcase access is ready. Your original request is preserved.
+                </p>
+                <button
+                  class="button primary"
+                  type="button"
+                  onClick={retryStorage}
+                  disabled={busy()}
+                >
+                  Retry original request
+                </button>
+                <button
+                  class="button"
+                  type="button"
+                  onClick={cancelStorage}
+                  disabled={busy()}
+                >
+                  Discard request
+                </button>
               </div>
             </Show>
             <Notice error={error()} />
@@ -402,7 +505,10 @@ export default function Speech(props: {
               />
               Automatic fallback
             </label>
-            <p class="hint">Off by default for text to speech. Turn on to try other providers automatically.</p>
+            <p class="hint">
+              Off by default for text to speech. Turn on to try other providers
+              automatically.
+            </p>
           </Show>
           <Show
             when={!prefs.error && prefs()}

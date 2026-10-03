@@ -1,6 +1,6 @@
 import { createResource, createSignal, For, Show } from "solid-js";
 import {
-  api,
+  bindApi,
   recordEvent,
   date,
   providerNames,
@@ -12,7 +12,12 @@ import {
 import { Empty, Heading, Modal, Notice, Order } from "./ui";
 import VoiceProfilePicker from "./VoiceProfilePicker";
 import type { VoiceProfile } from "./api";
-export default function Settings(props: { signin: () => void; connect: () => void }) {
+export default function Settings(props: {
+  signin: () => void;
+  connect: () => void;
+}) {
+  const api = bindApi(),
+    originalContext = session()?.context;
   const [prefs, { refetch }] = createResource(
     () => session()?.authenticated,
     () => api<Preferences>("/api/v1/preferences"),
@@ -62,7 +67,7 @@ export default function Settings(props: { signin: () => void; connect: () => voi
       setStt();
       setPreferencesVersion((v) => v + 1);
       setNotice("Preferences saved.");
-      recordEvent("settings_saved");
+      recordEvent("settings_saved", 0, originalContext);
     } catch (err) {
       setError(err);
     } finally {
@@ -113,8 +118,19 @@ export default function Settings(props: { signin: () => void; connect: () => voi
         Your providers. Your preferred order.
       </Heading>
       <Notice error={error() || prefs.error || keys.error} message={notice()} />
-      <div class="actions"><button class="button" onClick={props.connect}>Use a test app_secret</button></div>
-      <label><input type="checkbox" checked={telemetry() ?? prefs()?.telemetry_enabled ?? true} onChange={e=>setTelemetry(e.currentTarget.checked)}/> Send diagnostic events to Space Station (save preferences to apply)</label>
+      <div class="actions">
+        <button class="button" onClick={props.connect}>
+          Use a test app_secret
+        </button>
+      </div>
+      <label>
+        <input
+          type="checkbox"
+          checked={telemetry() ?? prefs()?.telemetry_enabled ?? true}
+          onChange={(e) => setTelemetry(e.currentTarget.checked)}
+        />{" "}
+        Send diagnostic events to Space Station (save preferences to apply)
+      </label>
 
       <Show
         when={session()?.authenticated}
@@ -158,7 +174,10 @@ export default function Settings(props: { signin: () => void; connect: () => voi
             <div class="two-columns">
               <div>
                 <h3>Text to speech</h3>
-                <p class="hint">Uses your first provider. Automatic fallback is off unless enabled for a request.</p>
+                <p class="hint">
+                  Uses your first provider. Automatic fallback is off unless
+                  enabled for a request.
+                </p>
                 <Order
                   operation="tts"
                   value={tts() || prefs()!.tts_order}
@@ -168,7 +187,9 @@ export default function Settings(props: { signin: () => void; connect: () => voi
               </div>
               <div>
                 <h3>Speech to text</h3>
-                <p class="hint">Automatically tries the next provider if a request fails.</p>
+                <p class="hint">
+                  Automatically tries the next provider if a request fails.
+                </p>
                 <Order
                   operation="stt"
                   value={stt() || prefs()!.stt_order}
@@ -205,7 +226,8 @@ export default function Settings(props: { signin: () => void; connect: () => voi
               <h2>Bring your own keys</h2>
               <p class="hint">
                 Connect your own provider accounts. Your saved keys are used
-                automatically for speech requests; providers without a saved key use Waveform’s shared key.
+                automatically for speech requests; providers without a saved key
+                use Waveform’s shared key.
               </p>
             </div>
           </div>
@@ -215,7 +237,9 @@ export default function Settings(props: { signin: () => void; connect: () => voi
                 const configured = () =>
                   keys.error
                     ? undefined
-                    : keys()?.items.find((k) => k.provider === provider && k.configured);
+                    : keys()?.items.find(
+                        (k) => k.provider === provider && k.configured,
+                      );
                 return (
                   <div class="provider-row">
                     <div class="provider-initial">
@@ -262,7 +286,10 @@ export default function Settings(props: { signin: () => void; connect: () => voi
           </div>
           <p class="hint key-note">
             Keys are encrypted by the backend and are never returned after
-            saving. Gemini and OpenAI support both speech tasks, ElevenLabs supports text to speech, and Deepgram supports speech to text. You can also override a key for a single request in the speech workspace.
+            saving. Gemini and OpenAI support both speech tasks, ElevenLabs
+            supports text to speech, and Deepgram supports speech to text. You
+            can also override a key for a single request in the speech
+            workspace.
           </p>
         </section>
       </Show>

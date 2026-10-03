@@ -46,6 +46,14 @@ export interface Environment {
 }
 export interface Session {
   context: string;
+  contextId?: string;
+  contexts?: {
+    id: string;
+    plane: "production" | "test";
+    user: Identity;
+    org: string;
+    environment: Environment | null;
+  }[];
   authenticated: boolean;
   user: Identity | null;
   org: string;
@@ -133,15 +141,24 @@ export async function api<T>(
     body?: unknown;
     headers?: Record<string, string>;
     signal?: AbortSignal;
+    context?: string;
   } = {},
 ): Promise<T> {
+  const context = options.context ?? session()?.context;
+  const publicRead =
+    path.startsWith("/health/") || path === "/api/v1/capabilities";
+  const changed = () => !publicRead && context !== session()?.context;
+  if (options.context && changed())
+    throw new ApiError(
+      "Return to the original workspace before retrying this action.",
+      409,
+      "workspace_changed",
+    );
   const response = await fetch(path, {
     method: options.method || "GET",
     credentials: "same-origin",
     headers: {
-      ...(session()?.context
-        ? { "x-waveform-context": session()!.context }
-        : {}),
+      ...(context ? { "x-waveform-context": context } : {}),
       ...(options.body !== undefined
         ? { "content-type": "application/json" }
         : {}),
@@ -154,6 +171,12 @@ export async function api<T>(
     response.status === 204
       ? undefined
       : await response.json().catch(() => undefined);
+  if (changed())
+    throw new ApiError(
+      "This response belongs to the previous workspace. Return there before retrying.",
+      409,
+      "workspace_changed",
+    );
   if (!response.ok)
     throw new ApiError(
       body?.error?.message || `Request failed (${response.status}).`,
@@ -169,12 +192,18 @@ export async function api<T>(
     );
   return body as T;
 }
+export function bindApi() {
+  const context = session()?.context;
+  return <T>(path: string, options: Parameters<typeof api>[1] = {}) =>
+    api<T>(path, { ...options, context });
+}
 export const [session, setSession] = createSignal<Session>();
 export const [preferencesVersion, setPreferencesVersion] = createSignal(0);
 export const [contextVersion, setContextVersion] = createSignal(0);
 export function acceptSession(value: Session) {
+  const changed = session()?.context !== value.context;
   setSession(value);
-  setContextVersion((v) => v + 1);
+  if (changed) setContextVersion((v) => v + 1);
 }
 export async function sessionAction(action: string, body: unknown = {}) {
   const value = await api<Session>(`/api/session/${action}`, {
@@ -224,7 +253,20 @@ export function safeUrl(value?: string | null) {
 }
 
 /** Diagnostic events use the same authenticated gateway; no table key enters the browser. */
-export function recordEvent(event: "speech_completed" | "speech_failed" | "settings_saved" | "page_view", elapsed_ms = 0) {
-  if (session()?.plane === "test" || !session()?.authenticated) return;
-  void api("/api/v1/telemetry", {method:"POST", body:{event,elapsed_ms}}).catch(()=>{});
+export function recordEvent(
+  event: "speech_completed" | "speech_failed" | "settings_saved" | "page_view",
+  elapsed_ms = 0,
+  context = session()?.context,
+) {
+  if (
+    context !== session()?.context ||
+    session()?.plane === "test" ||
+    !session()?.authenticated
+  )
+    return;
+  void api("/api/v1/telemetry", {
+    method: "POST",
+    body: { event, elapsed_ms },
+    context,
+  }).catch(() => {});
 }

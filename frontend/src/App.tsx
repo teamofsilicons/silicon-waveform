@@ -133,20 +133,36 @@ export default function App() {
         <aside class="sidebar" classList={{ open: menu() }}>
           <Brand />
           <div class="workspace-context">
-            <span class="eyebrow">ORGANIZATION</span>
-            <button
+            <label class="eyebrow" for="workspace-context">
+              ACCOUNT & ORGANIZATION
+            </label>
+            <select
+              id="workspace-context"
               class="organization-button"
-              onClick={() => {
-                location.hash = "account";
-                setMenu(false);
-              }}
+              value={session()?.contextId || ""}
+              disabled={busy()}
+              onChange={(event) =>
+                void sessionAction("context", {
+                  context_id: event.currentTarget.value,
+                }).catch(setError)
+              }
             >
-              <span>
-                {session()?.org === "tos"
-                  ? "Team of Silicons"
-                  : session()?.org || "Your workspace"}
-              </span>
-              <Icon name="down" size={14} />
+              <Show when={!session()?.authenticated}>
+                <option value="">Choose a saved workspace</option>
+              </Show>
+              <For each={session()?.contexts || []}>
+                {(saved) => (
+                  <option value={saved.id}>
+                    {saved.user.public_id} · {saved.org}
+                    {saved.plane === "test"
+                      ? ` · ${saved.environment?.name || "Test"}`
+                      : ""}
+                  </option>
+                )}
+              </For>
+            </select>
+            <button class="text-button" onClick={signin}>
+              Add an account or organization
             </button>
           </div>
           <nav aria-label="Main navigation">
@@ -243,8 +259,19 @@ export default function App() {
           <Show when={session()?.plane === "test"}>
             <div class="testing-banner" role="status">
               <strong>Test environment · {session()?.environment?.name}</strong>
-              <span>Identity: {session()?.user?.public_id || "Not signed in"}</span>
-              <button class="button" onClick={() => void sessionAction("switch", {plane:"production"}).catch(setError)}>Exit testing mode</button>
+              <span>
+                Identity: {session()?.user?.public_id || "Not signed in"}
+              </span>
+              <button
+                class="button"
+                onClick={() =>
+                  void sessionAction("switch", { plane: "production" }).catch(
+                    setError,
+                  )
+                }
+              >
+                Exit testing mode
+              </button>
             </div>
           </Show>
           <main id="main-content" tabindex="-1">
@@ -273,7 +300,13 @@ export default function App() {
                       <History signin={signin} />
                     </Show>
                     <Show when={page() === "settings"}>
-                      <Settings signin={signin} connect={() => {setKey("");setConnect(true);}} />
+                      <Settings
+                        signin={signin}
+                        connect={() => {
+                          setKey("");
+                          setConnect(true);
+                        }}
+                      />
                     </Show>
                     <Show when={page() === "environments"}>
                       <Environments
@@ -319,7 +352,7 @@ export default function App() {
                           <div class="actions">
                             <button class="button primary" onClick={signin}>
                               {session()?.authenticated
-                                ? "Switch identity or organization"
+                                ? "Add an account or organization"
                                 : "Sign in with IAM"}
                             </button>
                             <Show when={session()?.authenticated}>
@@ -443,7 +476,15 @@ export default function App() {
                 Continue with IAM <Icon name="arrow" />
               </a>
             </Show>
-            <button class="button" onClick={() => {setLogin(false);setConnect(true);}}>Use a test app_secret</button>
+            <button
+              class="button"
+              onClick={() => {
+                setLogin(false);
+                setConnect(true);
+              }}
+            >
+              Use a test app_secret
+            </button>
             <Notice error={error()} />
             <p class="hint">
               Access tokens stay on the frontend server. Waveform never asks for
@@ -465,7 +506,9 @@ export default function App() {
         >
           <form class="stack" onSubmit={connectEnvironment}>
             <p class="muted">
-              Enter Waveform’s IAM testing app_secret. We discover the sandbox automatically. Then sign in with a test SLT or an existing test identity’s public ID.
+              Enter Waveform’s IAM testing app_secret. We discover the sandbox
+              automatically. Then sign in with a test SLT or an existing test
+              identity’s public ID.
             </p>
             <label>
               Organization handle
