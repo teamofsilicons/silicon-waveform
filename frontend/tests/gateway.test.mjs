@@ -508,6 +508,31 @@ test("popup login rejects malformed selection and keeps a prior session on misma
   assert.equal(after.context, before.context);
 });
 
+test("full-page fallback keeps the chosen identity kind and returns without popup metadata", async () => {
+  for (const kind of ["carbon", "silicon"]) {
+    const fake = fixture();
+    const s = setup({ fetcher: async (input, options) => {
+      const response = await fake.fetcher(input, options);
+      if (new URL(input).pathname !== "/api/v1/auth/me") return response;
+      return Response.json({ ...await response.json(), actor_type: kind, public_id: kind === "carbon" ? "c:person" : "si:agent" });
+    } });
+    const start = await s.call(`/auth/start?identity_kind=${kind}`);
+    assert.equal(start.status, 303);
+    const destination = new URL(start.headers.get("location"));
+    assert.equal(destination.searchParams.get("identity_kind"), kind);
+    assert.equal(destination.searchParams.has("display"), false);
+    assert.equal(destination.searchParams.has("popup_nonce"), false);
+    const callback = new URL(destination.searchParams.get("redirect_uri"));
+    assert.ok(callback.searchParams.get("state"));
+    callback.searchParams.set("slt", "oac_waveform_ui_fixture");
+    const completed = await s.call(callback.pathname + callback.search);
+    assert.equal(completed.headers.get("location"), origin + "/");
+    const current = await (await s.call("/api/session")).json();
+    assert.equal(current.authenticated, true);
+    assert.equal(current.user.actor_type, kind);
+  }
+});
+
 
 test("storage popup binds current workspace and exchanges its code only on the server", async () => {
   const s = setup(); await s.login();

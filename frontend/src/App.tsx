@@ -499,6 +499,9 @@ export default function App() {
               <div class="stack">
                 <button class="button primary" disabled={busy()} onClick={() => void signInAs("carbon")}>Continue as Carbon <Icon name="arrow" /></button>
                 <button class="button" disabled={busy()} onClick={() => void signInAs("silicon")}>Continue as Silicon <Icon name="arrow" /></button>
+                <Show when={!busy()}>
+                  <p class="hint">If popups are unavailable, continue in this tab as <a href="/auth/start?identity_kind=carbon">Carbon</a> or <a href="/auth/start?identity_kind=silicon">Silicon</a>.</p>
+                </Show>
               </div>
             </Show>
             <button
