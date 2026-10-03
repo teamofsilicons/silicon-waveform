@@ -1609,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-waveform-client"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "reqwest",
  "rustls",
@@ -2160,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "waveform-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "clap",
  "rpassword",

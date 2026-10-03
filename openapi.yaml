@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Silicon Waveform API
-  version: 0.5.0
+  version: 0.5.1
   summary: Provider-independent text-to-speech and speech-to-text
   description: |
     Synchronous speech operations for Carbons, Silicons, and IAM applications.
