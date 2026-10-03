@@ -469,3 +469,81 @@ test("Briefcase consent preserves the login and selected plane without sending s
   await s.call("/api/session/login",{slt:"test-carbon",org:"tos"});
   assert.equal((await s.call(path)).status,404);
 });
+
+
+test("popup login binds selected identity kind and nonce before creating a session", async () => {
+  for (const kind of ["carbon", "silicon"]) {
+    const s = setup();
+    const nonce = "a".repeat(64);
+    const start = await s.call(`/auth/start?identity_kind=${kind}&popup_nonce=${nonce}`);
+    const destination = new URL(start.headers.get("location"));
+    assert.equal(destination.searchParams.get("identity_kind"), kind);
+    assert.equal(destination.searchParams.get("display"), "popup");
+    const callback = new URL(destination.searchParams.get("redirect_uri"));
+    callback.searchParams.set("slt", "oac_waveform_ui_fixture");
+    const response = await s.call(callback.pathname + callback.search);
+    const complete = new URL(response.headers.get("location"));
+    assert.equal(complete.origin, origin);
+    assert.equal(complete.searchParams.get("nonce"), nonce);
+    assert.equal(complete.searchParams.get("result"), kind === "carbon" ? "ok" : "error");
+    assert.equal(complete.searchParams.has("slt"), false);
+    const current = await (await s.call("/api/session")).json();
+    assert.equal(current.authenticated, kind === "carbon");
+  }
+});
+test("popup login rejects malformed selection and keeps a prior session on mismatch", async () => {
+  const s = setup();
+  for (const query of ["identity_kind=admin", "identity_kind=carbon&popup_nonce=bad", `popup_nonce=${"b".repeat(64)}`]) {
+    assert.equal((await s.call("/auth/start?" + query)).status, 400);
+  }
+  await s.call("/api/session");
+  await s.login();
+  const before = await (await s.call("/api/session")).json();
+  const start = await s.call(`/auth/start?identity_kind=silicon&popup_nonce=${"b".repeat(64)}`);
+  const callback = new URL(new URL(start.headers.get("location")).searchParams.get("redirect_uri"));
+  callback.searchParams.set("slt", "oac_waveform_ui_fixture");
+  await s.call(callback.pathname + callback.search);
+  const after = await (await s.call("/api/session")).json();
+  assert.deepEqual(after.user, before.user);
+  assert.equal(after.context, before.context);
+});
+
+
+test("storage popup binds current workspace and exchanges its code only on the server", async () => {
+  const s = setup(); await s.login();
+  const nonce = "c".repeat(64);
+  const started = await s.call("/api/session/storage/start", { popup_nonce: nonce });
+  assert.equal(started.status, 200);
+  const handoff = await started.json();
+  assert.equal(new URL(handoff.redirect_url).searchParams.get("display"), "popup");
+  const request = s.fake.requests.find(r => r.path === "/api/v1/storage-authorizations");
+  assert.equal(request.body.redirect_uri, origin + "/auth/storage/callback");
+  assert.equal((await s.call("/auth/storage/callback?state=wrong&code=obc_fixture")).status, 403);
+  assert.equal(s.fake.requests.filter(r => r.path.endsWith("/complete")).length, 0);
+  const callback = await s.call("/auth/storage/callback?state=fixture-state&code=obc_fixture");
+  const target = new URL(callback.headers.get("location"));
+  assert.equal(target.searchParams.get("nonce"), nonce);
+  assert.equal(target.searchParams.get("result"), "ok");
+  assert.equal(target.searchParams.has("code"), false);
+  assert.equal(s.fake.requests.filter(r => r.path.endsWith("/complete")).length, 1);
+  assert.equal((await (await s.call("/api/session")).json()).authenticated, true);
+  assert.equal(s.fake.requests.some(r => r.path === "/api/v1/tts"), false);
+});
+test("storage popup retries an uncertain code exchange and refuses a switched workspace", async () => {
+  const fake = fixture(); let fail = true;
+  const s = setup({fetcher: async (url, options) => {
+    if (new URL(url).pathname.endsWith("/complete") && fail) return Response.json({error:{code:"temporary"}}, {status:503});
+    return fake.fetcher(url, options);
+  }});
+  await s.login();
+  await s.call("/api/session/storage/start", {popup_nonce:"d".repeat(64)});
+  const failed = await s.call("/auth/storage/callback?state=fixture-state&code=obc_fixture");
+  assert.equal(new URL(failed.headers.get("location")).searchParams.get("result"), "error");
+  fail = false;
+  const retry = await (await s.call("/api/session/storage/start", {popup_nonce:"e".repeat(64)})).json();
+  assert.equal(new URL(retry.redirect_url).searchParams.get("result"), "ok");
+  assert.equal(fake.requests.filter(r => r.path === "/api/v1/storage-authorizations").length, 1);
+  await s.call("/api/session/storage/start", {popup_nonce:"f".repeat(64)});
+  await s.call("/api/session/environment", {key:fake.testKey,org:"tos"});
+  assert.equal((await s.call("/auth/storage/callback?state=fixture-state&code=obc_fixture")).status, 403);
+});
