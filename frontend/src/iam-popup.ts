@@ -12,11 +12,13 @@ export function completeIamPopup(): boolean {
   if (nonce && /^[a-f0-9]{64}$/.test(nonce) && ["ok", "error"].includes(result || "") && window.opener) {
     window.opener.postMessage({ type: messageType, nonce, result }, window.location.origin);
     window.close();
+    return true;
   }
-  return true;
+  return false;
 }
 
-export function openIamPopup(start: (nonce: string) => string | Promise<string>): Promise<void> {
+export function openIamPopup(start: (nonce: string) => string | Promise<string>, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new Error("Sign-in was cancelled."));
   const nonce = Array.from(crypto.getRandomValues(new Uint8Array(32)), value => value.toString(16).padStart(2, "0")).join("");
   const popup = window.open("about:blank", "iam-" + nonce, "popup,width=520,height=760");
   if (!popup) return Promise.reject(new Error("Allow popups for this site, then choose your account type again."));
@@ -26,6 +28,7 @@ export function openIamPopup(start: (nonce: string) => string | Promise<string>)
       if (settled) return;
       settled = true;
       window.removeEventListener("message", receive);
+      signal?.removeEventListener("abort", abort);
       clearInterval(closed);
       clearTimeout(timeout);
       popup.close();
@@ -36,9 +39,11 @@ export function openIamPopup(start: (nonce: string) => string | Promise<string>)
       if (event.data.result === "ok") finish();
       else if (event.data.result === "error") finish(new Error("IAM could not finish sign-in. Please try again."));
     };
+    const abort = () => finish(new Error("Sign-in was cancelled."));
     const closed = setInterval(() => { if (popup.closed) finish(new Error("Sign-in was closed. Choose your account type to try again.")); }, 500);
     const timeout = setTimeout(() => finish(new Error("Sign-in expired. Choose your account type to try again.")), 600_000);
     window.addEventListener("message", receive);
-    Promise.resolve().then(() => start(nonce)).then(url => { if (!settled) popup.location.href = url; }).catch(error => finish(error instanceof Error ? error : new Error("Unable to start sign-in.")));
+    signal?.addEventListener("abort", abort, { once: true });
+    Promise.resolve().then(() => settled ? undefined : start(nonce)).then(url => { if (!settled && url) popup.location.href = url; }).catch(error => finish(error instanceof Error ? error : new Error("Unable to start sign-in.")));
   });
 }

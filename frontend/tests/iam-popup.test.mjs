@@ -34,3 +34,19 @@ test("blocked popups fail clearly and completion never sends callback credential
   assert.equal(origin, "https://app.example");
   assert.deepEqual(message, { type: "silicon:iam-login-complete", nonce: "a".repeat(64), result: "ok" });
 });
+
+test("a pending ten-minute popup aborts immediately and cannot deliver a late result", async t => {
+  const b = browser(t), controller = new AbortController(); let nonce;
+  const result = openIamPopup(value => { nonce = value; return "/start"; }, controller.signal);
+  await Promise.resolve();
+  controller.abort();
+  await assert.rejects(result, /cancelled/);
+  assert.equal(b.popup.closed, true);
+  b.send({ origin: b.window.location.origin, source: b.popup, data: { type: "silicon:iam-login-complete", nonce, result: "ok" } });
+});
+
+test("manual review callback without an opener loads the application normally", t => {
+  const b = browser(t);
+  b.window.location.href = "https://app.example/?iam_popup=complete&nonce=" + "c".repeat(64) + "&result=ok";
+  assert.equal(completeIamPopup(), false);
+});

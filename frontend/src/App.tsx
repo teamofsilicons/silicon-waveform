@@ -18,6 +18,7 @@ import {
 } from "./api";
 import { Brand, Heading, Icon, Modal, Notice } from "./ui";
 import Speech from "./Speech";
+import { createLoginLifecycle, createLoginCancellation } from "./login-lifecycle";
 import { completeIamPopup, openIamPopup, type IdentityKind } from "./iam-popup";
 import History from "./History";
 import Settings from "./Settings";
@@ -41,6 +42,7 @@ export default function App() {
     [connect, setConnect] = createSignal(false);
   const [error, setError] = createSignal<unknown>(),
     [busy, setBusy] = createSignal(false),
+    [loginBusy, setLoginBusy] = createSignal(false),
     [slt, setSlt] = createSignal(""),
     [org, setOrg] = createSignal("tos"),
     [key, setKey] = createSignal("");
@@ -77,6 +79,33 @@ export default function App() {
       setReady(true);
     }
   });
+  const loginLifecycle = createLoginLifecycle(setLoginBusy);
+  const cancellation = createLoginCancellation(
+    () => session()?.context,
+    (nonce, context) => api<Session>("/auth/cancel", { method: "POST", body: { nonce }, context }),
+    acceptSession,
+  );
+  function cancelPopup() {
+    const fence = loginLifecycle.cancel(), before = session()?.context;
+    return { fence, promise: cancellation.cancel(), before };
+  }
+  function closeLogin() {
+    const cancelled = cancelPopup();
+    setLogin(false); setSlt(""); setError();
+    void cancelled.promise.catch(err => { if (cancelled.fence.current()) setError(err); });
+  }
+  async function fullPage(event: MouseEvent, kind: IdentityKind) {
+    event.preventDefault();
+    const cancelled = cancelPopup();
+    const destination = `/auth/start?identity_kind=${kind}`;
+    try {
+      const restored = await cancelled.promise;
+      if (!cancelled.fence.current()) return;
+      if (session()?.context !== (restored ?? cancelled.before)) throw new Error("The selected workspace changed. Choose your sign-in option again.");
+      location.assign(destination);
+    } catch (err) { if (cancelled.fence.current()) setError(err); }
+  }
+  onCleanup(() => { const cancelled = cancelPopup(); loginLifecycle.dispose(); void cancelled.promise.catch(() => {}); });
   function signin() {
     setSlt("");
     setOrg(session()?.org || "tos");
@@ -84,17 +113,27 @@ export default function App() {
     setLogin(true);
   }
   async function signInAs(kind: IdentityKind) {
-    const getSession = bindApi();
-    setBusy(true);
+    const attempt = loginLifecycle.begin();
+    let before = session()?.context;
     setError();
     try {
-      await openIamPopup(nonce => `/auth/start?identity_kind=${kind}&popup_nonce=${nonce}`);
-      const current = await getSession<Session>("/api/session");
+      await openIamPopup(async nonce => {
+        const restored = await cancellation.cancel();
+        if (session()?.context !== restored) throw new Error("The selected workspace changed. Choose your sign-in option again.");
+        before = restored;
+        if (!attempt.current()) throw new Error("Sign-in was cancelled.");
+        cancellation.remember(nonce);
+        return `/auth/start?identity_kind=${kind}&popup_nonce=${nonce}`;
+      }, attempt.signal);
+      if (!attempt.current() || session()?.context !== before) return;
+      const current = await api<Session>("/api/session", { signal: attempt.signal });
+      if (!attempt.current() || session()?.context !== before) return;
       if (!current.authenticated || current.user?.actor_type !== kind) throw new Error("The selected account could not be verified. Please sign in again.");
+      cancellation.forget();
       acceptSession(current);
       setLogin(false);
-    } catch (err) { setError(err); }
-    finally { setBusy(false); }
+    } catch (err) { if (attempt.current()) setError(err); }
+    finally { attempt.finish(); }
   }
   async function signIn(e: SubmitEvent) {
     e.preventDefault();
@@ -462,11 +501,8 @@ export default function App() {
               : "Welcome to Waveform"
           }
           close={() => {
-            if (!busy()) {
-              setLogin(false);
-              setSlt("");
-              setError();
-            }
+            if (session()?.plane !== "test") closeLogin();
+            else if (!busy()) { setLogin(false); setSlt(""); setError(); }
           }}
         >
           <div class="stack">
@@ -497,19 +533,16 @@ export default function App() {
               }
             >
               <div class="stack">
-                <button class="button primary" disabled={busy()} onClick={() => void signInAs("carbon")}>Continue as Carbon <Icon name="arrow" /></button>
-                <button class="button" disabled={busy()} onClick={() => void signInAs("silicon")}>Continue as Silicon <Icon name="arrow" /></button>
-                <Show when={!busy()}>
-                  <p class="hint">If popups are unavailable, continue in this tab as <a href="/auth/start?identity_kind=carbon">Carbon</a> or <a href="/auth/start?identity_kind=silicon">Silicon</a>.</p>
-                </Show>
+                <button class="button primary" disabled={loginBusy()} onClick={() => void signInAs("carbon")}>Continue as Carbon <Icon name="arrow" /></button>
+                <button class="button" disabled={loginBusy()} onClick={() => void signInAs("silicon")}>Continue as Silicon <Icon name="arrow" /></button>
+                <p class="hint">If popups are unavailable, continue in this tab as <a href="/auth/start?identity_kind=carbon" onClick={event => void fullPage(event, "carbon")}>Carbon</a> or <a href="/auth/start?identity_kind=silicon" onClick={event => void fullPage(event, "silicon")}>Silicon</a>.</p>
+                <Show when={loginBusy()}><button class="button" onClick={closeLogin}>Cancel sign-in</button></Show>
               </div>
             </Show>
             <button
               class="button"
-              onClick={() => {
-                setLogin(false);
-                setConnect(true);
-              }}
+              disabled={busy()}
+              onClick={() => { closeLogin(); setConnect(true); }}
             >
               Use a test app_secret
             </button>

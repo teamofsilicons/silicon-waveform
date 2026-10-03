@@ -85,6 +85,7 @@ export default function Speech(props: {
   let attempt: { signature: string; key: string; id: string } | undefined;
   const [needsStorage, setNeedsStorage] = createSignal(false);
   const [storageApproved, setStorageApproved] = createSignal(false);
+  const [storagePaused, setStoragePaused] = createSignal(false);
   // Retain only in memory until explicit retry/cancel; never serialize provider keys.
   let pendingStorage:
     | {
@@ -97,6 +98,12 @@ export default function Speech(props: {
     attempt = undefined;
     setNeedsStorage(false);
     setStorageApproved(false);
+    setStoragePaused(false);
+    setError();
+  }
+  function pauseStorage() {
+    setNeedsStorage(false);
+    setStoragePaused(true);
     setError();
   }
   let mounted = true;
@@ -362,12 +369,19 @@ export default function Speech(props: {
             </Show>
             <Show when={needsStorage()}>
               <StorageConsent
-                cancel={cancelStorage}
+                cancel={pauseStorage}
                 approved={() => {
                   setNeedsStorage(false);
                   setStorageApproved(true);
                 }}
               />
+            </Show>
+            <Show when={storagePaused()}>
+              <div class="storage-consent" role="status">
+                <p>Approval paused. Your original request and speech draft are preserved.</p>
+                <button class="button" type="button" onClick={() => { setStoragePaused(false); setNeedsStorage(true); }}>Resume approval</button>
+                <button class="button" type="button" onClick={cancelStorage}>Discard request</button>
+              </div>
             </Show>
             <Show when={storageApproved()}>
               <div class="storage-consent" role="status">

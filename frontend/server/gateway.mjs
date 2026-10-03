@@ -122,7 +122,7 @@ export function createGateway({
     a.org === b.org &&
     (plane === "production" ||
       (a.environment?.id === b.environment?.id && a.key === b.key));
-  function installSlot(session, plane, next) {
+  function installSlot(session, plane, next, popupReceipt) {
     const previous = session[plane],
       saved = { ...session.saved },
       retired = [];
@@ -150,11 +150,13 @@ export function createGateway({
         delete saved[contextId];
       }
     }
+    const context = id();
     updateSession(session, {
       saved,
       [plane]: next,
       active: plane,
-      context: id(),
+      ...(popupReceipt ? { popupReceipt: { ...popupReceipt, context } } : {}),
+      context,
       until: Date.now() + SESSION_TTL_MS,
     });
     for (const slot of retired) slot.revoked = true;
@@ -421,7 +423,7 @@ export function createGateway({
     pending.actor === slot?.user?.public_id && pending.kind === slot?.user?.actor_type &&
     !!slot?.access && currentSlot(session, slot);
   const storageContext = (session, slot, pending) =>
-    storageIdentity(session, slot, pending) && pending.context === session.context;
+    storageIdentity(session, slot, pending) && !pending.cancelled && pending.context === session.context;
   async function completeStorage(session, slot, pending) {
     const response = await authorized(
       `/api/v1/storage-authorizations/${pending.authorizationId}/complete`, session, slot,
@@ -429,15 +431,28 @@ export function createGateway({
       { "idempotency-key": pending.startKey + "-complete" },
     );
     if (!response.ok) {
-      if (response.status === 412) delete slot.storagePending;
+      const error = await response.clone().json().catch(() => null);
+      if (response.status === 412 || (response.status === 400 && ["invalid_storage_authorization", "storage_authorization_expired"].includes(error?.error?.code))) delete slot.storagePending;
       return response;
     }
     const value = await response.json();
     if (value.authorization_id !== pending.authorizationId || value.state !== pending.state || value.status !== "completed")
       return failure("approval_pending", "Approval could not be verified. Retry the original request.", 409);
+    pending.completed = true;
+    pending.codeDigest = createHash("sha256").update(pending.code).digest("hex");
+    delete pending.code;
+    slot.storageCompleted = pending;
     delete slot.storagePending;
     return null;
   }
+  const storageView = pending => ({
+    authorization_id: pending.authorizationId, state: pending.state,
+    consent_url: pending.completed ? null : pending.consentUrl,
+    redirect_url: pending.completed && pending.popupNonce ? popupLocation(pending.popupNonce, true) : pending.consentUrl,
+    status: pending.completed ? "completed" : "pending",
+    expires_at: new Date(pending.until).toISOString(), manual: pending.manual,
+    code_saved: !!pending.code,
+  });
   const snapshot = (s) => ({
     authenticated: !!s[s.active]?.access,
     user: s[s.active]?.user ?? null,
@@ -617,16 +632,21 @@ export function createGateway({
       if (path === "/api/session/storage/start" && request.method === "POST") {
         const slot = session[session.active];
         if (!slot?.access || !identity(slot.user)) return finish(failure("sign_in_required", "Sign in to approve Briefcase access.", 401));
-        if (!/^[a-f0-9]{64}$/.test(body.popup_nonce || "")) return finish(failure("invalid_popup", "Start approval from Waveform."));
+        if (body.popup_nonce !== undefined && !/^[a-f0-9]{64}$/.test(body.popup_nonce)) return finish(failure("invalid_popup", "Start approval from Waveform."));
+        const reviewNonce = body.review_nonce || body.popup_nonce;
+        if (reviewNonce !== undefined && !/^[a-f0-9]{64}$/.test(reviewNonce)) return finish(failure("invalid_review", "Start approval from Waveform."));
+        if (session.storageCancelled?.some(entry => entry.nonce === reviewNonce && entry.until > Date.now())) return finish(failure("approval_cancelled", "This review was cancelled.", 409));
         let pending = slot.storagePending;
         if (storageIdentity(session, slot, pending)) {
           pending.popupNonce = body.popup_nonce;
           pending.context = session.context;
+          pending.cancelled = false;
+          pending.reviewNonce = reviewNonce;
         } else {
           pending = {
             startKey: id(), context: session.context, slotId: slot.contextId,
             plane: session.active, org: slot.org, actor: slot.user.public_id,
-            kind: slot.user.actor_type, popupNonce: body.popup_nonce, until: Date.now() + 600_000,
+            kind: slot.user.actor_type, popupNonce: body.popup_nonce, manual: !body.popup_nonce, reviewNonce, until: Date.now() + 600_000,
           };
           slot.storagePending = pending;
         }
@@ -636,24 +656,57 @@ export function createGateway({
         if (pending.code) {
           const failed = await completeStorage(session, slot, pending);
           if (failed) return finish(failed);
-          return finish(json({ redirect_url: popupLocation(body.popup_nonce, true) }));
+          return finish(json(storageView(pending)));
         }
         if (!pending.authorizationId) {
-          const response = await authorized("/api/v1/storage-authorizations", session, slot, "POST", { redirect_uri: new URL("/auth/storage/callback", origin).href }, { "idempotency-key": pending.startKey });
+          const response = await authorized("/api/v1/storage-authorizations", session, slot, "POST", pending.manual ? {} : { redirect_uri: new URL("/auth/storage/callback", origin).href }, { "idempotency-key": pending.startKey });
           if (!response.ok) {
-            if (response.status === 412) delete slot.storagePending;
+            const error = await response.clone().json().catch(() => null);
+            if (response.status === 412 || (response.status === 400 && ["invalid_storage_authorization", "storage_authorization_expired"].includes(error?.error?.code))) delete slot.storagePending;
             return finish(response);
           }
           const value = await response.json();
           if (typeof value.authorization_id !== "string" || !/^[a-f0-9-]{36}$/.test(value.authorization_id) || typeof value.state !== "string" || !value.state || typeof value.consent_url !== "string" || value.status !== "pending") return finish(failure("invalid_approval", "IAM returned an invalid approval request.", 502));
           const consent = new URL(value.consent_url);
           if ((consent.protocol !== "https:" && !(consent.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(consent.hostname))) || consent.username || consent.password || consent.hash) return finish(failure("invalid_approval", "IAM returned an invalid approval address.", 502));
-          consent.searchParams.set("display", "popup");
+          if (body.popup_nonce) consent.searchParams.set("display", "popup");
           const until = Math.min(pending.until, Date.parse(value.expires_at));
           if (!Number.isFinite(until) || until <= Date.now()) return finish(failure("invalid_approval", "IAM returned an invalid expiry.", 502));
           Object.assign(pending, { authorizationId: value.authorization_id, state: value.state, consentUrl: consent.href, until });
         }
-        return finish(json({ redirect_url: pending.consentUrl }));
+        return finish(json(storageView(pending)));
+      }
+      if (path === "/api/session/storage/cancel" && request.method === "POST") {
+        const slot = session[session.active], pending = slot?.storagePending;
+        // Cancel only this browser wait. Keep the durable request/key/code and
+        // any existing grant; a late callback cannot finish a dismissed review.
+        if (!/^[a-f0-9]{64}$/.test(body.review_nonce || "")) return finish(failure("invalid_review", "Cancel this review from Waveform."));
+        session.storageCancelled = [...(session.storageCancelled || []).filter(entry => entry.until > Date.now()), { nonce: body.review_nonce, until: Date.now() + 600_000 }].slice(-32);
+        if (storageIdentity(session, slot, pending) && body.review_nonce === pending.reviewNonce) pending.cancelled = true;
+        return finish(json({ cancelled: true }));
+      }
+      if (path === "/api/session/storage/status" && request.method === "POST") {
+        const slot = session[session.active], pending = slot?.storagePending || slot?.storageCompleted;
+        if (!storageIdentity(session, slot, pending) || body.authorization_id !== pending.authorizationId || body.state !== pending.state)
+          return finish(failure("approval_expired", "Resume approval in the original workspace.", 403));
+        return finish(json(storageView(pending)));
+      }
+      if (path === "/api/session/storage/complete" && request.method === "POST") {
+        const slot = session[session.active], pending = slot?.storagePending || slot?.storageCompleted;
+        if (!storageContext(session, slot, pending) || body.authorization_id !== pending.authorizationId || body.state !== pending.state)
+          return finish(failure("approval_expired", "Resume approval in the original workspace.", 403));
+        if (body.code !== undefined && !/^obc_[!-~]{1,16380}$/.test(body.code)) return finish(failure("invalid_code", "Paste the one-use approval code from IAM."));
+        if (pending.completed) {
+          if (body.code && createHash("sha256").update(body.code).digest("hex") !== pending.codeDigest) return finish(failure("approval_code_changed", "Retry the original approval code.", 409));
+          return finish(json(storageView(pending)));
+        }
+        if (pending.code && body.code && pending.code !== body.code) return finish(failure("approval_code_changed", "Retry the saved approval code.", 409));
+        pending.code ||= body.code;
+        if (!pending.code) return finish(failure("invalid_code", "Paste the one-use approval code from IAM."));
+        persist(session);
+        const failed = await completeStorage(session, slot, pending);
+        if (failed) return finish(failed);
+        return finish(json(storageView(pending)));
       }
       if (path === "/auth/storage/callback" && request.method === "GET") {
         const slot = session[session.active], pending = slot?.storagePending;
@@ -672,13 +725,34 @@ export function createGateway({
         try { success = !(await completeStorage(session, slot, pending)); } catch { /* The encrypted receipt remains retryable. */ }
         return finish(Response.redirect(popupLocation(pending.popupNonce, success), 303));
       }
+      if (path === "/auth/cancel" && request.method === "POST") {
+        if (!/^[a-f0-9]{64}$/.test(body.nonce || "")) return finish(failure("invalid_popup", "Cancel sign-in from Waveform."));
+        session.loginCancelled = [...(session.loginCancelled || []).filter(entry => entry.until > Date.now()), { nonce: body.nonce, until: Date.now() + 600_000 }].slice(-32);
+        if (session.pending?.popupNonce === body.nonce) delete session.pending;
+        const receipt = session.popupReceipt;
+        if (receipt?.nonce === body.nonce) {
+          if (receipt.context === session.context) {
+            const previous = slots(session).find(({ slot }) => slot.contextId === receipt.beforeId && !slot.revoked);
+            if (previous) installSlot(session, previous.plane, previous.slot);
+            else {
+              const selected = session[session.active];
+              const same = session.active === receipt.beforePlane && selected?.user?.public_id === receipt.beforeActor && selected?.user?.actor_type === receipt.beforeKind && selected?.org === receipt.beforeOrg;
+              if (!same) installSlot(session, receipt.beforePlane, { org: receipt.beforeOrg || "tos" });
+            }
+          }
+          delete session.popupReceipt;
+        }
+        return finish(json(snapshot(session)));
+      }
       if (path === "/auth/start" && request.method === "GET") {
         const identityKind = url.searchParams.get("identity_kind");
         const popupNonce = url.searchParams.get("popup_nonce");
         if ((identityKind && !["carbon", "silicon"].includes(identityKind)) ||
             (popupNonce && (!identityKind || !/^[a-f0-9]{64}$/.test(popupNonce))))
           return finish(failure("invalid_login", "Choose Carbon or Silicon to sign in."));
+        if (popupNonce && session.loginCancelled?.some(entry => entry.nonce === popupNonce && entry.until > Date.now())) return finish(failure("login_cancelled", "This sign-in was cancelled.", 409));
         const state = id();
+        delete session.popupReceipt;
         session.pending = { state, identityKind, popupNonce, context: session.context, plane: session.active, until: Date.now() + 600_000 };
         const callback = new URL("/auth/callback", origin);
         callback.searchParams.set("state", state);
@@ -694,8 +768,8 @@ export function createGateway({
         return finish(Response.redirect(destination, 303));
       }
       if (path === "/auth/callback" && request.method === "GET") {
-        const pending = session.pending;
-        delete session.pending;
+        const pending = session.pending?.state === url.searchParams.get("state") ? session.pending : undefined;
+        if (pending) delete session.pending;
         let error;
         if (
           !pending ||
@@ -715,7 +789,11 @@ export function createGateway({
           if (failed)
             error = "IAM could not finish sign-in. Please try a fresh code.";
           else {
-            installSlot(session, "production", slot);
+            const previous = session[session.active];
+            installSlot(session, "production", slot, pending.popupNonce ? {
+              nonce: pending.popupNonce, beforeId: previous?.contextId, beforePlane: session.active,
+              beforeActor: previous?.user?.public_id, beforeKind: previous?.user?.actor_type, beforeOrg: previous?.org,
+            } : undefined);
           }
         }
         const destination = new URL("/", origin);
