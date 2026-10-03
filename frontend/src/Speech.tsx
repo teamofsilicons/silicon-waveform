@@ -241,7 +241,7 @@ export default function Speech(props: {
   return (
     <>
       <Heading
-        eyebrow="SPEECH WORKSPACE"
+        eyebrow="Create with Waveform"
         title={props.operation === "tts" ? "Text to speech" : "Speech to text"}
       >
         {props.operation === "tts"
@@ -262,9 +262,6 @@ export default function Speech(props: {
           <form onSubmit={submit}>
             <div class="panel-heading">
               <h2>{props.operation === "tts" ? "Your text" : "Your audio"}</h2>
-              <span class="mono muted">
-                {props.operation === "tts" ? "01 / COMPOSE" : "01 / SOURCE"}
-              </span>
             </div>
             <Show
               when={props.operation === "tts"}
@@ -363,54 +360,6 @@ export default function Speech(props: {
                 </Show>
               </div>
             </Show>
-            <Show when={props.operation === "tts" && selectedProvider()}>
-              <Show
-                when={!autoFallback()}
-                fallback={
-                  <p class="provider-controls-note hint">
-                    Automatic fallback is on. Provider voice controls are
-                    unavailable because each provider handles them differently.
-                    Your voice profile is used across providers.
-                  </p>
-                }
-              >
-                <ProviderControls
-                  provider={selectedProvider()}
-                  options={providerOptions()}
-                  change={setProviderOptions}
-                  disabled={busy()}
-                />
-              </Show>
-            </Show>
-            <Show when={session()?.authenticated && selectedProvider()}>
-              <details class="request-key">
-                <summary>
-                  Use your own API key for this request{" "}
-                  <span class="label-note">optional</span>
-                </summary>
-                <label>
-                  {providerNames[selectedProvider()]} API key
-                  <input
-                    type="password"
-                    autocomplete="off"
-                    spellcheck={false}
-                    value={requestKey()}
-                    onInput={(e) => setRequestKey(e.currentTarget.value)}
-                    maxlength={16384}
-                    disabled={busy()}
-                    placeholder="Use a saved key or Waveform’s shared key"
-                  />
-                </label>
-                <p class="hint">
-                  Used only for {providerNames[selectedProvider()]} on this
-                  request and cleared after you submit. Leave blank to use your
-                  saved key, or Waveform’s shared key if none is saved.{" "}
-                  <a class="text-link" href="#settings">
-                    Manage saved keys
-                  </a>
-                </p>
-              </details>
-            </Show>
             <Show when={needsStorage()}>
               <StorageConsent
                 cancel={cancelStorage}
@@ -462,6 +411,7 @@ export default function Speech(props: {
               </span>
               <button
                 class="button primary"
+                aria-busy={busy()}
                 disabled={
                   busy() ||
                   (props.operation === "tts"
@@ -478,6 +428,54 @@ export default function Speech(props: {
                 <Icon name="arrow" />
               </button>
             </div>
+            <Show when={props.operation === "tts" && selectedProvider()}>
+              <Show
+                when={!autoFallback()}
+                fallback={
+                  <p class="provider-controls-note hint">
+                    Automatic fallback is on. Provider voice controls are
+                    unavailable because each provider handles them differently.
+                    Your voice profile is used across providers.
+                  </p>
+                }
+              >
+                <ProviderControls
+                  provider={selectedProvider()}
+                  options={providerOptions()}
+                  change={setProviderOptions}
+                  disabled={busy()}
+                />
+              </Show>
+            </Show>
+            <Show when={session()?.authenticated && selectedProvider()}>
+              <details class="request-key">
+                <summary>
+                  Use your own API key for this request{" "}
+                  <span class="label-note">optional</span>
+                </summary>
+                <label>
+                  {providerNames[selectedProvider()]} API key
+                  <input
+                    type="password"
+                    autocomplete="off"
+                    spellcheck={false}
+                    value={requestKey()}
+                    onInput={(e) => setRequestKey(e.currentTarget.value)}
+                    maxlength={16384}
+                    disabled={busy()}
+                    placeholder="Use a saved key or Waveform’s shared key"
+                  />
+                </label>
+                <p class="hint">
+                  Used only for {providerNames[selectedProvider()]} on this
+                  request and cleared after you submit. Leave blank to use your
+                  saved key, or Waveform’s shared key if none is saved.{" "}
+                  <a class="text-link" href="#settings">
+                    Manage saved keys
+                  </a>
+                </p>
+              </details>
+            </Show>
             <Show when={requestId()}>
               <p class="request-foot mono">Request {requestId()}</p>
             </Show>
@@ -557,7 +555,6 @@ export default function Speech(props: {
           <h2>
             {props.operation === "tts" ? "Generated audio" : "Transcript"}
           </h2>
-          <span class="mono muted">02 / RESULT</span>
         </div>
         <Show
           when={result()}

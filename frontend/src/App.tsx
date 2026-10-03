@@ -255,6 +255,14 @@ export default function App() {
                 {session()?.authenticated ? "Sign out" : "Sign in"}
               </button>
             </div>
+            <Show when={session()?.authenticated}>
+              <button class="mobile-context" aria-label="Change account or organization" onClick={() => setMenu(!menu())} aria-expanded={menu()}>
+                <span class="mobile-context-label">Workspace</span>
+                <strong>{session()?.org}</strong>
+                <span class="mobile-context-actor">{session()?.user?.public_id}</span>
+                <Icon name="down" size={14} />
+              </button>
+            </Show>
           </header>
           <Show when={session()?.plane === "test"}>
             <div class="testing-banner" role="status">

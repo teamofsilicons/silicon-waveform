@@ -63,6 +63,7 @@ export default function Settings(props: {
       });
       await refetch();
       setVoice();
+      setTelemetry();
       setTts();
       setStt();
       setPreferencesVersion((v) => v + 1);
@@ -118,19 +119,11 @@ export default function Settings(props: {
         Your providers. Your preferred order.
       </Heading>
       <Notice error={error() || prefs.error || keys.error} message={notice()} />
-      <div class="actions">
+      <div class="actions settings-actions">
         <button class="button" onClick={props.connect}>
           Use a test app_secret
         </button>
       </div>
-      <label>
-        <input
-          type="checkbox"
-          checked={telemetry() ?? prefs()?.telemetry_enabled ?? true}
-          onChange={(e) => setTelemetry(e.currentTarget.checked)}
-        />{" "}
-        Send diagnostic events to Space Station (save preferences to apply)
-      </label>
 
       <Show
         when={session()?.authenticated}
@@ -199,24 +192,35 @@ export default function Settings(props: {
               </div>
             </div>
             <div class="panel-footer">
-              <button
-                class="button"
-                disabled={busy()}
-                onClick={() => {
-                  setVoice(prefs()!.defaults.voice_profile);
-                  setTts([...prefs()!.defaults.tts_order]);
-                  setStt([...prefs()!.defaults.stt_order]);
-                }}
-              >
-                Use workspace defaults
-              </button>
-              <button
-                class="button primary"
-                disabled={busy() || (!tts() && !stt() && !voice())}
-                onClick={() => void save()}
-              >
-                {busy() ? "Saving…" : "Save preferences"}
-              </button>
+              <label class="check-label telemetry-setting">
+                <input
+                  type="checkbox"
+                  checked={telemetry() ?? prefs()?.telemetry_enabled ?? true}
+                  onChange={(e) => setTelemetry(e.currentTarget.checked)}
+                  disabled={busy()}
+                />
+                Send diagnostic events to Space Station
+              </label>
+              <div class="actions">
+                <button
+                  class="button"
+                  disabled={busy()}
+                  onClick={() => {
+                    setVoice(prefs()!.defaults.voice_profile);
+                    setTts([...prefs()!.defaults.tts_order]);
+                    setStt([...prefs()!.defaults.stt_order]);
+                  }}
+                >
+                  Use workspace defaults
+                </button>
+                <button
+                  class="button primary"
+                  disabled={busy() || (!tts() && !stt() && !voice() && telemetry() === undefined)}
+                  onClick={() => void save()}
+                >
+                  {busy() ? "Saving…" : "Save preferences"}
+                </button>
+              </div>
             </div>
           </section>
         </Show>
