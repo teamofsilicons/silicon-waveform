@@ -370,7 +370,7 @@ export function createGateway({
     }
     return response;
   }
-  async function login(session, slot, slt) {
+  async function login(session, slot, slt, expectedKind) {
     if (
       typeof slt !== "string" ||
       !(slot.key
@@ -399,9 +399,37 @@ export function createGateway({
     if (!me.ok) return me;
     slot.user = await me.json();
     if (!identity(slot.user)) throw new Error("Invalid account response");
+    if (expectedKind && slot.user.actor_type !== expectedKind) {
+      clearSlot(slot);
+      return failure("identity_kind_mismatch", "Choose the same account type you selected in Waveform.", 403);
+    }
     slot.org = slot.user.org_id;
     slot.contextId = id();
     delete session.loginAttempt;
+    return null;
+  }
+  const popupLocation = (nonce, success) => {
+    const target = new URL("/", origin);
+    target.searchParams.set("iam_popup", "complete");
+    target.searchParams.set("nonce", nonce);
+    target.searchParams.set("result", success ? "ok" : "error");
+    return target.href;
+  };
+  const storageContext = (session, pending) => {
+    const slot = session[session.active];
+    return pending && pending.until > Date.now() && pending.context === session.context && pending.plane === session.active && pending.org === slot?.org && pending.actor === slot?.user?.public_id && pending.kind === slot?.user?.actor_type && !!slot.access;
+  };
+  async function completeStorage(session, pending) {
+    const response = await authorized(`/api/v1/storage-authorizations/${pending.authorizationId}/complete`, session, session[session.active], "POST", { code: pending.code, state: pending.state });
+    if (!response.ok) {
+      if (response.status === 412) delete session.storagePending;
+      return response;
+    }
+    const value = await response.json();
+    if (value.authorization_id !== pending.authorizationId || value.state !== pending.state)
+      return failure("invalid_approval", "The approval response did not match this request.", 502);
+    if (value.status !== "completed") return failure("approval_pending", "Approval could not be completed.", 409);
+    delete session.storagePending;
     return null;
   }
   const snapshot = (s) => ({
@@ -580,9 +608,59 @@ export function createGateway({
         }
         return finish(json(snapshot(session)));
       }
+      if (path === "/api/session/storage/start" && request.method === "POST") {
+        const slot = session[session.active];
+        if (!slot?.access || !identity(slot.user)) return finish(failure("sign_in_required", "Sign in to approve Briefcase access.", 401));
+        if (!/^[a-f0-9]{64}$/.test(body.popup_nonce || "")) return finish(failure("invalid_popup", "Start approval from Waveform."));
+        let pending = session.storagePending;
+        if (storageContext(session, pending)) {
+          pending.popupNonce = body.popup_nonce;
+          if (pending.code) {
+            const failed = await completeStorage(session, pending);
+            if (failed) return finish(failed);
+            return finish(json({ redirect_url: popupLocation(body.popup_nonce, true) }));
+          }
+        } else {
+          const response = await authorized("/api/v1/storage-authorizations", session, slot, "POST", { redirect_uri: new URL("/auth/storage/callback", origin).href }, { "idempotency-key": body.popup_nonce });
+          if (!response.ok) return finish(response);
+          const value = await response.json();
+          if (typeof value.authorization_id !== "string" || !/^[a-f0-9-]{36}$/.test(value.authorization_id) || typeof value.state !== "string" || typeof value.consent_url !== "string") return finish(failure("invalid_approval", "IAM returned an invalid approval request.", 502));
+          const consent = new URL(value.consent_url);
+          if (!(consent.protocol === "https:" || (consent.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(consent.hostname))) || consent.username || consent.password || consent.hash) return finish(failure("invalid_approval", "IAM returned an invalid approval address.", 502));
+          const iamIds = consent.searchParams.getAll("request");
+          if (consent.origin !== new URL(iam).origin || consent.pathname !== "/obo/consent" || iamIds.length !== 1 || !/^[a-f0-9-]{36}$/.test(iamIds[0])) return finish(failure("invalid_approval", "IAM returned an unexpected approval page.", 502));
+          consent.searchParams.set("display", "popup");
+          pending = { authorizationId: value.authorization_id, iamAuthorizationId: iamIds[0], state: value.state, consentUrl: consent.href, context: session.context, plane: session.active, org: slot.org, actor: slot.user.public_id, kind: slot.user.actor_type, popupNonce: body.popup_nonce, until: Math.min(Date.now() + 600_000, Date.parse(value.expires_at)) };
+          if (!Number.isFinite(pending.until) || pending.until <= Date.now()) return finish(failure("invalid_approval", "IAM returned an invalid expiry.", 502));
+          session.storagePending = pending;
+        }
+        return finish(json({ redirect_url: pending.consentUrl }));
+      }
+      if (path === "/auth/storage/callback" && request.method === "GET") {
+        const pending = session.storagePending;
+        if (!storageContext(session, pending) || pending.state !== url.searchParams.get("state") || pending.iamAuthorizationId !== url.searchParams.get("authorization_id")) return finish(failure("approval_expired", "This approval no longer belongs to the current workspace. Return to Waveform and start again.", 403));
+        const code = url.searchParams.get("code");
+        if (url.searchParams.get("error") || !code || !/^obc_[!-~]{1,16380}$/.test(code)) {
+          delete session.storagePending;
+          return finish(Response.redirect(popupLocation(pending.popupNonce, false), 303));
+        }
+        // Save the one-use code before exchange so a transient failure can retry
+        // the same durable backend operation without asking for another grant.
+        if (pending.code && pending.code !== code) return finish(failure("approval_code_changed", "Retry the original approval callback.", 409));
+        pending.code = code;
+        persist(session);
+        let success = false;
+        try { success = !(await completeStorage(session, pending)); } catch { /* Keep the encrypted retry receipt after a transport failure. */ }
+        return finish(Response.redirect(popupLocation(pending.popupNonce, success), 303));
+      }
       if (path === "/auth/start" && request.method === "GET") {
+        const identityKind = url.searchParams.get("identity_kind");
+        const popupNonce = url.searchParams.get("popup_nonce");
+        if ((identityKind && !["carbon", "silicon"].includes(identityKind)) ||
+            (popupNonce && (!identityKind || !/^[a-f0-9]{64}$/.test(popupNonce))))
+          return finish(failure("invalid_login", "Choose Carbon or Silicon to sign in."));
         const state = id();
-        session.pending = { state, until: Date.now() + 600_000 };
+        session.pending = { state, identityKind, popupNonce, until: Date.now() + 600_000 };
         const callback = new URL("/auth/callback", origin);
         callback.searchParams.set("state", state);
         const destination = new URL(
@@ -590,13 +668,14 @@ export function createGateway({
           iam,
         );
         destination.searchParams.set("app_id", appId);
+        if (identityKind) destination.searchParams.set("identity_kind", identityKind);
+        if (popupNonce) destination.searchParams.set("display", "popup");
         // IAM chooses one account and organization; verify that exact authority.
         destination.searchParams.set("redirect_uri", callback.href);
         return finish(Response.redirect(destination, 303));
       }
       if (path === "/auth/callback" && request.method === "GET") {
         const pending = session.pending;
-        delete session.pending;
         let error;
         if (
           !pending ||
@@ -605,20 +684,37 @@ export function createGateway({
         )
           error = "Sign-in expired. Please start again.";
         else {
-          const slot = {};
-          const failed = await login(
-            session,
-            slot,
-            url.searchParams.get("slt"),
-          );
-          if (failed)
-            error = "IAM could not finish sign-in. Please try a fresh code.";
-          else {
-            installSlot(session, "production", slot);
+          const slt = url.searchParams.get("slt");
+          const fingerprint = createHash("sha256").update(slt || "").digest("hex");
+          if (pending.fingerprint && pending.fingerprint !== fingerprint)
+            return finish(failure("login_code_changed", "Retry the original sign-in callback.", 409));
+          pending.fingerprint = fingerprint;
+          persist(session);
+          if (pending.completedContext) {
+            if (pending.completedContext !== session.context || !session.production?.access)
+              error = "This sign-in is no longer active. Please start again.";
+          } else {
+            const slot = {};
+            let failed;
+            try { failed = await login(session, slot, slt, pending.identityKind); }
+            catch { failed = failure("sign_in_unavailable", "Sign-in is temporarily unavailable.", 503); }
+            if (failed && (failed.status >= 500 || failed.status === 429))
+              return finish(new Response('<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Retry Waveform sign-in</title><main><h1>Sign-in was interrupted</h1><p>Your original sign-in is still saved. Try again to finish it safely.</p><a href="">Retry sign-in</a></main></html>', {status:503,headers:{"content-type":"text/html; charset=utf-8"}}));
+            if (failed) {
+              delete session.pending;
+              error = "IAM could not finish sign-in. Please try a fresh code.";
+            } else {
+              installSlot(session, "production", slot);
+              pending.completedContext = session.context;
+            }
           }
         }
         const destination = new URL("/", origin);
-        if (error) destination.searchParams.set("auth_error", error);
+        if (pending?.popupNonce) {
+          destination.searchParams.set("iam_popup", "complete");
+          destination.searchParams.set("nonce", pending.popupNonce);
+          destination.searchParams.set("result", error ? "error" : "ok");
+        } else if (error) destination.searchParams.set("auth_error", error);
         return finish(Response.redirect(destination, 303));
       }
       if (path === "/api/session/login" && request.method === "POST") {

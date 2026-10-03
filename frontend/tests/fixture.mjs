@@ -95,7 +95,7 @@ export function fixture() {
     if (!headers.has("authorization")) return error("sign_in_required", 401);
     if (path === "/api/v1/storage-authorizations" && method === "POST") {
       const id = randomUUID();
-      const entry = {authorization_id:id,consent_url:"https://iam.example/obo/consent?request="+id,state:"fixture-state",status:"pending",expires_at:new Date(Date.now()+600000).toISOString()};
+      const entry = {authorization_id:id,consent_url:"https://auth.iam.teamofsilicons.com/obo/consent?request="+id,state:"fixture-state",status:"pending",expires_at:new Date(Date.now()+600000).toISOString()};
       p.storage.set(id,entry); return Response.json(entry);
     }
     const storage = path.match(/^\/api\/v1\/storage-authorizations\/([^/]+)(\/complete)?$/);

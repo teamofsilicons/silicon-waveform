@@ -142,7 +142,9 @@ fn mutation(key: &str) -> Result<Mutation, ControlError> {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Start {}
+pub(super) struct Start {
+    redirect_uri: Option<String>,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Complete {
@@ -169,9 +171,24 @@ fn response(row: &sqlx::postgres::PgRow, vault: &Vault) -> Result<Response, Cont
 pub(super) async fn start(
     State(state): State<Arc<ControlState>>,
     headers: HeaderMap,
-    Json(_): Json<Start>,
+    Json(input): Json<Start>,
 ) -> Result<Response, ControlError> {
     let identity = state.identity(&headers).await?;
+    if let Some(uri) = input.redirect_uri.as_deref() {
+        let url =
+            url::Url::parse(uri).map_err(|_| ControlError::bad_request("invalid_redirect_uri"))?;
+        if uri.len() > 2048
+            || url.as_str() != uri
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || !(url.scheme() == "https"
+                || (url.scheme() == "http"
+                    && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))))
+        {
+            return Err(ControlError::bad_request("invalid_redirect_uri"));
+        }
+    }
     let vault = state.vault()?;
     let key = super::single_header(&headers, "idempotency-key")?
         .ok_or_else(|| ControlError::bad_request("idempotency_key_required"))?;
@@ -188,8 +205,8 @@ pub(super) async fn start(
                 endpoint_id: (*endpoint).to_owned(),
             })
             .collect(),
-        redirect_uri: None,
-        state: None,
+        state: input.redirect_uri.as_ref().map(|_| correlation.clone()),
+        redirect_uri: input.redirect_uri,
     };
     let plain = zeroize::Zeroizing::new(
         serde_json::to_string(&body)
