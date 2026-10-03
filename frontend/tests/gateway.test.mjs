@@ -634,3 +634,89 @@ test("approval completion checks its exact receipt and changed graphs require a 
   assert.notEqual(starts[1], starts[0]);
   assert.equal((await (await s.call("/api/session")).json()).authenticated, true);
 });
+
+test("nonce cancellation rejects a delayed login start and prevents a pending callback exchange", async () => {
+  const s = setup(); await s.login();
+  const before = await (await s.call("/api/session")).json(), nonce = "1".repeat(64);
+  const started = await s.call(`/auth/start?identity_kind=carbon&popup_nonce=${nonce}`);
+  const callback = new URL(new URL(started.headers.get("location")).searchParams.get("redirect_uri")); callback.searchParams.set("slt","oac_waveform_ui_fixture");
+  await s.call("/auth/cancel", {nonce});
+  const count = s.fake.requests.length;
+  await s.call(callback.pathname + callback.search);
+  assert.equal(s.fake.requests.length,count);
+  assert.equal((await s.call(`/auth/start?identity_kind=carbon&popup_nonce=${nonce}`)).status,409);
+  assert.equal((await (await s.call("/api/session")).json()).context,before.context);
+});
+
+test("cancel queued behind a callback restores the previous account and never resurrects after logout", async () => {
+  const fake = fixture(); let account = "c:first", block = false, entered, release;
+  const enteredPromise = new Promise(done => { entered = done; });
+  const s = setup({fetcher: async (url, options) => {
+    const path = new URL(url).pathname;
+    if (path.endsWith("/login") && block) { entered(); await new Promise(done => { release = done; }); }
+    const response = await fake.fetcher(url,options);
+    if (path.endsWith("/me")) return Response.json({...await response.json(), public_id:account});
+    return response;
+  }});
+  const before = await (await s.login()).json();
+  const nonce = "2".repeat(64), started = await s.call(`/auth/start?identity_kind=carbon&popup_nonce=${nonce}`);
+  const callback = new URL(new URL(started.headers.get("location")).searchParams.get("redirect_uri")); callback.searchParams.set("slt","oac_waveform_ui_fixture");
+  account="c:second"; block=true;
+  const finishing = s.call(callback.pathname+callback.search); await enteredPromise;
+  const cancelling = s.call("/auth/cancel",{nonce}); release(); await finishing;
+  const restored = await (await cancelling).json();
+  assert.equal(restored.user.public_id,before.user.public_id);
+  assert.ok(restored.contexts.some(value=>value.user.public_id==="c:second"));
+  await s.call("/api/session/logout",{});
+  assert.equal((await (await s.call("/auth/cancel",{nonce})).json()).authenticated,false);
+});
+
+test("manual storage review needs no popup and cancellation retains the request while fencing late callbacks", async () => {
+  const s=setup(); await s.login();
+  const nonce="3".repeat(64), body={review_nonce:nonce};
+  const review=await (await s.call("/api/session/storage/start",body)).json();
+  assert.equal(review.manual,true);
+  assert.deepEqual(s.fake.requests.find(r=>r.path==="/api/v1/storage-authorizations").body,{});
+  await s.call("/api/session/storage/cancel",body);
+  assert.equal((await s.call("/api/session/storage/start",body)).status,409);
+  assert.equal((await s.call("/auth/storage/callback?state=fixture-state&code=obc_fixture")).status,403);
+  const resumed=await (await s.call("/api/session/storage/start",{review_nonce:"4".repeat(64)})).json();
+  assert.equal(resumed.authorization_id,review.authorization_id);
+  assert.equal(s.fake.requests.filter(r=>r.path==="/api/v1/storage-authorizations").length,1);
+  await s.call("/api/session/storage/cancel",body); // A delayed old cancellation cannot cancel the resumed review.
+  const complete={authorization_id:review.authorization_id,state:review.state,code:"obc_fixture"};
+  assert.equal((await s.call("/api/session/storage/complete",{...complete,state:"wrong"})).status,403);
+  const done=await(await s.call("/api/session/storage/complete",complete)).json(); assert.equal(done.status,"completed");
+  await s.call("/api/session/storage/cancel",{review_nonce:"4".repeat(64)});
+  assert.equal((await(await s.call("/api/session/storage/status",complete)).json()).status,"completed");
+  assert.equal(s.fake.requests.some(r=>r.path==="/api/v1/tts"||r.path.endsWith("/revoke")),false);
+});
+
+test("a late cancelled callback cannot consume the newer pending sign-in", async () => {
+  const s=setup(); await s.login();
+  const old=await s.call(`/auth/start?identity_kind=carbon&popup_nonce=${"5".repeat(64)}`);
+  const oldCallback=new URL(new URL(old.headers.get("location")).searchParams.get("redirect_uri")); oldCallback.searchParams.set("slt","oac_waveform_ui_fixture");
+  await s.call("/auth/cancel",{nonce:"5".repeat(64)});
+  const fresh=await s.call(`/auth/start?identity_kind=carbon&popup_nonce=${"6".repeat(64)}`);
+  const nextCallback=new URL(new URL(fresh.headers.get("location")).searchParams.get("redirect_uri")); nextCallback.searchParams.set("slt","oac_waveform_ui_fixture");
+  const count=s.fake.requests.length;
+  await s.call(oldCallback.pathname+oldCallback.search);
+  assert.equal(s.fake.requests.length,count);
+  const result=await s.call(nextCallback.pathname+nextCallback.search);
+  const target=new URL(result.headers.get("location"));
+  assert.equal(target.searchParams.get("nonce"),"6".repeat(64));
+  assert.equal(target.searchParams.get("result"),"ok");
+});
+
+test("declined manual authorization allows an explicit fresh review without changing ordinary login", async () => {
+  const fake=fixture(); let declined=true;
+  const s=setup({fetcher:async(url,options)=>new URL(url).pathname.endsWith("/complete")&&declined ? Response.json({error:{code:"invalid_storage_authorization"}},{status:400}) : fake.fetcher(url,options)});
+  const before=await(await s.login()).json();
+  const first=await(await s.call("/api/session/storage/start",{review_nonce:"7".repeat(64)})).json();
+  assert.equal((await s.call("/api/session/storage/complete",{authorization_id:first.authorization_id,state:first.state,code:"obc_fixture"})).status,400);
+  declined=false;
+  const next=await(await s.call("/api/session/storage/start",{review_nonce:"8".repeat(64)})).json();
+  assert.notEqual(first.authorization_id,next.authorization_id);
+  const current=await(await s.call("/api/session")).json();assert.equal(current.context,before.context);assert.deepEqual(current.user,before.user);
+  assert.equal(fake.requests.some(r=>r.path==="/api/v1/tts"||r.path.endsWith("/revoke")),false);
+});

@@ -709,3 +709,48 @@ test("pre-migration persisted credentials cannot be assigned an inferred context
   assert.equal(result.authenticated, false);
   assert.equal(result.contexts.length, 0);
 });
+
+test("manual code retry and cancellation fences survive gateway restart without creating a new request", async t => {
+  let fail=true; const attempts=[];
+  const s=setup(t,fetcher=>async(url,init)=>{
+    if(new URL(url).pathname.endsWith("/complete")) {
+      attempts.push({key:init.headers.get("idempotency-key"),body:init.body,authority:init.headers.get("authorization")});
+      if(fail) return Response.json({error:{code:"temporary"}},{status:503});
+    }
+    return fetcher(url,init);
+  });
+  await s.login();
+  const cancelled="a".repeat(64);
+  await s.call("/api/session/storage/cancel",{review_nonce:cancelled});
+  await s.call("/auth/cancel",{nonce:cancelled});
+  s.restart();
+  assert.equal((await s.call("/api/session/storage/start",{review_nonce:cancelled})).status,409);
+  assert.equal((await s.call(`/auth/start?identity_kind=carbon&popup_nonce=${cancelled}`)).status,409);
+  const review=await(await s.call("/api/session/storage/start",{review_nonce:"b".repeat(64)})).json();
+  assert.equal(review.manual,true);
+  const bound={authorization_id:review.authorization_id,state:review.state};
+  assert.equal((await s.call("/api/session/storage/complete",{...bound,code:"obc_fixture"})).status,503);
+  s.restart(); fail=false;
+  assert.equal((await s.call("/api/session/storage/complete",{...bound,code:"obc_other"})).status,409);
+  const result=await(await s.call("/api/session/storage/complete",bound)).json();
+  assert.equal(result.status,"completed");
+  assert.deepEqual(attempts[1],attempts[0]);
+  assert.equal(s.fake.requests.filter(r=>r.path==="/api/v1/storage-authorizations").length,1);
+  s.restart();
+  assert.equal((await(await s.call("/api/session/storage/status",bound)).json()).status,"completed");
+  assert.equal(s.stored()[0].production.storageCompleted.code,undefined);
+  assert.equal((await s.call("/api/session/storage/complete",{...bound,code:"obc_fixture"})).status,200);
+  assert.equal((await s.call("/api/session/storage/complete",bound)).status,200);
+  assert.equal((await s.call("/api/session/storage/complete",{...bound,code:"obc_changed"})).status,409);
+  assert.equal(attempts.length,2);
+  // The response was lost, then the user paused/unmounted and resumed with the exact UI receipt.
+  await s.call("/api/session/storage/cancel",{review_nonce:"b".repeat(64)});
+  s.restart();
+  const resumed=await(await s.call("/api/session/storage/start",{...bound,review_nonce:"c".repeat(64)})).json();
+  assert.equal(resumed.status,"completed"); assert.equal(resumed.authorization_id,review.authorization_id);
+  assert.equal(s.fake.requests.filter(r=>r.path==="/api/v1/storage-authorizations").length,1);
+  // An explicit new operation without that receipt must not inherit old completed authority.
+  const fresh=await(await s.call("/api/session/storage/start",{review_nonce:"d".repeat(64)})).json();
+  assert.equal(fresh.status,"pending"); assert.notEqual(fresh.authorization_id,review.authorization_id);
+  assert.equal(s.fake.requests.some(r=>r.path==="/api/v1/tts"||r.path.endsWith("/revoke")),false);
+});

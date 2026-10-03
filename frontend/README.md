@@ -30,6 +30,14 @@ entry so production IAM credentials cannot cross into a test plane. No
 organization field is shown in either login screen. Organization headers on
 subsequent API requests identify the active workspace; they do not scope login.
 
+Ordinary Carbon/Silicon popup sign-in always keeps Close and the full-page
+fallback usable. Cancelling invalidates only that attempt; a failed cancellation
+is retried before another handoff, and late callbacks cannot replace the selected
+workspace. Briefcase approval also offers manual review and one-use code entry.
+The gateway retains the same encrypted request and completion key across retries
+and restarts. Pausing review preserves the original speech request and draft;
+resuming approval never starts speech until **Retry original request** is chosen.
+
 ## Features
 
 | Screen               | Supported operations                                                                                                                                                                                              |
