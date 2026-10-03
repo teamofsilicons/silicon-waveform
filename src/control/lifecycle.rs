@@ -148,7 +148,7 @@ pub(super) async fn apply(
     }
     if !matches!(
         op.action.as_str(),
-        "prepare" | "rotate-key" | "clean" | "disable" | "restore" | "purge"
+        "prepare" | "import" | "rotate-key" | "clean" | "disable" | "restore" | "purge"
     ) {
         return Err(ControlError::bad_request("unsupported_lifecycle_action"));
     }
@@ -205,7 +205,7 @@ pub(super) async fn apply(
         {
             return Err(conflict());
         }
-    } else if op.action != "prepare" {
+    } else if !matches!(op.action.as_str(), "prepare" | "import") {
         return Err(conflict());
     }
     let bound_org: Option<String> =

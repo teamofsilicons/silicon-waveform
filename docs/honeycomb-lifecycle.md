@@ -34,9 +34,13 @@ Authorization: Bearer <dedicated service credential>
 }
 ```
 
-Actions: `prepare`, `rotate-key`, `clean`, `disable`, `restore`, `purge`. The body
+Actions: `prepare`, `import`, `rotate-key`, `clean`, `disable`, `restore`, `purge`. The body
 also accepts the coordinator’s `testing_key`, `reason` and `retired_apps` fields;
-unknown actions fail explicitly. Preparation records the participant binding;
+unknown actions fail explicitly. Honeycomb sends `import` when it adds an
+application to an existing shared world. Both `prepare` and `import` establish
+the participant binding; a later import requires an advancing revision and
+preserves existing test data. Their original action remains part of the replay
+hash, so changing `import` to `prepare` cannot replay the same operation.
 IAM-validated discovery initializes the empty runtime plane and voice defaults.
 Key rotation supplies `testing_key` so webhook matching uses the new key digest.
 The root key itself is not retained by this participant endpoint.
