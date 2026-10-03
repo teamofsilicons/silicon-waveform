@@ -77,6 +77,59 @@ function setup(t, wrap = (fetcher) => fetcher) {
   return { call, login, restart, stored, directory, fake };
 }
 
+test("an uncertain approval start reuses its authority and operation after restart", async (t) => {
+  let loseResponse = true, retainedResponse;
+  const attempts = [];
+  const s = setup(t, (fetcher) => async (url, init) => {
+    if (new URL(url).pathname === "/api/v1/storage-authorizations") {
+      attempts.push({ key: init.headers.get("idempotency-key"), authority: init.headers.get("authorization"), body: init.body });
+      retainedResponse ||= await (await fetcher(url, init)).json();
+      if (loseResponse) throw new Error("Approval started but its response was lost");
+      return Response.json(retainedResponse);
+    }
+    return fetcher(url, init);
+  });
+  await s.login();
+  assert.equal((await s.call("/api/session/storage/start", { popup_nonce: "a".repeat(64) })).status, 502);
+  assert.ok(s.stored()[0].production.storagePending.startKey);
+  s.restart();
+  loseResponse = false;
+  assert.equal((await s.call("/api/session/storage/start", { popup_nonce: "b".repeat(64) })).status, 200);
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts[1], attempts[0]);
+  assert.equal(s.fake.requests.filter(r => r.path === "/api/v1/storage-authorizations").length, 1);
+  const callback = await s.call("/auth/storage/callback?state=fixture-state&code=obc_fixture");
+  assert.equal(new URL(callback.headers.get("location")).searchParams.get("result"), "ok");
+  assert.equal(s.stored()[0].production.storagePending, undefined);
+});
+
+test("an uncertain approval completion retains its encrypted original code after restart", async (t) => {
+  let loseResponse = true;
+  const attempts = [];
+  const s = setup(t, (fetcher) => async (url, init) => {
+    if (new URL(url).pathname.endsWith("/complete")) {
+      attempts.push({ url: String(url), key: init.headers.get("idempotency-key"), body: init.body });
+      const response = await fetcher(url, init);
+      if (loseResponse) throw new Error("Completion response lost");
+      return response;
+    }
+    return fetcher(url, init);
+  });
+  await s.login();
+  await s.call("/api/session/storage/start", { popup_nonce: "c".repeat(64) });
+  const failed = await s.call("/auth/storage/callback?state=fixture-state&code=obc_fixture");
+  assert.equal(new URL(failed.headers.get("location")).searchParams.get("result"), "error");
+  assert.equal(s.stored()[0].production.storagePending.code, "obc_fixture");
+  assert.doesNotMatch(readFileSync(join(s.directory, "sessions.sqlite")).toString("latin1"), /obc_fixture|oat_production/);
+  s.restart();
+  loseResponse = false;
+  const retry = await (await s.call("/api/session/storage/start", { popup_nonce: "d".repeat(64) })).json();
+  assert.equal(new URL(retry.redirect_url).searchParams.get("result"), "ok");
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts[1], attempts[0]);
+  assert.equal(s.stored()[0].production.storagePending, undefined);
+});
+
 test("encrypted browser login survives restart and days of inactivity, while logout remains removed", async (t) => {
   let now = Date.now();
   t.mock.method(Date, "now", () => now);

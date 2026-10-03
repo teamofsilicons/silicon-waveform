@@ -83,10 +83,21 @@ async fn feature_consent_is_bound_encrypted_replayable_and_refreshes_without_log
         "POST",
         "/api/v1/storage-authorizations",
         "tos",
-        json!({}),
+        json!({"redirect_uri":"https://waveform.example/auth/storage/callback"}),
     )
     .await?;
     assert_eq!(status, StatusCode::OK, "{started}");
+    let requests = iam.received_requests().await.ok_or("IAM requests")?;
+    let authorization = requests
+        .iter()
+        .find(|r| r.url.path() == "/api/v1/obo-access/authorizations")
+        .ok_or("authorization request")?;
+    let forwarded: Value = serde_json::from_slice(&authorization.body)?;
+    assert_eq!(
+        forwarded["redirect_uri"],
+        "https://waveform.example/auth/storage/callback"
+    );
+    assert_eq!(forwarded["state"], started["state"]);
     assert_eq!(
         call(
             &app,

@@ -9,6 +9,7 @@ import {
 import {
   acceptSession,
   api,
+  bindApi,
   recordEvent,
   contextVersion,
   session,
@@ -17,6 +18,7 @@ import {
 } from "./api";
 import { Brand, Heading, Icon, Modal, Notice } from "./ui";
 import Speech from "./Speech";
+import { completeIamPopup, openIamPopup, type IdentityKind } from "./iam-popup";
 import History from "./History";
 import Settings from "./Settings";
 import Environments from "./Environments";
@@ -53,6 +55,7 @@ export default function App() {
   });
   const initialError = new URL(location.href).searchParams.get("auth_error");
   onMount(async () => {
+    if (completeIamPopup()) return;
     const hash = () => {
       if (location.hash === "#main-content") return;
       setPage(readPage());
@@ -79,6 +82,19 @@ export default function App() {
     setOrg(session()?.org || "tos");
     setError();
     setLogin(true);
+  }
+  async function signInAs(kind: IdentityKind) {
+    const getSession = bindApi();
+    setBusy(true);
+    setError();
+    try {
+      await openIamPopup(nonce => `/auth/start?identity_kind=${kind}&popup_nonce=${nonce}`);
+      const current = await getSession<Session>("/api/session");
+      if (!current.authenticated || current.user?.actor_type !== kind) throw new Error("The selected account could not be verified. Please sign in again.");
+      acceptSession(current);
+      setLogin(false);
+    } catch (err) { setError(err); }
+    finally { setBusy(false); }
   }
   async function signIn(e: SubmitEvent) {
     e.preventDefault();
@@ -480,9 +496,10 @@ export default function App() {
                 </form>
               }
             >
-              <a class="button primary" href="/auth/start">
-                Continue with IAM <Icon name="arrow" />
-              </a>
+              <div class="stack">
+                <button class="button primary" disabled={busy()} onClick={() => void signInAs("carbon")}>Continue as Carbon <Icon name="arrow" /></button>
+                <button class="button" disabled={busy()} onClick={() => void signInAs("silicon")}>Continue as Silicon <Icon name="arrow" /></button>
+              </div>
             </Show>
             <button
               class="button"
