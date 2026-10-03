@@ -1,6 +1,6 @@
 # IAM integration
 
-> **Integration preview for Waveform 0.5.0 / IAM 5.0.0 / Briefcase 3.0.0.** These guides precede the coordinated runtime rollout. Upgrade dependent services and clients together; public documentation alone does not indicate the new runtime is live.
+> **Live integration baseline — October 3, 2026:** Waveform 0.5.0, Briefcase 3.0.0 and IAM 5.0.0 are deployed. Browser popup and expanded saved-workspace interface changes are a separate follow-up; use the API/CLI contracts below now, and check the application before relying on those interface additions.
 
 Waveform pins the official IAM 5.0.0 SDK at `f1e9c4768029aacabe337ca41be52e05023d1631` and Briefcase 3.0.0 client at `ba9e5211b2c4eebd3122f15607b28408bbe22fb6`.
 
@@ -33,3 +33,7 @@ Testing uses the selected Waveform app secret and IAM test context. An absent or
 Apply additive PostgreSQL migration `0015_storage_consent.sql` before enabling the new runtime. It stores encrypted pending authorizations and durable grants, partitioned by plane, actor, organization and endpoint. Back up the database and preserve `WAVEFORM_ENCRYPTION_KEY`. The preceding binary can run with these unused additive tables, but old OBO calls require the old coordinated IAM and Briefcase runtimes; roll the integration set back together. Do not roll back schema or delete grants as an authentication repair.
 
 Update consumers to `X-IAM-OBO-Access-Token` and request feature consent after login. An ATA verification is app authority and cannot be supplied to these OBO routes. Test both actors, cross-organization destination selection, revoked consent, expired tokens, uncertain refreshes and test-plane cleanup before publishing the application.
+
+## Browser integration follow-up
+
+The live core supports the manual-code storage flow above. The automatic popup callback and saved-context interface are under integration testing. [The application guide](build-with-iam5.md) explains the target callback, retry and account-binding pattern without treating those interface additions as already deployed.
