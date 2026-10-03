@@ -1150,6 +1150,103 @@ async fn discovered_identity_reports_permissions_and_webhooks_are_isolated() -> 
 
 #[tokio::test]
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn honeycomb_lifecycle_import_establishes_and_preserves_the_bound_plane() -> TestResult {
+    let (pool, schema) = database().await?;
+    let iam = MockServer::start().await;
+    let state = fixture(pool.clone(), &iam)?;
+    let app = router(state.clone());
+    let id = Uuid::new_v4();
+    let token = "test-only-honeycomb-service-token-123456";
+    // The real coordinator imports an app after earlier participants have advanced
+    // the shared revision. It does not send a separate prepare to that app first.
+    let mut op = json!({"operation_id":Uuid::new_v4(),"environment_id":id,"org_id":"tos","app_id":"waveform","environment_revision":6,"generation":1,"key_version":1,"action":"import","testing_key":"never-persist-this-root-key","snapshot":{"app_id":"waveform","selected_release":"0.5.1","source_revision":2},"reason":"requested","retired_apps":[]});
+    let route = |op: &Value| {
+        format!(
+            "/internal/honeycomb/organizations/tos/testing-environments/{id}/operations/{}",
+            op["operation_id"].as_str().unwrap_or_default()
+        )
+    };
+    let (status, receipt) = call(&app, "PUT", &route(&op), Some(token), op.clone()).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["state"], "completed");
+    assert_eq!(receipt["environment_revision"], 6);
+    assert_eq!(receipt["environment_id"], id.to_string());
+    assert_eq!(receipt["operation_id"], op["operation_id"]);
+    assert_eq!(
+        call(&app, "PUT", &route(&op), Some(token), op.clone())
+            .await?
+            .1,
+        receipt
+    );
+    // Keep the original action in the immutable request hash.
+    let mut changed = op.clone();
+    changed["action"] = json!("prepare");
+    assert_eq!(
+        call(&app, "PUT", &route(&changed), Some(token), changed.clone())
+            .await?
+            .0,
+        StatusCode::CONFLICT
+    );
+    changed = op.clone();
+    changed["operation_id"] = json!(Uuid::new_v4());
+    assert_eq!(
+        call(&app, "PUT", &route(&changed), Some(token), changed.clone())
+            .await?
+            .0,
+        StatusCode::CONFLICT
+    );
+    changed["environment_revision"] = json!(7);
+    changed["generation"] = json!(2);
+    assert_eq!(
+        call(&app, "PUT", &route(&changed), Some(token), changed.clone())
+            .await?
+            .0,
+        StatusCode::CONFLICT
+    );
+    let secret = format!("ask_{}", "I".repeat(43));
+    mock_discovery(&iam, id, &secret, 1, None).await;
+    drop(
+        state
+            .discover_plane(&secret)
+            .await
+            .map_err(|_| "discovery failed")?,
+    );
+    let actor = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO waveform_account_preferences(plane_id,org_id,actor_id) VALUES($1,'tos',$2)",
+    )
+    .bind(id)
+    .bind(actor)
+    .execute(&pool)
+    .await?;
+    op["operation_id"] = json!(Uuid::new_v4());
+    op["environment_revision"] = json!(7);
+    assert_eq!(
+        call(&app, "PUT", &route(&op), Some(token), op.clone())
+            .await?
+            .1["state"],
+        "completed"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM waveform_account_preferences WHERE plane_id=$1 AND actor_id=$2"
+        )
+        .bind(id)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await?,
+        1
+    );
+    assert!(state.test_fence(id).await.is_ok());
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
 #[allow(
     clippy::too_many_lines,
     clippy::unwrap_used,
