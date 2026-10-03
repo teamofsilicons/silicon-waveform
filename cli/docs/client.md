@@ -148,3 +148,7 @@ metadata; optional fields remain `None` and the options map remains empty.
 ## Reusable OBO speech
 
 An application can use `client.with_obo_token("ting", access_token)?` to replace its ordinary bearer with a reusable approved IAM graph token. Waveform verifies the endpoint on every call. The helper sends `X-App-ID` and `X-IAM-OBO-Access-Token`, preserves the selected testing environment, and sends no ordinary bearer. Never pass ATA credentials to this helper.
+
+## Capturing an IAM 5 login context
+
+After exchanging an SLT, verify `client.with_bearer(tokens.access_token.clone()).login_status().await?`, then call `status.verify_tokens(&tokens)?` before persisting credentials. Retain that public status with the independent credential family. Bind a client snapshot with `with_login_context(&status)?`: status and scoped requests must then match its canonical actor, organization and world. Clones retain their captured context. Use `status.verify_tokens(&successor)?` and `status.ensure_matches(&verified_successor_status)?` before replacing refreshed credentials. The SDK remains stateless and performs no automatic refresh, account selection or command replay.

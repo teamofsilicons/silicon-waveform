@@ -14,6 +14,7 @@ use std::{
 use thiserror::Error;
 use url::Url;
 
+mod context;
 /// Optional local Space Station integration, supported on Unix hosts only.
 #[cfg(unix)]
 pub mod telemetry;
@@ -75,7 +76,7 @@ pub struct StorageAuthorization {
 }
 
 /// Verified identity of the carbon or silicon using Waveform.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LoginActor {
     /// Carbon or silicon identity type.
     pub actor_type: silicon_iam_client::models::ApplicationAuthorizationActorType,
@@ -84,7 +85,7 @@ pub struct LoginActor {
 }
 
 /// Current authentication status, without access or refresh tokens.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LoginStatus {
     /// True only after the server verifies the selected bearer token.
     pub authenticated: bool,
@@ -403,6 +404,7 @@ pub struct Client {
     credential: Auth,
     environment: Option<TestEnvironmentKey>,
     speech_request_id: Option<uuid::Uuid>,
+    login_context: Option<LoginStatus>,
     updater: Arc<update::AutomaticUpdater>,
 }
 impl std::fmt::Debug for Auth {
@@ -450,6 +452,7 @@ impl Client {
             credential,
             environment: None,
             speech_request_id: None,
+            login_context: None,
             updater: update::AutomaticUpdater::new(update::UpdatePolicy::from_environment()),
         })
     }
@@ -501,6 +504,18 @@ impl Client {
             credential: Auth::Bearer(SecretString::from(token.into())),
             ..self.clone()
         }
+    }
+    /// Pins actor, organization and world for subsequent status and scoped requests.
+    /// Capture this from verified login status and retain it when rotating credentials.
+    pub fn with_login_context(&self, context: &LoginStatus) -> Result<Self> {
+        context.validate()?;
+        if let Some(previous) = &self.login_context {
+            previous.ensure_matches(context)?;
+        }
+        Ok(Self {
+            login_context: Some(context.clone()),
+            ..self.clone()
+        })
     }
     /// Uses a reusable IAM OBO access token for speech operations. Neither the
     /// current actor bearer nor a refresh credential is forwarded with it.
@@ -555,13 +570,18 @@ impl Client {
         &self,
         refresh_token: &str,
     ) -> Result<silicon_iam_client::models::OAuthTokenResponse> {
-        self.request(
-            Method::POST,
-            "auth/refresh",
-            Some(serde_json::json!({"refresh_token": refresh_token})),
-            None,
-        )
-        .await
+        let tokens = self
+            .request(
+                Method::POST,
+                "auth/refresh",
+                Some(serde_json::json!({"refresh_token": refresh_token})),
+                None,
+            )
+            .await?;
+        if let Some(expected) = &self.login_context {
+            expected.verify_tokens(&tokens)?;
+        }
+        Ok(tokens)
     }
 
     /// Rotates a refresh token with a retry key retained across uncertain responses.
@@ -587,7 +607,11 @@ impl Client {
         if let Some(environment) = &self.environment {
             request = request.header("x-testing-environment-key", environment.0.expose_secret());
         }
-        self.send_response(request).await
+        let tokens = self.send_response(request).await?;
+        if let Some(expected) = &self.login_context {
+            expected.verify_tokens(&tokens)?;
+        }
+        Ok(tokens)
     }
     /// Generates speech synchronously.
     pub async fn tts(
@@ -764,8 +788,16 @@ impl Client {
 
     /// Reads the authenticated actor and organization authorization.
     pub async fn me(&self) -> Result<serde_json::Value> {
-        self.request(Method::GET, "auth/me", None::<&()>, None)
-            .await
+        let value: serde_json::Value = self
+            .request(Method::GET, "auth/me", None::<&()>, None)
+            .await?;
+        if let Some(expected) = &self.login_context {
+            let authority = serde_json::from_value::<
+                silicon_iam_client::models::ApplicationAuthorization,
+            >(value.clone())?;
+            expected.ensure_matches(&LoginStatus::from_authority(authority)?)?;
+        }
+        Ok(value)
     }
 
     /// Reads public IAM metadata without requiring a login.
@@ -791,19 +823,16 @@ impl Client {
             }) => return Ok(LoginStatus::default()),
             Err(error) => return Err(error),
         };
-        Ok(LoginStatus {
-            authenticated: true,
-            actor: Some(LoginActor {
-                actor_type: authority.actor_type.ok_or_else(|| {
-                    Error::Invalid("IAM did not identify a Carbon or Silicon".into())
-                })?,
-                public_id: authority
-                    .public_id
-                    .ok_or_else(|| Error::Invalid("IAM did not return a public identity".into()))?,
-            }),
-            org_id: Some(authority.org_id),
-            testing_environment_id: authority.testing_environment_id.map(|id| id.to_string()),
-        })
+        let status = LoginStatus::from_authority(authority)?;
+        if self.environment.is_some() != status.testing_environment_id.is_some() {
+            return Err(Error::Invalid(
+                "login authority belongs to a different world".into(),
+            ));
+        }
+        if let Some(expected) = &self.login_context {
+            expected.ensure_matches(&status)?;
+        }
+        Ok(status)
     }
 
     /// Discovers the selected sandbox, without needing an organization or a login.
@@ -1012,6 +1041,7 @@ impl Client {
     }
     /// Fetches one actor-scoped job by its durable identifier.
     pub async fn job(&self, job_id: &str, organization: &str, actor: &str) -> Result<Job> {
+        self.verify_scope(organization, Some(actor))?;
         if uuid::Uuid::parse_str(job_id).is_err() || organization.is_empty() || actor.is_empty() {
             return Err(Error::Invalid(
                 "job ID, organization and actor are required".into(),
@@ -1139,6 +1169,7 @@ impl Client {
         organization: &str,
         body: Option<B>,
     ) -> Result<R> {
+        self.verify_scope(organization, None)?;
         if organization.is_empty() {
             return Err(Error::Invalid("organization is required".into()));
         }
@@ -1186,6 +1217,7 @@ impl Client {
         path: &str,
         organization: &str,
     ) -> Result<()> {
+        self.verify_scope(organization, None)?;
         if organization.is_empty() {
             return Err(Error::Invalid("organization is required".into()));
         }
@@ -1231,6 +1263,7 @@ impl Client {
         actor: &str,
         query: Vec<(&str, String)>,
     ) -> Result<R> {
+        self.verify_scope(organization, Some(actor))?;
         let mut url = self.base.clone();
         {
             let mut segments = url
@@ -1312,6 +1345,9 @@ impl Client {
         body: Option<B>,
         scope: Option<(&str, &str, &str)>,
     ) -> Result<()> {
+        if let Some((org, actor, _)) = scope {
+            self.verify_scope(org, Some(actor))?;
+        }
         let mut url = self.base.clone();
         {
             let mut segments = url
@@ -1382,6 +1418,9 @@ impl Client {
         body: Option<B>,
         scope: Option<(&str, &str, &str)>,
     ) -> Result<R> {
+        if let Some((org, actor, _)) = scope {
+            self.verify_scope(org, Some(actor))?;
+        }
         let mut url = self.base.clone();
         {
             let mut segments = url

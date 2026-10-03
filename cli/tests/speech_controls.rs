@@ -25,6 +25,8 @@ impl Home {
             .env("SILICON_HOME", &self.0)
             .env("WAVEFORM_AUTO_UPDATE", "false")
             .env_remove("WAVEFORM_TEST")
+            .env_remove("WAVEFORM_PROFILE")
+            .env_remove("SILICON_ORG")
             .args(["--url", &server.uri()])
             .args(args)
             .stdin(Stdio::piped())
@@ -50,12 +52,12 @@ impl Home {
     async fn login(&self, server: &MockServer) {
         Mock::given(method("GET")).and(path("/api/v1/auth/me"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "actor_type":"carbon", "public_id":"12345678", "organization_id":"00000000-0000-0000-0000-000000000002", "org_id":"tos", "membership_id":"12345678[tos]", "membership_version":1, "authorization_epoch":1, "audience":"waveform", "testing_environment_id":null, "scopes":[], "org_role":"member", "tags":[]
+                "actor_type":"carbon", "public_id":"c:12345678", "organization_id":"00000000-0000-0000-0000-000000000002", "org_id":"tos", "membership_id":"c:12345678[tos]", "membership_version":1, "authorization_epoch":1, "audience":"waveform", "testing_environment_id":null, "scopes":[], "org_role":"member", "tags":[]
             }))).mount(server).await;
         Mock::given(method("POST")).and(path("/api/v1/auth/login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "access_token":"oat_fixture", "refresh_token":"ort_fixture", "token_type":"Bearer",
-                "expires_in":1800,"scope":"","actor":{"principal_id":"00000000-0000-0000-0000-000000000001","type":"carbon","public_id":"12345678"}
+                "expires_in":1800,"scope":"","org_id":"tos","actor":{"principal_id":"00000000-0000-0000-0000-000000000001","type":"carbon","public_id":"c:12345678"}
             }))).expect(1).mount(server).await;
         assert!(
             self.run(server, &["login", "oac_fixture"], None)
@@ -94,7 +96,7 @@ async fn request_controls_and_keys_reach_only_the_speech_request() {
                 "--org",
                 "tos",
                 "--actor",
-                "actor",
+                "c:12345678",
                 "--provider",
                 "gemini",
                 "--provider-options",
@@ -135,7 +137,7 @@ async fn request_controls_and_keys_reach_only_the_speech_request() {
                 "--org",
                 "tos",
                 "--actor",
-                "actor",
+                "c:12345678",
                 "--provider-key-file",
                 "openai=-",
             ],
@@ -170,7 +172,7 @@ async fn saved_provider_key_supports_stdin_without_echo() {
                 "--org",
                 "tos",
                 "--actor",
-                "actor",
+                "c:12345678",
                 "gemini",
                 "--key-file",
                 "-",
@@ -231,7 +233,7 @@ async fn maximum_unicode_gemini_controls_fit_file_and_stdin_inputs() {
                     "--org",
                     "tos",
                     "--actor",
-                    "actor",
+                    "c:12345678",
                     "--provider",
                     "gemini",
                     "--provider-options-file",

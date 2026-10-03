@@ -158,3 +158,7 @@ The access token can be reused; each call is verified again and downstream
 Briefcase actions use the same approved chain. Account settings and job polling
 remain bearer-authenticated. `Auth::OnBehalfOf` exposes the same transport for
 callers constructing the client directly. Testing selection is preserved.
+
+## Capturing an IAM 5 login context
+
+After exchanging an SLT, verify `client.with_bearer(tokens.access_token.clone()).login_status().await?`, then call `status.verify_tokens(&tokens)?` before persisting credentials. Retain that public status with the independent credential family. Bind a client snapshot with `with_login_context(&status)?`: status and scoped requests must then match its canonical actor, organization and world. Clones retain their captured context. Use `status.verify_tokens(&successor)?` and `status.ensure_matches(&verified_successor_status)?` before replacing refreshed credentials. The SDK remains stateless and performs no automatic refresh, account selection or command replay.
