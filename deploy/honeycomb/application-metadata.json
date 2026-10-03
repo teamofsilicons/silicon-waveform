@@ -21,20 +21,68 @@
     ],
     "external": [
       {
-        "app_id": "tos>briefcase",
-        "endpoint_id": "briefcase.files.create"
+        "app_id": "briefcase",
+        "endpoint_id": "briefcase.uploads.reserve"
       },
       {
-        "app_id": "tos>briefcase",
+        "app_id": "briefcase",
+        "endpoint_id": "briefcase.uploads.commit"
+      },
+      {
+        "app_id": "briefcase",
         "endpoint_id": "briefcase.entries.list"
       },
       {
-        "app_id": "tos>briefcase",
+        "app_id": "briefcase",
         "endpoint_id": "briefcase.files.read"
       }
     ]
   },
-  "obo_endpoints": [],
-  "obo_review_message": "Waveform creates private generated-audio files and lists or reads user-authorized Briefcase sources for transcription and replay. Identity, membership and tag context allow Briefcase to enforce the initiating actor\u2019s resource permissions. No global file administration is requested.",
+  "obo_endpoints": [
+    {
+      "endpoint_id": "waveform.tts",
+      "name": "Generate speech",
+      "description": "Generate speech and store its audio in the selected Briefcase account and organization.",
+      "path": "/api/v1/tts",
+      "metadata": {},
+      "critical": true,
+      "additional_warnings": [
+        "stores_data"
+      ],
+      "downstream": [
+        {
+          "audience": "briefcase",
+          "endpoint_id": "briefcase.uploads.reserve"
+        },
+        {
+          "audience": "briefcase",
+          "endpoint_id": "briefcase.uploads.commit"
+        },
+        {
+          "audience": "briefcase",
+          "endpoint_id": "briefcase.entries.list"
+        }
+      ]
+    },
+    {
+      "endpoint_id": "waveform.stt",
+      "name": "Transcribe speech",
+      "description": "Read an authorized audio source from the selected Briefcase account and organization and transcribe it.",
+      "path": "/api/v1/stt",
+      "metadata": {},
+      "critical": true,
+      "downstream": [
+        {
+          "audience": "briefcase",
+          "endpoint_id": "briefcase.entries.list"
+        },
+        {
+          "audience": "briefcase",
+          "endpoint_id": "briefcase.files.read"
+        }
+      ]
+    }
+  ],
+  "obo_review_message": "Waveform separately requests permission to reserve and commit private generated-audio uploads, and list or read authorized Briefcase sources. IAM shows the selected provider account, organization, and endpoint graph before approval. Resource access remains enforced by Briefcase.",
   "testing_idle_days": 30
 }

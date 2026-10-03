@@ -5,13 +5,40 @@ Application: `tos>waveform` (Silicon Waveform). Registration was accepted on
 for this ID, so a new identity was created through Honeycomb as the `tos` owner.
 The deployed webhook URL and existing signing key were retained.
 
-`application-metadata.json` records the submitted catalog details and permissions.
+The initial catalog details and permissions were recorded in
+`application-metadata.json`; its current contents are the IAM 5 candidate below.
 It deliberately omits the webhook signing secret and is not a complete creation
 request. Registration credentials and private request/response files are excluded
 from Git. The one-time application credential is saved under the operator's
 protected `~/.config/silicon/waveform/` directory for the later service rollout.
 
-## Current published release
+## IAM 5 candidate catalog
+
+`application-metadata.json` now describes the prepared Waveform 0.5.0 catalog,
+using canonical application ID `waveform` (`org_id` remains `tos`). It has not
+been submitted by this change. The September publication record below is historical.
+
+The external scope contains exactly the four Briefcase roots used by the current
+storage broker: `briefcase.uploads.reserve`, `briefcase.uploads.commit`,
+`briefcase.entries.list`, and `briefcase.files.read`, with canonical app ID
+`briefcase`. Ordinary IAM scopes are unchanged. The retired raw upload endpoint
+is absent. Feature permission is separate from ordinary login.
+
+The receiving endpoints `waveform.tts` (`/api/v1/tts`) and `waveform.stt`
+(`/api/v1/stt`) declare their existing downstream edges. TTS needs reserve,
+commit and list; STT needs list and read. Do not replace `obo_endpoints` with an
+empty array: an IAM application update would retire the receiving endpoints.
+
+Before applying the catalog, register the exact Briefcase endpoint paths from
+[the integration guide](../../docs/iam.md#endpoint-configuration-and-uploads),
+resolve provider visibility/approval, and validate both production and testing
+graphs against IAM 5. Keep private credentials outside this file. The metadata is
+not a complete application creation request or an assertion of live registration.
+
+Run `python3 scripts/check-iam5-catalog.py` to check this declaration against the
+runtime storage roots, receiver paths, and documented downstream edges.
+
+## September published release
 
 Version **0.3.1** is public as of September 21, 2026. The application remains
 active and public at configuration revision 1. This release preserves its
