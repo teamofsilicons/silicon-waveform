@@ -532,27 +532,27 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
     let iam = MockServer::start().await;
     let storage = MockServer::start().await;
     let mut state = fixture(pool.clone(), &iam)?;
-    let settings = &mut Arc::get_mut(&mut state)
-        .ok_or("shared state")?
-        .briefcase_settings;
+    let control = Arc::get_mut(&mut state).ok_or("shared state")?;
+    // Match the ordinary IAM 5 scope used by the production STT configuration.
+    control.stt_scope = "self.identity.read".to_owned();
+    let settings = &mut control.briefcase_settings;
     settings.base_url = storage.uri().parse()?;
     settings.permanent_origin = "https://briefcase.example.test".parse()?;
     settings.cdn_origin = settings.permanent_origin.clone();
     crate::infrastructure::testing::seed_audio(&pool).await?;
     let app = speech_app(state.clone())?;
     let actor = Uuid::new_v4();
-    let iam_plane = Uuid::new_v4();
-    let mut actor_snapshot = snapshot(actor);
-    actor_snapshot["authorization"]["actor_type"] = json!(kind);
-    actor_snapshot["authorization"]["public_id"] = json!(if kind == "carbon" {
+    // IAM 5 profile routing uses the public actor, not IAM's internal principal UUID.
+    let actor_public_id = if kind == "carbon" {
         "c:12345678"
     } else {
         "si:12345678"
-    });
-    actor_snapshot["authorization"]["scopes"] = json!([
-        "obo:briefcase:briefcase.files.create",
-        "obo:briefcase:briefcase.files.read"
-    ]);
+    };
+    let iam_plane = Uuid::new_v4();
+    let mut actor_snapshot = snapshot(actor);
+    actor_snapshot["authorization"]["actor_type"] = json!(kind);
+    actor_snapshot["authorization"]["public_id"] = json!(actor_public_id);
+    actor_snapshot["authorization"]["scopes"] = json!(["self.identity.read"]);
     Mock::given(path("/api/v1/oauth/introspect"))
         .respond_with(ResponseTemplate::new(200).set_body_json(actor_snapshot.clone()))
         .mount(&iam)
@@ -561,6 +561,8 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
     let root = created["key"].as_str().ok_or("missing root")?;
     actor_snapshot["authorization"]["testing_environment_id"] = json!(iam_plane);
     actor_snapshot["authorization"]["org_id"] = json!("client-workspace");
+    actor_snapshot["authorization"]["membership_id"] =
+        json!(format!("{actor_public_id}[client-workspace]"));
     let selected_snapshot = Arc::new(Mutex::new(actor_snapshot.clone()));
     let live_snapshot = selected_snapshot.clone();
     Mock::given(path("/api/v1/oauth/introspect"))
@@ -577,11 +579,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
         Some(root),
         "client-workspace",
         "client-workspace",
-        if kind == "carbon" {
-            "c:12345678"
-        } else {
-            "si:12345678"
-        },
+        actor_public_id,
         true,
     )
     .await?;
@@ -697,7 +695,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
         .and(header("x-testing-environment-key", "I".repeat(32)))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token":"oat_fixture","refresh_token":"ort_fixture","token_type":"Bearer","expires_in":1800,
-            "scope":"roles.read memberships.read","actor":{"principal_id":actor,"type":kind,"public_id":if kind == "carbon" { "c:12345678" } else { "si:12345678" }},"org_id":"client-workspace"
+            "scope":"self.identity.read","actor":{"principal_id":actor,"type":kind,"public_id":actor_public_id},"org_id":"client-workspace"
         }))).expect(1).mount(&iam).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -705,7 +703,6 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
     let server = tokio::spawn(async move { axum::serve(listener, server_app).await });
     let home = std::env::temp_dir().join(format!("waveform-cli-storage-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&home)?;
-    let actor_text = actor.to_string();
     let job_id = first["request_id"].as_str().ok_or("job id")?;
     for args in [
         vec!["--test", root, "login", "oac_fixture"],
@@ -716,7 +713,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             "--org",
             "client-workspace",
             "--actor",
-            &actor_text,
+            actor_public_id,
         ],
         vec![
             "--test",
@@ -725,7 +722,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             "--org",
             "client-workspace",
             "--actor",
-            &actor_text,
+            actor_public_id,
             "gemini",
             "fixture-personal-key",
         ],
@@ -736,7 +733,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             "--org",
             "client-workspace",
             "--actor",
-            &actor_text,
+            actor_public_id,
         ],
         vec![
             "--test",
@@ -745,7 +742,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             "--org",
             "client-workspace",
             "--actor",
-            &actor_text,
+            actor_public_id,
             "gemini",
         ],
         vec![
@@ -756,7 +753,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             "--org",
             "client-workspace",
             "--actor",
-            &actor_text,
+            actor_public_id,
             "--idempotency",
             &key,
         ],
@@ -767,7 +764,7 @@ async fn paired_read_roundtrip(kind: &str) -> TestResult {
             "--org",
             "client-workspace",
             "--actor",
-            &actor_text,
+            actor_public_id,
             "--job-id",
             job_id,
             "--wait",
