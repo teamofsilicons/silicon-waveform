@@ -16,7 +16,8 @@ serde_json="1.0"
 thiserror="2.0"
 url="2.5"
 semver="1.0"
-silicon-iam-client = { version = "5.0.0", path = "../vendor/silicon-iam-client" }
+# Temporary: the client/CLI stage replaces IAM with silicon-accounts-client.
+silicon-iam-client = "=5.0.0"
 secrecy="0.10"
 uuid={version="1",features=["v4"]}
 tokio={version="1.53",features=["process","time"]}
