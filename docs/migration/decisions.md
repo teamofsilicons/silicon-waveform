@@ -67,7 +67,19 @@ outside a Silicon's circle can reach it through Waveform. Nothing to add.
 - **Removed routes:** `/api/v1/iam`, `/api/v1/auth/login|refresh|logout`, `/api/v1/testing-environment(s)…`,
   `/internal/honeycomb/…`, `/internal/contracts/{v}/deprecate` (now an operator subcommand), `/webhooks/`, `/webhook/`,
   `/api/v1/storage-authorizations/{id}` and `/{id}/complete` (the IAM consent flow). The CLI talks to Accounts
-  directly as a public client and the web BFF does the code exchange.
+  directly as a public client and the web BFF does the code exchange. The sign-in routes an old client would call
+  (`/api/v1/iam`, `/api/v1/auth/login|refresh|logout`, `/api/v1/testing-environment(s)`, `/webhooks/`, `/webhook/`)
+  answer `410 route_retired` with a hint naming what replaced them, instead of a bare 404.
+- **The authorized actor** carries the account uuid, kind, current id, the credential's scopes and, for bearer
+  tokens, the token family (`fid`, one sign-in). Speech requests log the account uuid, the issuing app and the
+  token family (never a token).
+- **A Silicon's custodian** is learned from `GET /v1/accounts/{uuid}` the first time Waveform sees the Silicon
+  (in the background, re-checked every 10 minutes and on `silicon.custodian_changed`); `GET /api/v1/me` waits for
+  that first lookup so a Silicon's first answer already names its custodian. A Carbon selecting a Silicon whose
+  cached custodian differs is re-checked with Accounts at most once a minute before being refused.
+- **Removing Waveform's access** (`membership.access_removed`) ends Waveform's own sign-ins and its Briefcase proof
+  for the account. A proof another app presents for that account still works while Accounts verifies it: it
+  stands on that app's own grant, and Accounts is the authority on it.
 - **Kept or added routes:** `GET /api/v1/auth/me` (and alias `GET /api/v1/me`), public `GET /api/v1/accounts`
   (discovery), `GET /api/v1/silicons`, `POST|GET|DELETE /api/v1/storage-authorizations`,
   `GET /api/v1/audio/{request_id}`, `POST /webhooks/accounts`.
@@ -124,10 +136,32 @@ that is not an Accounts event, 503 when no secret is configured. Dedupe on `even
 200 and are logged. Ordering uses `occurred_at` and, for `account.updated`, `account.version`.
 
 **`account.deleted`:** delete the account's provider keys, Briefcase proofs (revoked at Accounts first), preferences,
-job history, idempotency records and held audio; delete its legacy `waveform_actor_keys` rows; clear the cached id,
+job history, idempotency records and held audio; delete its legacy `waveform_actor_keys` rows and its `waveform_identity_links` rows; clear the cached id,
 name and photo; keep the uuid ↔ storage-key row as a tombstone so the deleted account's tokens stay refused. Bug
-reports already delivered to the Team inbox are not Waveform product data; they stay, but their storage key no longer
+reports already delivered to the bug-report inbox are not Waveform product data; they stay, but their storage key no longer
 maps to any id. Briefcase copies are the account's files and Briefcase handles them.
+
+## Linking earlier accounts (`link-identities`)
+
+`waveform-api link-identities --file mapping.csv [--dry-run] [--merge] [--relink]` reads
+`iam_principal_id,accounts_uuid` rows (an optional header, blank lines and `#` comments allowed; a principal is the
+earlier public id `c:…`/`si:…` or the earlier principal UUID). For each row it points the Accounts uuid at the private
+storage key that principal's rows already use (`waveform_account_keys`, source `link_identities`, recorded in
+`waveform_identity_links`), so history, idempotency records and saved keys appear under the account unchanged. It then
+consolidates the account's settings from every former org into the Accounts-era `@` rows (newest preference wins;
+newest key per provider wins and is re-sealed with `WAVEFORM_ENCRYPTION_KEY`; without the key, keys stay on their
+legacy rows and are counted as skipped) and marks earlier Briefcase grants invalidated. Nothing is deleted.
+
+Everything runs in one transaction and prints a JSON report (`linked`, `already_linked`, `unmatched`, `conflicts`,
+consolidation counts); any conflict rolls the whole run back and exits 2. Re-running the same file is a no-op.
+Conflicts it refuses unless told otherwise:
+
+- the account already signed in after the cutover started and has its own, still empty Waveform key: `--merge`
+  points it at the earlier data instead (refused when that new key already has data, which needs a manual decision);
+- the earlier data is already linked to a different account by an earlier run of this command: `--relink` moves it
+  (never a link Waveform made at sign-in).
+
+So a wrong mapping can be corrected before cutover by re-running with a fixed file and `--relink`.
 
 ## Configuration
 
@@ -146,7 +180,8 @@ Honeycomb variables are ignored with one warning at boot naming them.
 
 Honeycomb test environments are removed (D5). The deterministic fixture providers (the prerecorded clips) stay
 behind `WAVEFORM_SPEECH_FIXTURES=true`, which the service refuses in production. They replace every paid provider for
-the whole process, so local and CI end-to-end runs need no provider keys.
+the whole process, so local and CI end-to-end runs need no provider keys. Saved or request provider keys are accepted
+in that mode and never used, so provider-key flows can be exercised end to end too.
 
 ## Versions
 

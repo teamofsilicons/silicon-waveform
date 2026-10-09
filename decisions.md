@@ -863,3 +863,19 @@ plaintext key is stored. Explicit legacy fallback without new controls/keys keep
 its original digest so completed operations can replay. Sandbox requests validate
 controls but use prerecorded profile clips for every TTS provider and never spend
 provider credentials. This source update is locally verified, not deployed.
+
+## 2026-10-10 — Silicon Accounts replaces IAM; data belongs to personal accounts
+
+**Status:** Accepted. Supersedes every entry above that relies on IAM sign-in, OBO tokens, org scoping, test
+planes or Honeycomb lifecycle (among them D-055 and the org/plane parts of D-056 and the 2026-09-20 entry).
+
+Waveform authenticates with Silicon Accounts only: bearer access tokens issued to `waveform` are verified locally,
+and other apps act for an account with User verification proofs (`waveform.tts`, `waveform.stt`) from an operator
+allow-list. Everything belongs to the account that made the request; a Carbon can manage the Waveform settings and
+history of the Silicons it is custodian of, but never acts as them. Briefcase is reached with User verification
+proofs for `briefcase`; when that is not possible the speech still completes and Waveform holds the MP3. Existing
+rows keep their private storage keys and are linked to Accounts uuids at cutover by `waveform-api link-identities`.
+The API keeps `/api/v1` with contract 2.0.0.
+
+The full record of the judgement calls, the old-to-new mapping and the configuration is
+[`docs/migration/decisions.md`](docs/migration/decisions.md).
