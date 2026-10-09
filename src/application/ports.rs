@@ -25,7 +25,7 @@ pub trait TextToSpeechProvider: Send + Sync {
     fn name(&self) -> ProviderName;
 
     /// Clones this adapter with a request-local key, preserving shared limits.
-    /// Unsupported fixture adapters return `None`.
+    /// An adapter that cannot take a key returns `None` (the default).
     fn with_api_key(
         &self,
         _key: secrecy::SecretString,
@@ -49,7 +49,7 @@ pub trait SpeechToTextProvider: Send + Sync {
     fn name(&self) -> ProviderName;
 
     /// Clones this adapter with a request-local key, preserving shared limits.
-    /// Unsupported fixture adapters return `None`.
+    /// An adapter that cannot take a key returns `None` (the default).
     fn with_api_key(
         &self,
         _key: secrecy::SecretString,

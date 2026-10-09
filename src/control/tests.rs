@@ -1570,6 +1570,103 @@ async fn speech_runs_for_accounts_and_for_apps_with_proofs() -> TestResult {
 
 #[tokio::test]
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn voice_catalog_and_the_stt_folder_follow_the_credential() -> TestResult {
+    let harness = Harness::new("waveform.stt=interface").await?;
+    harness.accounts.issues_briefcase_proofs().await;
+    let ada = bearer(&harness.token(ADA));
+
+    let (status, voices) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/voice-profiles",
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{voices}");
+    assert!(
+        voices["items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty() && items.iter().all(|v| v["id"].is_string())),
+        "{voices}"
+    );
+    // Account routes take no proofs, even with a scope Waveform honours.
+    harness
+        .accounts
+        .valid_proof("sap_interface-stt", BOB, "interface", &["waveform.stt"])
+        .await;
+    let (status, refused) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/voice-profiles",
+        &[("authorization", "Proof sap_interface-stt")],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(refused["error"]["reason"], "proof_not_accepted");
+
+    // Ada's own token: Waveform gets Briefcase access and returns her folder.
+    let folder_id = Uuid::new_v4();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/entries/list"))
+        .and(body_partial_json(json!({"path":"apps"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[
+            {"id":Uuid::new_v4(),"type":"folder","name":"other","path":"apps/other","origin_app_id":"other"},
+            {"id":folder_id,"type":"folder","name":"waveform","path":"apps/waveform","origin_app_id":"waveform","deleted_at":null}
+        ],"next_cursor":null})))
+        .mount(&harness.briefcase)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/entries/list"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"items":[],"next_cursor":null})),
+        )
+        .mount(&harness.briefcase)
+        .await;
+    let (status, target) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/stt/source-target",
+        &[("authorization", &ada)],
+        Some(json!({})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{target}");
+    assert_eq!(target["folder_id"], folder_id.to_string());
+    assert_eq!(target["folder_path"], "apps/waveform");
+    assert_eq!(target["account"]["uuid"], "zQo");
+    let requests = harness
+        .briefcase
+        .received_requests()
+        .await
+        .ok_or("requests")?;
+    assert!(!requests.is_empty());
+    assert!(requests.iter().all(|request| {
+        request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Proof sap_briefcase-1")
+            && !request.headers.contains_key("x-org-id")
+    }));
+
+    // Interface acting for Bob, who never gave Waveform Briefcase access.
+    let (status, refused) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/stt/source-target",
+        &[("authorization", "Proof sap_interface-stt")],
+        Some(json!({})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(refused["error"]["code"], "storage_authorization_required");
+    harness.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
 async fn contract_negotiation_and_operator_deprecation_are_durable() -> TestResult {
     let harness = Harness::new("").await?;
     let (status, body, headers) =

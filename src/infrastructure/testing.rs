@@ -133,6 +133,11 @@ impl TextToSpeechProvider for FixtureTtsProvider {
         self.provider
     }
 
+    /// Saved or request keys are accepted and never used: fixtures call no provider.
+    fn with_api_key(&self, _key: secrecy::SecretString) -> Option<Arc<dyn TextToSpeechProvider>> {
+        Some(Arc::new(*self))
+    }
+
     async fn synthesize(
         &self,
         request: TtsProviderRequest,
@@ -169,6 +174,11 @@ impl FixtureSttProvider {
 impl SpeechToTextProvider for FixtureSttProvider {
     fn name(&self) -> ProviderName {
         self.provider
+    }
+
+    /// Saved or request keys are accepted and never used: fixtures call no provider.
+    fn with_api_key(&self, _key: secrecy::SecretString) -> Option<Arc<dyn SpeechToTextProvider>> {
+        Some(Arc::new(*self))
     }
 
     async fn transcribe(
@@ -261,12 +271,18 @@ pub(crate) async fn seed_audio(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct DatabaseFixtureTtsProvider(sqlx::PgPool, ProviderName);
 
 #[async_trait]
 impl TextToSpeechProvider for DatabaseFixtureTtsProvider {
     fn name(&self) -> ProviderName {
         self.1
+    }
+
+    /// Saved or request keys are accepted and never used: fixtures call no provider.
+    fn with_api_key(&self, _key: secrecy::SecretString) -> Option<Arc<dyn TextToSpeechProvider>> {
+        Some(Arc::new(self.clone()))
     }
 
     async fn synthesize(
@@ -397,6 +413,39 @@ mod tests {
         request.voice = Some(ProviderVoice::Gemini("UnknownVoice".to_owned()));
         assert!(provider.synthesize(request, request_id()).await.is_err());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn fixtures_accept_saved_and_request_keys_without_using_them() {
+        let (tts, stt) = provider_chains();
+        let key = || secrecy::SecretString::from("sk-never-used".to_owned());
+        for provider in &tts {
+            let keyed = provider
+                .with_api_key(key())
+                .unwrap_or_else(|| unreachable!());
+            assert_eq!(keyed.name(), provider.name());
+        }
+        for provider in &stt {
+            let keyed = provider
+                .with_api_key(key())
+                .unwrap_or_else(|| unreachable!());
+            assert_eq!(keyed.name(), provider.name());
+        }
+        let request = TtsRequest::new(
+            SpeechText::new("hello".to_owned()).unwrap_or_else(|_| unreachable!()),
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let keyed = tts[2].with_api_key(key()).unwrap_or_else(|| unreachable!());
+        assert!(
+            keyed
+                .synthesize(
+                    TtsProviderRequest::for_provider(&request, ProviderName::OpenAi),
+                    request_id(),
+                )
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
