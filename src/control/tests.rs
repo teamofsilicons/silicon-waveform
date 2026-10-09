@@ -1,24 +1,65 @@
-//! Local PostgreSQL + HTTP tests for the durable control API.
+//! Control and speech API tests against PostgreSQL (`WAVEFORM_TEST_DATABASE_URL`),
+//! a stubbed Silicon Accounts (real `EdDSA` tokens, JWKS, proofs, signed webhooks)
+//! and a stubbed Briefcase. Each test gets its own schema.
 
-use super::*;
-use crate::application::ports::ProviderKeyStore as _;
+#![allow(clippy::too_many_lines)]
+
+use std::{sync::Arc, time::Duration};
+
 use axum::body::{Body, to_bytes};
-use hmac::{Hmac, Mac as _};
-use http::Request;
+use http::{Request, StatusCode};
 use secrecy::SecretString;
-use serde_json::Value;
-use sha2::Sha256;
-use sqlx::postgres::PgPoolOptions;
+use serde_json::{Value, json};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use tower::ServiceExt as _;
+use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{body_string_contains, header, method, path},
+    matchers::{body_partial_json, method, path},
 };
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
-const SECRET: &str = "test-only-waveform-webhook-secret-123456";
+use super::ControlState;
+use crate::{
+    api::{ApiState, ReadinessChecks},
+    application::{
+        ports::LeaseIdGenerator,
+        service::{ServicePolicy, StorageBoundary, WaveformService},
+    },
+    config::{BriefcaseSettings, ServerSettings},
+    domain::{
+        idempotency::{IdempotencyLeaseId, RequestDigestKey},
+        media::{BriefcaseOrigin, MediaSizeLimit},
+    },
+    infrastructure::{
+        accounts::AccountsGateway,
+        authenticator::AccountsAuthenticator,
+        briefcase::BriefcaseHttp,
+        directory::AccountDirectory,
+        held_audio::PostgresHeldAudio,
+        idempotency::PostgresIdempotencyStore,
+        storage_proofs::StorageProofs,
+        testing::{FixtureAudioNormalizer, TEST_STT_TEXT, provider_chains},
+        vault::Vault,
+    },
+    test_support::{TestAccounts, WEBHOOK_SECRET, signed_delivery},
+};
 
+pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+pub(super) const ADA: (&str, &str, &str) = ("zQo", "carbon", "c:ada");
+pub(super) const SCOUT: (&str, &str, &str) = ("K1E", "silicon", "si:scout");
+pub(super) const BOB: (&str, &str, &str) = ("B0b", "carbon", "c:bob");
+pub(super) const ROVER: (&str, &str, &str) = ("R0v", "silicon", "si:rover");
+
+/// A fresh schema in the test database with every migration applied.
 pub(super) async fn database() -> Result<(PgPool, String), Box<dyn std::error::Error>> {
+    database_with(None).await
+}
+
+/// A fresh schema migrated up to `up_to` (all migrations when `None`).
+pub(super) async fn database_with(
+    up_to: Option<i64>,
+) -> Result<(PgPool, String), Box<dyn std::error::Error>> {
     let url = std::env::var("WAVEFORM_TEST_DATABASE_URL")?;
     // Identifier is generated exclusively from a UUID, with no user input.
     let schema = format!("control_{}", Uuid::new_v4().simple());
@@ -29,7 +70,7 @@ pub(super) async fn database() -> Result<(PgPool, String), Box<dyn std::error::E
     admin.close().await;
     let search = format!("SET search_path TO {schema}");
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(8)
         .after_connect(move |connection, _| {
             let search = search.clone();
             Box::pin(async move {
@@ -41,1462 +82,1832 @@ pub(super) async fn database() -> Result<(PgPool, String), Box<dyn std::error::E
         })
         .connect(&url)
         .await?;
-    sqlx::migrate!().run(&pool).await?;
+    let mut migrator = sqlx::migrate!();
+    if let Some(up_to) = up_to {
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|migration| migration.version <= up_to)
+                .cloned()
+                .collect(),
+        );
+    }
+    migrator.run(&pool).await?;
     Ok((pool, schema))
 }
 
-pub(super) fn fixture(
-    pool: PgPool,
-    iam: &MockServer,
-) -> Result<Arc<ControlState>, Box<dyn std::error::Error>> {
-    Ok(Arc::new(ControlState {
-        fence_slots: Arc::new(tokio::sync::Semaphore::new(8)),
-        honeycomb_token: Some(SecretString::from(
-            "test-only-honeycomb-service-token-123456",
-        )),
-        tts_scope: "obo:briefcase:briefcase.files.create".into(),
-        stt_scope: "obo:briefcase:briefcase.files.read".into(),
-        mail: None,
-        station: None,
-        pool,
-        iam: Client::builder(&iam.uri())?
-            .credential(Credential::application("waveform", "test-app-secret"))
-            .auto_update(false)
-            .build()?,
-        app_id: "waveform".to_owned(),
-        briefcase_settings: crate::config::BriefcaseSettings {
-            base_url: iam.uri().parse()?,
-            permanent_origin: iam.uri().parse()?,
-            cdn_origin: iam.uri().parse()?,
-            app_id: "waveform".to_owned(),
-            audience: "briefcase".to_owned(),
-            timeout: std::time::Duration::from_secs(5),
-            download_timeout: std::time::Duration::from_secs(5),
-            max_download_bytes: 1_000_000,
-        },
-        iam_timeout: std::time::Duration::from_secs(5),
-        source_stt_action: "waveform.stt".to_owned(),
-        vault: Some(Vault::new(&SecretString::from("19".repeat(32)))?),
-        verifier: Some(WebhookVerifier::new(WebhookSecretKeyring::new(
-            1,
-            WebhookSecret::new(SECRET)?,
-        )?)),
-    }))
+pub(super) async fn drop_schema(pool: &PgPool, schema: &str) -> TestResult {
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(pool)
+        .await?;
+    pool.close().await;
+    Ok(())
 }
 
-pub(super) async fn call(
-    app: &Router,
+struct TestLeaseIds;
+
+impl LeaseIdGenerator for TestLeaseIds {
+    fn new_idempotency_lease_id(&self) -> IdempotencyLeaseId {
+        IdempotencyLeaseId::new(Uuid::new_v4()).unwrap_or_else(|_| unreachable!())
+    }
+}
+
+/// Everything a test needs: the real router over a real schema.
+pub(super) struct Harness {
+    pub(super) pool: PgPool,
+    pub(super) schema: String,
+    pub(super) accounts: TestAccounts,
+    pub(super) briefcase: MockServer,
+    pub(super) state: Arc<ControlState>,
+    /// The full public router (with contract negotiation, which needs the database).
+    pub(super) app: axum::Router,
+    /// The control routes alone, without the negotiation layer.
+    pub(super) control: axum::Router,
+}
+
+impl Harness {
+    pub(super) async fn new(issuers: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let (pool, schema) = database().await?;
+        Self::over(pool, schema, issuers).await
+    }
+
+    /// A harness whose database is never reached (routes that fail or answer first).
+    pub(super) async fn without_database(
+        issuers: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let pool = PgPoolOptions::new().connect_lazy("postgres://localhost/unused")?;
+        Self::over(pool, String::new(), issuers).await
+    }
+
+    pub(super) async fn over(
+        pool: PgPool,
+        schema: String,
+        issuers: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let accounts = TestAccounts::start().await;
+        let briefcase = MockServer::start().await;
+        let accounts_settings = accounts.settings(issuers);
+        let gateway = Arc::new(AccountsGateway::new(&accounts_settings)?);
+        let authenticator = AccountsAuthenticator::new(
+            gateway.clone(),
+            AccountDirectory::new(pool.clone(), gateway.clone()),
+            accounts_settings.proof_issuers.clone(),
+        );
+        let vault = Vault::new(&SecretString::from("19".repeat(32)))?;
+        let proofs = StorageProofs::new(
+            pool.clone(),
+            vault.clone(),
+            gateway.clone(),
+            "briefcase".to_owned(),
+        );
+        let briefcase_settings = BriefcaseSettings {
+            base_url: briefcase.uri().parse()?,
+            permanent_origin: briefcase.uri().parse()?,
+            app_id: "briefcase".to_owned(),
+            app_folder: "apps/waveform".to_owned(),
+            timeout: Duration::from_secs(5),
+            download_timeout: Duration::from_secs(5),
+            max_download_bytes: 1_000_000,
+        };
+        let briefcase_http = Arc::new(BriefcaseHttp::new(&briefcase_settings, "waveform")?);
+        let held_audio = PostgresHeldAudio::new(pool.clone(), Duration::from_hours(24));
+        let state = Arc::new(ControlState {
+            pool: pool.clone(),
+            mail: None,
+            station: None,
+            app_id: "waveform".to_owned(),
+            accounts_url: accounts.issuer(),
+            public_url: "http://127.0.0.1:4161".parse()?,
+            authenticator: authenticator.clone(),
+            storage_proofs: Some(proofs.clone()),
+            briefcase: briefcase_http.clone(),
+            held_audio: held_audio.clone(),
+            vault: Some(vault),
+            webhook_secrets: vec![SecretString::from(WEBHOOK_SECRET.to_owned())],
+        });
+        let idempotency = Arc::new(PostgresIdempotencyStore::new(
+            pool.clone(),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            Duration::from_hours(24),
+        ));
+        let (tts, stt) = provider_chains();
+        let service = WaveformService::new(
+            Arc::new(authenticator),
+            StorageBoundary {
+                authority: Arc::new(proofs),
+                briefcase: briefcase_http,
+                held_audio: Arc::new(held_audio),
+            },
+            idempotency.clone(),
+            Arc::new(FixtureAudioNormalizer),
+            Arc::new(TestLeaseIds),
+            tts,
+            stt,
+            ServicePolicy::new(
+                Duration::from_secs(600),
+                MediaSizeLimit::default(),
+                BriefcaseOrigin::new(briefcase.uri().parse()?)?,
+                4_096,
+                RequestDigestKey::new(b"control-tests-request-digest-key-0123")?,
+                "http://127.0.0.1:4161".parse()?,
+            )?,
+        )?
+        .with_voice_profiles(state.clone())
+        .with_provider_orders(state.clone())
+        .with_provider_keys(state.clone());
+        let api = ApiState::new(
+            Arc::new(service),
+            ReadinessChecks::new(idempotency, Arc::new(FixtureAudioNormalizer), true, true),
+            Duration::from_secs(300),
+            Duration::from_secs(600),
+        )
+        .with_control(state.clone());
+        let app = crate::api::router(
+            api,
+            &ServerSettings {
+                bind_addr: "127.0.0.1:4161".parse()?,
+                json_body_limit: 327_680,
+                tts_deadline: Duration::from_secs(300),
+                stt_deadline: Duration::from_secs(600),
+                max_in_flight: std::num::NonZeroUsize::new(64).ok_or("in flight")?,
+                shutdown_timeout: Duration::from_secs(5),
+            },
+        );
+        let control = super::router(state.clone());
+        Ok(Self {
+            pool,
+            schema,
+            accounts,
+            briefcase,
+            state,
+            app,
+            control,
+        })
+    }
+
+    /// A valid Waveform access token for one of the test accounts.
+    pub(super) fn token(&self, account: (&str, &str, &str)) -> String {
+        self.accounts.token(account.0, account.1, account.2)
+    }
+
+    pub(super) async fn finish(self) -> TestResult {
+        drop_schema(&self.pool, &self.schema).await
+    }
+}
+
+/// Sends one request through the router and decodes a JSON answer.
+pub(super) async fn send(
+    app: &axum::Router,
     verb: &str,
     route: &str,
-    token: Option<&str>,
-    body: Value,
+    headers: &[(&str, &str)],
+    body: Option<Value>,
 ) -> Result<(StatusCode, Value), Box<dyn std::error::Error>> {
-    let mut request = Request::builder()
-        .method(verb)
-        .uri(route)
-        .header("content-type", "application/json")
-        .header("x-org-id", "tos");
-    if let Some(token) = token {
-        request = request.header("authorization", format!("Bearer {token}"));
-    }
-    let response = app
-        .clone()
-        .oneshot(request.body(Body::from(body.to_string()))?)
-        .await?;
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), 1_048_576).await?;
+    let (status, bytes, _) = send_raw(app, verb, route, headers, body).await?;
     Ok((
         status,
         if bytes.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(&bytes)?
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         },
     ))
 }
 
-pub(super) fn snapshot(actor: Uuid) -> Value {
-    json!({"active": true, "authorization": {
-        "principal_id": actor, "actor_type": "carbon", "public_id": "c:12345678",
-        "organization_id": Uuid::from_u128(2), "org_id": "tos", "membership_id": Uuid::from_u128(3),
-        "membership_version": 1, "authorization_epoch": 1, "audience": "waveform",
-        "testing_environment_id": null, "scopes": ["roles.read","memberships.read"], "org_role": "member", "tags": []
-    }})
-}
-
-#[tokio::test]
-async fn iam_discovery_is_public_and_exposes_only_public_configuration() -> TestResult {
-    // Discovery in production needs neither a database connection nor an IAM call.
-    let pool = PgPoolOptions::new().connect_lazy("postgres://localhost/unused")?;
-    let iam = MockServer::start().await;
-    let app = router(fixture(pool, &iam)?);
+/// Sends one request and returns the raw answer.
+pub(super) async fn send_raw(
+    app: &axum::Router,
+    verb: &str,
+    route: &str,
+    headers: &[(&str, &str)],
+    body: Option<Value>,
+) -> Result<(StatusCode, Vec<u8>, http::HeaderMap), Box<dyn std::error::Error>> {
+    let mut request = Request::builder().method(verb).uri(route);
+    if body.is_some() {
+        request = request.header("content-type", "application/json");
+    }
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
     let response = app
-        .oneshot(Request::builder().uri("/api/v1/iam").body(Body::empty())?)
+        .clone()
+        .oneshot(request.body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))?)
         .await?;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()[http::header::CACHE_CONTROL], "no-store");
-    let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
-    assert_eq!(
-        body,
-        json!({
-            "app_id":"waveform", "iam_base_url":format!("{}/", iam.uri()),
-            "testing_environment_id":null
-        })
-    );
-    assert!(
-        iam.received_requests()
-            .await
-            .ok_or("requests unavailable")?
-            .is_empty()
-    );
-    Ok(())
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), 32 * 1_048_576).await?;
+    Ok((status, bytes.to_vec(), response_headers))
 }
 
-#[tokio::test]
-async fn session_mutations_reject_invalid_or_duplicate_keys_before_iam() -> TestResult {
-    let pool = PgPoolOptions::new().connect_lazy("postgres://localhost/unused")?;
-    let iam = MockServer::start().await;
-    let app = router(fixture(pool, &iam)?);
-    for (route, body) in [
-        ("login", json!({"slt":"oac_fixture"})),
-        ("refresh", json!({"refresh_token":"ort_fixture"})),
-        ("logout", json!({"token":"ort_fixture"})),
-    ] {
-        for key in [
-            "short".to_owned(),
-            "a".repeat(256),
-            "contains a space".to_owned(),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(format!("/api/v1/auth/{route}"))
-                        .header("content-type", "application/json")
-                        .header("idempotency-key", key)
-                        .body(Body::from(body.to_string()))?,
-                )
-                .await?;
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/v1/auth/{route}"))
-                    .header("content-type", "application/json")
-                    .header("idempotency-key", "first-operation-key")
-                    .header("idempotency-key", "second-operation-key")
-                    .body(Body::from(body.to_string()))?,
-            )
-            .await?;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+pub(super) fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// Posts a signed Accounts webhook delivery.
+pub(super) async fn deliver(
+    app: &axum::Router,
+    event: &Value,
+) -> Result<(StatusCode, Value), Box<dyn std::error::Error>> {
+    let (headers, body) = signed_delivery(WEBHOOK_SECRET, event);
+    let mut request = Request::builder().method("POST").uri("/webhooks/accounts");
+    for (name, value) in &headers {
+        request = request.header(*name, value);
     }
-    assert!(
-        iam.received_requests()
-            .await
-            .ok_or("requests unavailable")?
-            .is_empty()
-    );
-    Ok(())
+    let response = app.clone().oneshot(request.body(Body::from(body))?).await?;
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 65_536).await?;
+    Ok((
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    ))
 }
 
-#[tokio::test]
-#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
-#[allow(clippy::too_many_lines)]
-async fn session_retries_preserve_the_iam_receipt_in_both_planes() -> TestResult {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let (pool, schema) = database().await?;
-    let iam = MockServer::start().await;
-    let state = fixture(pool.clone(), &iam)?;
-    let app = router(state.clone());
-    Mock::given(path("/api/v1/oauth/introspect"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(snapshot(Uuid::new_v4())))
-        .mount(&iam)
-        .await;
-    let created = legacy_plane(&state, Uuid::new_v4()).await?;
-    let root = created["key"].as_str().ok_or("environment key missing")?;
-    for testing in [false, true] {
-        for (route, body, upstream, success) in [
-            (
-                "login",
-                json!({"slt":"oac_fixture"}),
-                "/api/v1/app-auth/tokens",
-                StatusCode::OK,
-            ),
-            (
-                "refresh",
-                json!({"refresh_token":"ort_fixture"}),
-                "/api/v1/app-auth/tokens",
-                StatusCode::OK,
-            ),
-            (
-                "logout",
-                json!({"token":"ort_fixture"}),
-                "/api/v1/oauth/revoke",
-                StatusCode::NO_CONTENT,
-            ),
-        ] {
-            iam.reset().await;
-            let key = format!(
-                "session-{route}-{}-receipt",
-                if testing { "test" } else { "production" }
-            );
-            let attempts = Arc::new(AtomicUsize::new(0));
-            let counter = attempts.clone();
-            let response = if success == StatusCode::NO_CONTENT {
-                ResponseTemplate::new(204)
-            } else {
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "access_token":"oat_saved", "refresh_token":"ort_saved", "token_type":"Bearer",
-                    "expires_in":1800, "scope":"self.identity.read", "org_id":null,
-                    "actor":{"principal_id":Uuid::new_v4(),"type":"carbon","public_id":"c:tester"}
-                }))
-            };
-            // IAM has processed the operation, but the first response is unavailable.
-            // A repeat with the same key returns its saved receipt.
-            Mock::given(method("POST"))
-                .and(path(upstream))
-                .and(header("idempotency-key", key.as_str()))
-                .respond_with(move |_: &wiremock::Request| {
-                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
-                        ResponseTemplate::new(502).set_body_json(
-                            json!({"error":{"code":"unavailable","message":"response lost"}}),
-                        )
-                    } else {
-                        response.clone()
-                    }
-                })
-                .expect(2)
-                .mount(&iam)
-                .await;
-            for expected in [StatusCode::SERVICE_UNAVAILABLE, success] {
-                let mut request = Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/v1/auth/{route}"))
-                    .header("content-type", "application/json")
-                    .header("idempotency-key", &key);
-                if testing {
-                    request = request.header("x-testing-environment-key", root);
-                }
-                let result = app
-                    .clone()
-                    .oneshot(request.body(Body::from(body.to_string()))?)
-                    .await?;
-                assert_eq!(result.status(), expected, "{route}, testing={testing}");
-                if expected == StatusCode::OK {
-                    let tokens: Value =
-                        serde_json::from_slice(&to_bytes(result.into_body(), 65536).await?)?;
-                    assert_eq!(tokens["refresh_token"], "ort_saved");
-                }
+#[allow(clippy::needless_pass_by_value)]
+pub(super) fn event(kind: &str, data: Value) -> Value {
+    json!({
+        "event_id": Uuid::now_v7().to_string(), "type": kind,
+        "occurred_at": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+        "app_id": "waveform", "silicon": null, "data": data
+    })
+}
+
+/// Mounts a Briefcase that accepts uploads into `apps/waveform` and lists the
+/// last one, echoing the operation and file name it was given.
+pub(super) async fn briefcase_accepts_uploads(briefcase: &MockServer) {
+    let entry_id = Uuid::new_v4();
+    let upload_id = Uuid::new_v4();
+    let origin = briefcase.uri();
+    let last = Arc::new(std::sync::Mutex::new(json!({})));
+    let status = move |state: &str, operation: &Value| json!({"operation_id":operation,"upload_id":upload_id,"state":state,"expires_at":"2099-01-01T00:00:00Z","published_entry_id": if state == "committed" { Some(entry_id) } else { None }});
+    let reserved = last.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/uploads/reserve"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            let mut answer = status("reserved", &body["operation_id"]);
+            answer["capability"] = json!("capability-1");
+            if let Ok(mut last) = reserved.lock() {
+                *last = body;
             }
-            let requests = iam
-                .received_requests()
-                .await
-                .ok_or("requests unavailable")?;
-            assert_eq!(requests.len(), 2);
-            assert_eq!(requests[0].body, requests[1].body);
-            // Request tracing may change; the retry receipt and authority must not.
-            let mut first_headers = requests[0].headers.clone();
-            let mut second_headers = requests[1].headers.clone();
-            first_headers.remove("x-request-id");
-            second_headers.remove("x-request-id");
-            assert_eq!(first_headers, second_headers);
-            assert_eq!(
-                requests[0]
-                    .headers
-                    .contains_key("x-testing-environment-key"),
-                testing
-            );
-            assert_eq!(attempts.load(Ordering::SeqCst), 2);
-            iam.verify().await;
-        }
+            ResponseTemplate::new(200).set_body_json(answer)
+        })
+        .mount(briefcase)
+        .await;
+    let staged = last.clone();
+    Mock::given(method("PUT"))
+        .and(path(format!("/api/v1/obo/uploads/{upload_id}/content")))
+        .respond_with(move |_request: &wiremock::Request| {
+            let operation = staged
+                .lock()
+                .map_or(Value::Null, |last| last["operation_id"].clone());
+            ResponseTemplate::new(200).set_body_json(status("staged", &operation))
+        })
+        .mount(briefcase)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/uploads/commit"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            ResponseTemplate::new(200).set_body_json(status("committed", &body["operation_id"]))
+        })
+        .mount(briefcase)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/files/read"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "audio/mpeg")
+                .set_body_bytes(b"I".to_vec()),
+        )
+        .mount(briefcase)
+        .await;
+    let listed = last;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/entries/list"))
+        .and(body_partial_json(json!({"path":"apps/waveform"})))
+        .respond_with(move |_request: &wiremock::Request| {
+            let name = listed.lock().map(|last| last["name"].as_str().unwrap_or_default().to_owned()).unwrap_or_default();
+            ResponseTemplate::new(200).set_body_json(json!({"items":[{"id":entry_id,"type":"file","name":name,"path":format!("apps/waveform/{name}"),"permanent_url":format!("{origin}/zQo/apps/waveform/{name}"),"origin_app_id":"waveform"}],"next_cursor":null}))
+        })
+        .mount(briefcase)
+        .await;
+}
+
+/// Mounts a Briefcase that lets the account read one source file.
+pub(super) async fn briefcase_serves_source(briefcase: &MockServer) -> String {
+    let entry_id = Uuid::new_v4();
+    let url = format!("{}/zQo/apps/waveform/voice.mp3", briefcase.uri());
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/entries/list"))
+        .and(body_partial_json(json!({"path":"apps/waveform"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[{"id":entry_id,"type":"file","name":"voice.mp3","path":"apps/waveform/voice.mp3","permanent_url":url}],"next_cursor":null})))
+        .mount(briefcase)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/files/read"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "audio/mpeg")
+                .set_body_bytes(b"voice-bytes".to_vec()),
+        )
+        .mount(briefcase)
+        .await;
+    url
+}
+
+#[tokio::test]
+async fn discovery_is_public_and_retired_routes_say_what_replaced_them() -> TestResult {
+    let harness = Harness::without_database("").await?;
+    let (status, body) = send(&harness.control, "GET", "/api/v1/accounts", &[], None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["app_id"], "waveform");
+    assert_eq!(body["accounts_url"], harness.accounts.issuer());
+    assert_eq!(
+        body["proof_scopes"],
+        json!(["waveform.tts", "waveform.stt"])
+    );
+    for (verb, route) in [
+        ("GET", "/api/v1/iam"),
+        ("POST", "/api/v1/auth/login"),
+        ("POST", "/api/v1/auth/refresh"),
+        ("POST", "/api/v1/auth/logout"),
+        ("GET", "/api/v1/testing-environment"),
+        ("POST", "/webhooks/"),
+        ("POST", "/webhook/"),
+    ] {
+        let (status, body) = send(&harness.control, verb, route, &[], None).await?;
+        assert_eq!(status, StatusCode::GONE, "{verb} {route}");
+        assert_eq!(body["error"]["code"], "route_retired");
+        assert!(
+            body["error"]["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("waveform login"))
+        );
     }
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&pool)
-        .await?;
-    pool.close().await;
+    // No Accounts call was needed for any of this.
+    assert!(
+        harness
+            .accounts
+            .server
+            .received_requests()
+            .await
+            .ok_or("requests")?
+            .iter()
+            .all(|request| request.url.path() != "/v1/proofs/verify")
+    );
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
-#[allow(clippy::too_many_lines)]
-async fn login_settings_secrets_webhooks_and_online_revocation() -> TestResult {
-    let (pool, schema) = database().await?;
-    let iam = MockServer::start().await;
-    let state = fixture(pool.clone(), &iam)?;
-    let app = router(state.clone());
-    let actor = Uuid::new_v4();
-    // Pre-cutover import retains the private key and its encryption context.
-    sqlx::query("INSERT INTO waveform_actor_keys VALUES($1,'c:12345678',$2)")
-        .bind(Uuid::nil())
-        .bind(actor)
-        .execute(&pool)
-        .await?;
-    Mock::given(method("POST")).and(path("/api/v1/app-auth/tokens"))
-        .and(header("authorization", "Basic d2F2ZWZvcm06dGVzdC1hcHAtc2VjcmV0"))
-        .and(body_string_contains("slt=oac_fixture"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "oat_fixture", "refresh_token": "ort_fixture", "token_type": "Bearer",
-            "expires_in": 1800, "scope": "roles.read memberships.read", "actor": {"principal_id": actor,"type":"carbon","public_id":"c:12345678"}, "org_id": "tos"
-        }))).expect(1).mount(&iam).await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/oauth/introspect"))
-        .and(body_string_contains("token=oat_fixture"))
-        .and(header("x-org-id", "tos"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(snapshot(actor)))
-        .mount(&iam)
+async fn credentials_are_refused_with_exact_reasons_before_any_data_access() -> TestResult {
+    let harness = Harness::without_database("").await?;
+    let mut wrong_audience = harness.accounts.claims(ADA.0, ADA.1, ADA.2);
+    wrong_audience["aud"] = json!("briefcase");
+    let wrong_audience = bearer(&harness.accounts.key.sign(&wrong_audience));
+    let mut expired = harness.accounts.claims(ADA.0, ADA.1, ADA.2);
+    expired["exp"] = json!(time::OffsetDateTime::now_utc().unix_timestamp() - 600);
+    let expired = bearer(&harness.accounts.key.sign(&expired));
+    for (headers, status, reason) in [
+        (vec![], StatusCode::UNAUTHORIZED, "missing_credentials"),
+        (
+            vec![("authorization", "Basic d2F2ZWZvcm06eA==")],
+            StatusCode::UNAUTHORIZED,
+            "malformed_authorization",
+        ),
+        (
+            vec![("authorization", "Proof sapr_refresh-token")],
+            StatusCode::UNAUTHORIZED,
+            "malformed_authorization",
+        ),
+        (
+            vec![
+                ("authorization", "Bearer x"),
+                ("x-iam-obo-access-token", "oba_old"),
+            ],
+            StatusCode::UNAUTHORIZED,
+            "retired_credentials",
+        ),
+        (
+            vec![("authorization", wrong_audience.as_str())],
+            StatusCode::UNAUTHORIZED,
+            "wrong_audience",
+        ),
+        (
+            vec![("authorization", expired.as_str())],
+            StatusCode::UNAUTHORIZED,
+            "token_expired",
+        ),
+        (
+            vec![("authorization", "Bearer not.a.jwt")],
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+        ),
+    ] {
+        let (got, body) = send(&harness.control, "GET", "/api/v1/me", &headers, None).await?;
+        assert_eq!(got, status, "{reason}");
+        assert_eq!(body["error"]["reason"], reason);
+        assert!(body["error"]["hint"].is_string(), "{reason}");
+    }
+    // A valid proof is still refused on a route that only takes the account's own token.
+    harness
+        .accounts
+        .valid_proof("sap_for-settings", ADA, "interface", &["waveform.tts"])
         .await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/oauth/introspect"))
-        .and(body_string_contains("token=oat_other"))
-        .respond_with(ResponseTemplate::new(200).set_body_json({
-            let mut other = snapshot(Uuid::new_v4());
-            other["authorization"]["public_id"] = json!("c:different-carbon");
-            other
-        }))
-        .mount(&iam)
-        .await;
-
-    let (status, tokens) = call(
-        &app,
-        "POST",
-        "/api/v1/auth/login",
-        None,
-        json!({"slt":"oac_fixture"}),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(tokens["access_token"], "oat_fixture");
-    let assigned: String = sqlx::query_scalar("SELECT voice_profile FROM waveform_account_preferences WHERE plane_id=$1 AND org_id='tos' AND actor_id=$2").bind(Uuid::nil()).bind(actor).fetch_one(&pool).await?;
-    assert_eq!(assigned, "kore");
-    let (status, catalog) = call(
-        &app,
+    let (status, body) = send(
+        &harness.control,
         "GET",
-        "/api/v1/voice-profiles",
-        Some("oat_fixture"),
-        Value::Null,
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(catalog["items"].as_array().ok_or("catalog")?.len(), 30);
-    assert_eq!(
-        call(&app, "GET", "/api/v1/voice-profiles", None, Value::Null)
-            .await?
-            .0,
-        StatusCode::UNAUTHORIZED
-    );
-    let (status, changed) = call(
-        &app,
-        "PATCH",
         "/api/v1/preferences",
-        Some("oat_fixture"),
-        json!({"voice_profile":"puck"}),
+        &[("authorization", "Proof sap_for-settings")],
+        None,
     )
     .await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(changed["voice_profile"], "puck");
-    assert_eq!(
-        call(
-            &app,
-            "PATCH",
-            "/api/v1/preferences",
-            Some("oat_fixture"),
-            json!({"voice_profile":"missing"})
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["reason"], "proof_not_accepted");
+    Ok(())
+}
+
+/// Signs an account in once so Waveform knows it (and, for a Silicon, its custodian).
+async fn sign_in(
+    harness: &Harness,
+    account: (&str, &str, &str),
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let token = harness.token(account);
+    let (status, body) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/me",
+        &[("authorization", &bearer(&token))],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(body)
+}
+
+/// Waits until the background custodian lookup filled a Silicon's custodian.
+async fn wait_for_custodian(harness: &Harness, silicon: &str) -> TestResult {
+    for _ in 0..100 {
+        let custodian: Option<String> = sqlx::query_scalar(
+            "SELECT custodian_uuid FROM waveform_accounts WHERE account_uuid=$1",
         )
+        .bind(silicon)
+        .fetch_optional(&harness.pool)
         .await?
-        .0,
-        StatusCode::BAD_REQUEST
-    );
+        .flatten();
+        if custodian.is_some() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err("custodian was never looked up".into())
+}
 
-    let (status, _) = call(
-        &app,
-        "POST",
-        "/api/v1/auth/login",
-        None,
-        json!({"slt":"ort_refresh-is-not-login"}),
+async fn storage_key(harness: &Harness, account: &str) -> Result<Uuid, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_scalar(
+        "SELECT storage_actor_id FROM waveform_account_keys WHERE account_uuid=$1",
     )
-    .await?;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        call(&app, "GET", "/api/v1/preferences", None, Value::Null)
-            .await?
-            .0,
-        StatusCode::UNAUTHORIZED
+    .bind(account)
+    .fetch_one(&harness.pool)
+    .await?)
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn accounts_are_keyed_by_their_exact_uuid_and_silicons_learn_their_custodian() -> TestResult {
+    let harness = Harness::new("").await?;
+    harness
+        .accounts
+        .account(SCOUT.0, SCOUT.1, SCOUT.2, Some((ADA.0, ADA.2)))
+        .await;
+    let me = sign_in(&harness, ADA).await?;
+    assert_eq!(me["account"]["uuid"], "zQo");
+    assert_eq!(me["account"]["id"], "c:ada");
+    assert_eq!(me["account"]["kind"], "carbon");
+    // A uuid differing only by case is a different account.
+    let other = sign_in(&harness, ("zqo", "carbon", "c:zed")).await?;
+    assert_eq!(other["account"]["uuid"], "zqo");
+    assert_ne!(
+        storage_key(&harness, "zQo").await?,
+        storage_key(&harness, "zqo").await?
     );
-    let (_, prefs) = call(
-        &app,
+    // Signing in again keeps the same private key.
+    let first = storage_key(&harness, "zQo").await?;
+    sign_in(&harness, ADA).await?;
+    assert_eq!(storage_key(&harness, "zQo").await?, first);
+
+    // A Silicon's first answer already names who looks after it.
+    let scout_me = sign_in(&harness, SCOUT).await?;
+    assert_eq!(
+        scout_me["account"]["custodian"]["uuid"], "zQo",
+        "{scout_me}"
+    );
+    wait_for_custodian(&harness, SCOUT.0).await?;
+    let (status, body) = send(
+        &harness.app,
         "GET",
-        "/api/v1/preferences",
-        Some("oat_fixture"),
-        Value::Null,
-    )
-    .await?;
-    assert_eq!(
-        prefs["tts_order"],
-        json!(["gemini", "elevenlabs", "openai"])
-    );
-    let (status, prefs) = call(
-        &app,
-        "PATCH",
-        "/api/v1/preferences",
-        Some("oat_fixture"),
-        json!({"tts_order":["openai"]}),
+        "/api/v1/silicons",
+        &[("authorization", &bearer(&harness.token(ADA)))],
+        None,
     )
     .await?;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"][0]["uuid"], "K1E");
+    assert_eq!(body["items"][0]["custodian"]["uuid"], "zQo");
+    // The circle helper: a Carbon's circle is itself and its Silicons.
+    let ada = harness
+        .state
+        .directory()
+        .load(&"zQo".parse()?)
+        .await?
+        .ok_or("ada")?;
+    let circle = harness.state.directory().circle(&ada).await?;
     assert_eq!(
-        prefs["tts_order"],
+        circle.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        vec!["zQo", "K1E"]
+    );
+    let scout = harness
+        .state
+        .directory()
+        .load(&"K1E".parse()?)
+        .await?
+        .ok_or("scout")?;
+    let circle = harness.state.directory().circle(&scout).await?;
+    assert_eq!(
+        circle.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        vec!["K1E", "zQo"]
+    );
+    harness.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn a_custodian_manages_its_silicons_settings_keys_and_history_and_nobody_else_can()
+-> TestResult {
+    let harness = Harness::new("").await?;
+    harness
+        .accounts
+        .account(SCOUT.0, SCOUT.1, SCOUT.2, Some((ADA.0, ADA.2)))
+        .await;
+    harness
+        .accounts
+        .account(ROVER.0, ROVER.1, ROVER.2, Some((BOB.0, BOB.2)))
+        .await;
+    harness.accounts.account(BOB.0, BOB.1, BOB.2, None).await;
+    harness.accounts.introspection(true).await;
+    for account in [ADA, SCOUT, BOB, ROVER] {
+        sign_in(&harness, account).await?;
+    }
+    wait_for_custodian(&harness, SCOUT.0).await?;
+    let ada = bearer(&harness.token(ADA));
+    let bob = bearer(&harness.token(BOB));
+    let scout = bearer(&harness.token(SCOUT));
+
+    // Ada changes Scout's settings and saves a key for it.
+    let (status, body) = send(
+        &harness.app,
+        "PATCH",
+        "/api/v1/preferences?account=si:scout",
+        &[("authorization", &ada)],
+        Some(json!({"voice_profile":"puck","tts_order":["openai"]})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["account"]["uuid"], "K1E");
+    let (status, _) = send(
+        &harness.app,
+        "PUT",
+        "/api/v1/provider-keys/openai?account=K1E",
+        &[("authorization", &ada)],
+        Some(json!({"api_key":"sk-custodian-pays"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Scout sees them as its own; the key value is never returned.
+    let (_, preferences) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/preferences",
+        &[("authorization", &scout)],
+        None,
+    )
+    .await?;
+    assert_eq!(preferences["voice_profile"], "puck");
+    assert_eq!(
+        preferences["tts_order"],
         json!(["openai", "gemini", "elevenlabs"])
     );
-    let (_, other) = call(
-        &app,
-        "GET",
-        "/api/v1/preferences",
-        Some("oat_other"),
-        Value::Null,
-    )
-    .await?;
-    assert_eq!(other["tts_order"][0], "gemini");
-    assert_eq!(other["voice_profile"], "kore");
-    assert_eq!(prefs["voice_profile"], "puck");
-    assert_eq!(
-        call(
-            &app,
-            "PATCH",
-            "/api/v1/preferences",
-            Some("oat_fixture"),
-            json!({"tts_order":["deepgram"]})
-        )
-        .await?
-        .0,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        call(
-            &app,
-            "PUT",
-            "/api/v1/provider-keys/openai",
-            Some("oat_fixture"),
-            json!({"api_key":"personal-test-secret"})
-        )
-        .await?
-        .0,
-        StatusCode::NO_CONTENT
-    );
-    let (_, keys) = call(
-        &app,
+    let (_, keys) = send(
+        &harness.app,
         "GET",
         "/api/v1/provider-keys",
-        Some("oat_fixture"),
-        Value::Null,
+        &[("authorization", &scout)],
+        None,
     )
     .await?;
     assert_eq!(keys["items"][0]["provider"], "openai");
-    assert!(!keys.to_string().contains("personal-test-secret"));
-    let cipher: Vec<u8> =
-        sqlx::query_scalar("SELECT secret_cipher FROM waveform_provider_keys WHERE actor_id=$1")
-            .bind(actor)
-            .fetch_one(&pool)
-            .await?;
-    assert!(!String::from_utf8_lossy(&cipher).contains("personal-test-secret"));
-    let authorized = AuthorizedActor {
-        actor: Actor::new(ActorKind::Carbon, ActorId::new(actor)?),
-        organization_id: "tos".parse()?,
-        originating_application: None,
-        expires_at: None,
-    };
-    let loaded = state.load(Uuid::nil(), &authorized).await?;
-    assert_eq!(
-        loaded
-            .get(&ProviderName::OpenAi)
-            .ok_or("personal key missing")?
-            .expose_secret(),
-        "personal-test-secret"
-    );
-    assert!(state.load(Uuid::new_v4(), &authorized).await?.is_empty());
-    let mut other = authorized.clone();
-    other.organization_id = "other".parse()?;
-    assert!(state.load(Uuid::nil(), &other).await?.is_empty());
-    other = authorized.clone();
-    other.actor = Actor::new(ActorKind::Carbon, ActorId::new(Uuid::new_v4())?);
-    assert!(state.load(Uuid::nil(), &other).await?.is_empty());
+    assert!(!keys.to_string().contains("sk-custodian-pays"));
 
-    assert_eq!(
-        call(
-            &app,
+    // Bob is not Scout's custodian; Scout cannot manage its custodian; unknown ids are named.
+    for (caller, route) in [
+        (&bob, "/api/v1/preferences?account=si:scout"),
+        (&bob, "/api/v1/jobs?account=K1E"),
+        (&bob, "/api/v1/provider-keys?account=si:scout"),
+        (&scout, "/api/v1/preferences?account=c:ada"),
+        (&scout, "/api/v1/jobs?account=si:rover"),
+    ] {
+        let (status, body) = send(
+            &harness.app,
             "GET",
-            "/api/v1/provider-keys",
-            Some("oat_other"),
-            Value::Null
+            route,
+            &[("authorization", caller)],
+            None,
         )
-        .await?
-        .1["items"],
-        json!([])
-    );
-    assert_eq!(
-        call(
-            &app,
-            "DELETE",
-            "/api/v1/provider-keys/openai",
-            Some("oat_fixture"),
-            Value::Null
-        )
-        .await?
-        .0,
-        StatusCode::NO_CONTENT
-    );
-
-    assert!(state.load(Uuid::nil(), &authorized).await?.is_empty());
-
-    let id = Uuid::new_v4();
-    let event = json!({"spec_version":"1.0","event_id":id,"event_type":"session.revoked.v1","occurred_at":"2026-09-07T00:00:00Z","organization_id":Uuid::from_u128(2),"aggregate":{"type":"session","id":Uuid::from_u128(4),"version":1},"data":{"private":"not-persisted"}}).to_string();
-    assert_eq!(
-        webhook(&app, id, &event, false).await?,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        webhook(&app, id, &event, false).await?,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        webhook(&app, id, &event, true).await?,
-        StatusCode::UNAUTHORIZED
-    );
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM waveform_webhook_events")
-        .fetch_one(&pool)
         .await?;
-    assert_eq!(count, 1);
-    iam.reset().await;
-    Mock::given(path("/api/v1/oauth/introspect"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"active":false})))
-        .mount(&iam)
+        assert_eq!(status, StatusCode::FORBIDDEN, "{route}");
+        assert_eq!(body["error"]["code"], "not_custodian");
+    }
+    Mock::given(method("GET"))
+        .and(path("/v1/accounts/by-id/si:nobody"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(json!({"error":{"code":"account_not_found","message":"no"}})),
+        )
+        .mount(&harness.accounts.server)
         .await;
-    assert_eq!(
-        call(
-            &app,
-            "GET",
-            "/api/v1/preferences",
-            Some("oat_fixture"),
-            Value::Null
-        )
-        .await?
-        .0,
-        StatusCode::UNAUTHORIZED
-    );
-    // Unknown test roots are never sent to production IAM.
-    let request = Request::builder()
-        .uri("/api/v1/auth/me")
-        .header("authorization", "Bearer oat_fixture")
-        .header("x-org-id", "tos")
-        .header("x-testing-environment-key", "A".repeat(32))
-        .body(Body::empty())?;
-    assert_eq!(
-        app.oneshot(request).await?.status(),
-        StatusCode::UNAUTHORIZED
-    );
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&pool)
-        .await?;
-    pool.close().await;
-    Ok(())
-}
-
-async fn webhook(
-    app: &Router,
-    id: Uuid,
-    body: &str,
-    tamper: bool,
-) -> Result<StatusCode, Box<dyn std::error::Error>> {
-    use std::fmt::Write as _;
-    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
-    let mut mac = <Hmac<Sha256> as hmac::Mac>::new_from_slice(SECRET.as_bytes())?;
-    mac.update(timestamp.as_bytes());
-    mac.update(b".");
-    mac.update(body.as_bytes());
-    let mut signature = String::from("v1=");
-    for byte in mac.finalize().into_bytes() {
-        write!(signature, "{byte:02x}")?;
-    }
-    let body = if tamper {
-        format!("{body} ")
-    } else {
-        body.to_owned()
-    };
-    let request = Request::builder()
-        .method("POST")
-        .uri("/webhooks/")
-        .header("x-silicon-iam-event-id", id.to_string())
-        .header("x-silicon-iam-timestamp", timestamp)
-        .header("x-silicon-iam-key-version", "1")
-        .header("x-silicon-iam-signature", signature)
-        .body(Body::from(body))?;
-    Ok(app.clone().oneshot(request).await?.status())
-}
-
-#[tokio::test]
-#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
-async fn environment_management_is_owned_by_honeycomb() -> TestResult {
-    let (pool, schema) = database().await?;
-    let iam = MockServer::start().await;
-    let state = fixture(pool.clone(), &iam)?;
-    let app = router(state.clone());
-    for route in [
-        "/api/v1/testing-environments".to_owned(),
-        "/api/v1/testing-environment/clean".to_owned(),
-        format!("/api/v1/testing-environments/{}/restore", Uuid::new_v4()),
-    ] {
-        let (status, body) = call(&app, "POST", &route, Some("oat_fixture"), json!({})).await?;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"]["code"], "manage_environment_in_honeycomb");
-    }
-    let legacy = legacy_plane(&state, Uuid::new_v4()).await?;
-    let id: Uuid = legacy["id"].as_str().ok_or("id")?.parse()?;
-    sqlx::query("UPDATE waveform_environments SET last_activity_at=now()-interval '90 days',deleted_at=now()-interval '40 days' WHERE id=$1").bind(id).execute(&pool).await?;
-    assert_eq!(state.cleanup_environments().await?, 0);
-    assert!(
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM waveform_environments WHERE id=$1)"
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await?
-    );
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&pool)
-        .await?;
-    pool.close().await;
-    Ok(())
-}
-
-// Existing paired environments remain readable after management moves to Honeycomb.
-async fn legacy_plane(
-    state: &ControlState,
-    iam_id: Uuid,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let id = Uuid::new_v4();
-    let key = Uuid::new_v4().simple().to_string();
-    let vault = state.vault().map_err(|_| "vault")?;
-    sqlx::query("INSERT INTO waveform_environments(id,org_id,creator_id,name,root_key_hash,root_key_cipher,iam_key_cipher,app_secret_cipher,briefcase_key_cipher,iam_environment_id) VALUES($1,'tos',$2,'legacy sandbox',$3,$4,$5,$6,$7,$8)")
-        .bind(id).bind(Uuid::new_v4()).bind(vault.digest(&key,"environment-root")?)
-        .bind(vault.seal(&key,&format!("{id}/root-key"))?)
-        .bind(vault.seal(&"I".repeat(32),&format!("{id}/iam-key"))?)
-        .bind(vault.seal("test-environment-app-secret",&format!("{id}/app-secret"))?)
-        .bind(vault.seal(&format!("ask_{}","B".repeat(43)),&format!("{id}/briefcase-key"))?)
-        .bind(iam_id).execute(&state.pool).await?;
-    sqlx::query("INSERT INTO waveform_voice_profiles(plane_id,id,profile) SELECT $1,id,profile FROM waveform_voice_profiles WHERE plane_id=$2").bind(id).bind(Uuid::nil()).execute(&state.pool).await?;
-    sqlx::query("INSERT INTO waveform_provider_defaults(plane_id,tts_order,stt_order,voice_profile) SELECT $1,tts_order,stt_order,voice_profile FROM waveform_provider_defaults WHERE plane_id=$2").bind(id).bind(Uuid::nil()).execute(&state.pool).await?;
-    Ok(json!({"id":id,"key":key}))
-}
-
-#[path = "speech_tests.rs"]
-mod speech_tests;
-
-#[tokio::test]
-#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
-async fn voice_profiles_isolate_accounts_organizations_and_test_catalogs() -> TestResult {
-    use crate::application::ports::VoiceProfileStore as _;
-    let (pool, schema) = database().await?;
-    let iam = MockServer::start().await;
-    let state = fixture(pool.clone(), &iam)?;
-    let actor = AuthorizedActor {
-        actor: Actor::new(ActorKind::Silicon, ActorId::new(Uuid::new_v4())?),
-        organization_id: "tos".parse()?,
-        originating_application: None,
-        expires_at: None,
-    };
-    let baseline = state.resolve(Uuid::nil(), &actor, None).await?;
-    assert_eq!(baseline.id, "kore");
-    let plane = Uuid::new_v4();
-    sqlx::query("INSERT INTO waveform_environments(id,org_id,creator_id,name,root_key_hash,root_key_cipher,iam_key_cipher,briefcase_key_cipher,app_secret_cipher,iam_environment_id) VALUES($1,'tos',$2,'voice test',$3,$3,$3,$3,$3,$1)")
-        .bind(plane).bind(actor.actor.id.as_uuid()).bind(plane.as_bytes().to_vec()).execute(&pool).await?;
-    sqlx::query("INSERT INTO waveform_voice_profiles SELECT $1,id,profile FROM waveform_voice_profiles WHERE plane_id=$2").bind(plane).bind(Uuid::nil()).execute(&pool).await?;
-    sqlx::query("INSERT INTO waveform_provider_defaults(plane_id,tts_order,stt_order,voice_profile) SELECT $1,tts_order,stt_order,'puck' FROM waveform_provider_defaults WHERE plane_id=$2").bind(plane).bind(Uuid::nil()).execute(&pool).await?;
-    let test_default = state.resolve(plane, &actor, None).await?;
-    assert_eq!(test_default.id, "puck");
-    assert_eq!(
-        state.resolve(plane, &actor, Some("sulafat")).await?.id,
-        "sulafat"
-    );
-    assert_eq!(state.resolve(plane, &actor, None).await?.id, "puck");
-    assert_eq!(state.resolve(Uuid::nil(), &actor, None).await?, baseline);
-    // Catalog tuning in a test environment never changes production.
-    sqlx::query("UPDATE waveform_voice_profiles SET profile=jsonb_set(profile,'{openai_voice}',to_jsonb('shimmer'::text)) WHERE plane_id=$1 AND id='kore'").bind(plane).execute(&pool).await?;
-    assert_eq!(
-        state
-            .resolve(plane, &actor, Some("kore"))
-            .await?
-            .openai_voice,
-        "shimmer"
-    );
-    assert_eq!(
-        state.resolve(plane, &actor, Some("kore")).await?.revision,
-        2
-    );
-    assert_eq!(state.resolve(Uuid::nil(), &actor, None).await?, baseline);
-    // Same principal in a second organization gets an independent default.
-    sqlx::query("UPDATE waveform_account_preferences SET voice_profile='sulafat' WHERE plane_id=$1 AND org_id='tos' AND actor_id=$2").bind(Uuid::nil()).bind(actor.actor.id.as_uuid()).execute(&pool).await?;
-    let other = AuthorizedActor {
-        organization_id: "other".parse()?,
-        ..actor.clone()
-    };
-    assert_eq!(state.resolve(Uuid::nil(), &other, None).await?.id, "kore");
-    assert_eq!(
-        state.resolve(Uuid::nil(), &actor, None).await?.id,
-        "sulafat"
-    );
-    assert!(state.resolve(plane, &actor, Some("missing")).await.is_err());
-    sqlx::query("UPDATE waveform_voice_profiles SET profile=jsonb_set(profile,'{elevenlabs,voice_settings,speed}', '9') WHERE plane_id=$1 AND id='kore'").bind(plane).execute(&pool).await?;
-    assert!(matches!(
-        state.resolve(plane, &actor, Some("kore")).await,
-        Err(crate::domain::error::WaveformError::DependencyUnavailable { .. })
-    ));
-    // Environment cleanup removes the choice; next use reassigns that plane's default.
-    sqlx::query("DELETE FROM waveform_account_preferences WHERE plane_id=$1")
-        .bind(plane)
-        .execute(&pool)
-        .await?;
-    assert_eq!(state.resolve(plane, &actor, None).await?.id, "puck");
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&pool)
-        .await?;
-    pool.close().await;
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
-async fn unscoped_identity_uses_iam_workspace_and_rejects_wrong_audience() -> TestResult {
-    let (pool, schema) = database().await?;
-    let iam = MockServer::start().await;
-    let state = fixture(pool.clone(), &iam)?;
-    let app = router(state);
-    let mut authority = snapshot(Uuid::new_v4())["authorization"].clone();
-    authority["org_id"] = json!("workspace");
-    for (token, audience, expected) in [
-        ("oat_unscoped", "waveform", StatusCode::OK),
-        ("oat_wrong", "other", StatusCode::FORBIDDEN),
-    ] {
-        authority["audience"] = json!(audience);
-        Mock::given(method("POST"))
-            .and(path("/api/v1/oauth/introspect"))
-            .and(body_string_contains(format!("token={token}")))
-            .and(|request: &wiremock::Request| !request.headers.contains_key("x-org-id"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"active":true,"authorizations":[authority.clone()]})),
-            )
-            .expect(1)
-            .mount(&iam)
-            .await;
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/auth/me")
-                    .header("authorization", format!("Bearer {token}"))
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(response.status(), expected);
-        if expected == StatusCode::OK {
-            let value: Value =
-                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
-            assert_eq!(value["org_id"], "workspace");
-        }
-    }
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&pool)
-        .await?;
-    pool.close().await;
-    Ok(())
-}
-
-async fn mock_discovery(
-    iam: &MockServer,
-    id: Uuid,
-    secret: &str,
-    version: i64,
-    cleaned: Option<&str>,
-) {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    Mock::given(path("/api/v1/application/testing-context"))
-      .and(header("x-testing-application",format!("Basic {}",STANDARD.encode(format!("waveform:{secret}")))))
-      .respond_with(ResponseTemplate::new(200).set_body_json(json!({"environment_id":id,"application":{"app_id":"waveform","base_url":"https://backend.waveform.example","app_scope":{"iam":[],"external":[]},"webhook_scope":[],"testing_idle_days":15},"environment":{"environment_id":id,"org_id":"tos","name":format!("Sandbox {version}"),"version":version,"key_generation":1,"cleaned_at":cleaned,"created_at":"2026-09-01T00:00:00Z","creator_type":"carbon","creator_id":"c:alice"},"webhook_key_digest":"00".repeat(32)}))).mount(iam).await;
-}
-
-#[tokio::test]
-#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
-async fn app_secret_discovery_revalidates_isolates_and_cleans() -> TestResult {
-    let (pool, schema) = database().await?;
-    let iam = MockServer::start().await;
-    let state = fixture(pool.clone(), &iam)?;
-    let id = Uuid::new_v4();
-    let secret = format!("ask_{}", "a".repeat(43));
-    mock_discovery(&iam, id, &secret, 1, None).await;
-    assert_eq!(
-        state
-            .discover_plane(&secret)
-            .await
-            .map_err(|_| "discovery failed")?
-            .id,
-        id
-    );
-    let credentials: (Vec<u8>, Vec<u8>) = sqlx::query_as(
-        "SELECT iam_key_cipher,briefcase_key_cipher FROM waveform_environments WHERE id=$1",
+    let (status, body) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/jobs?account=si:nobody",
+        &[("authorization", &ada)],
+        None,
     )
-    .bind(id)
-    .fetch_one(&pool)
     .await?;
-    assert!(credentials.0.is_empty() && credentials.1.is_empty());
-    let actor = Uuid::new_v4();
-    for plane in [Uuid::nil(), id] {
-        sqlx::query("INSERT INTO waveform_account_preferences(plane_id,org_id,actor_id) VALUES($1,'tos',$2)").bind(plane).bind(actor).execute(&pool).await?;
-    }
-    iam.reset().await;
-    mock_discovery(&iam, id, &secret, 2, Some("2026-09-13T00:00:00Z")).await;
-    state
-        .discover_plane(&secret)
-        .await
-        .map_err(|_| "clean discovery failed")?;
-    let remaining: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM waveform_account_preferences WHERE plane_id=$1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(remaining, 0);
-    let production: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM waveform_account_preferences WHERE plane_id=$1")
-            .bind(Uuid::nil())
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(production, 1);
-    iam.reset().await;
-    mock_discovery(&iam, id, &secret, 1, None).await;
-    assert!(state.discover_plane(&secret).await.is_err());
-    iam.reset().await;
-    Mock::given(path("/api/v1/application/testing-context"))
-        .respond_with(ResponseTemplate::new(401))
-        .mount(&iam)
-        .await;
-    assert!(state.discover_plane(&secret).await.is_err());
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&pool)
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("si:nobody"))
+    );
+
+    // History: Scout's jobs are visible to Scout and Ada, never to Bob; another
+    // account's job id answers like an unknown one.
+    let scout_key = storage_key(&harness, SCOUT.0).await?;
+    let job = Uuid::now_v7();
+    sqlx::query("INSERT INTO waveform_jobs(id,plane_id,org_id,actor_id,actor_kind,operation,status,first_line,request_digest,idempotency_key_hash,issuing_app,created_at,finished_at,duration_ms,provider) VALUES($1,$2,'@',$3,'silicon','tts','completed','hello',$4,$5,'interface',now(),now(),1200,'gemini')")
+        .bind(job).bind(Uuid::nil()).bind(scout_key).bind(vec![1_u8; 32]).bind(vec![2_u8; 32])
+        .execute(&harness.pool).await?;
+    // A legacy (pre-Accounts, org-scoped) job of the same key appears in the same history.
+    let legacy_job = Uuid::now_v7();
+    sqlx::query("INSERT INTO waveform_jobs(id,plane_id,org_id,actor_id,actor_kind,operation,status,first_line,request_digest,idempotency_key_hash,created_at,finished_at,error_code) VALUES($1,$2,'tos',$3,'silicon','stt','failed','',$4,$5,now()-interval '1 day',now()-interval '1 day','providers_exhausted')")
+        .bind(legacy_job).bind(Uuid::nil()).bind(scout_key).bind(vec![3_u8; 32]).bind(vec![4_u8; 32])
+        .execute(&harness.pool).await?;
+    for caller in [&scout, &ada] {
+        let route = if caller == &ada {
+            "/api/v1/jobs?account=si:scout"
+        } else {
+            "/api/v1/jobs"
+        };
+        let (status, body) = send(
+            &harness.app,
+            "GET",
+            route,
+            &[("authorization", caller)],
+            None,
+        )
         .await?;
-    pool.close().await;
-    Ok(())
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids = body["items"]
+            .as_array()
+            .ok_or("items")?
+            .iter()
+            .map(|item| item["id"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![job.to_string(), legacy_job.to_string()]);
+        assert_eq!(body["items"][0]["issuing_app"], "interface");
+    }
+    let (status, _) = send(
+        &harness.app,
+        "GET",
+        &format!("/api/v1/jobs/{job}"),
+        &[("authorization", &bob)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = send(
+        &harness.app,
+        "GET",
+        &format!("/api/v1/jobs/{job}?account=si:scout"),
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["first_line"], "hello");
+
+    // Key writes see revocation at once: an inactive sign-in is refused.
+    harness.accounts.server.reset().await;
+    harness.accounts.introspection(false).await;
+    harness
+        .accounts
+        .account(SCOUT.0, SCOUT.1, SCOUT.2, Some((ADA.0, ADA.2)))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/jwks.json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"keys":[harness.accounts.key.jwk()]})),
+        )
+        .mount(&harness.accounts.server)
+        .await;
+    let fresh = bearer(&harness.token(ADA));
+    let (status, body) = send(
+        &harness.app,
+        "DELETE",
+        "/api/v1/provider-keys/openai?account=si:scout",
+        &[("authorization", &fresh)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["reason"], "token_inactive");
+    harness.finish().await
 }
 
-async fn sandbox_call(
-    app: &Router,
-    secret: &str,
-    route: &str,
-    body: Value,
-    key: &str,
-) -> Result<(StatusCode, Value), Box<dyn std::error::Error>> {
-    let response = app
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn webhooks_are_verified_deduplicated_and_applied() -> TestResult {
+    let harness = Harness::new("").await?;
+    harness
+        .accounts
+        .account(SCOUT.0, SCOUT.1, SCOUT.2, Some((ADA.0, ADA.2)))
+        .await;
+    for account in [ADA, SCOUT, BOB] {
+        sign_in(&harness, account).await?;
+    }
+    wait_for_custodian(&harness, SCOUT.0).await?;
+
+    // Signature, timestamp and body checks.
+    let ping = event("ping", json!({}));
+    let (headers, body) = signed_delivery("whsec_some-other-secret", &ping);
+    let mut request = Request::builder().method("POST").uri("/webhooks/accounts");
+    for (name, value) in &headers {
+        request = request.header(*name, value);
+    }
+    let response = harness
+        .app
+        .clone()
+        .oneshot(request.body(Body::from(body))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let stale = time::OffsetDateTime::now_utc().unix_timestamp() - 3_600;
+    let raw = serde_json::to_vec(&ping)?;
+    let response = harness
+        .app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(route)
-                .header("content-type", "application/json")
-                .header("x-testing-environment-key", secret)
-                .header("x-org-id", "tos")
-                .header("authorization", "Bearer oat_sandbox")
-                .header("idempotency-key", key)
-                .body(Body::from(body.to_string()))?,
+                .uri("/webhooks/accounts")
+                .header("x-accounts-timestamp", stale.to_string())
+                .header(
+                    "x-accounts-signature",
+                    silicon_accounts_client::sign_webhook(WEBHOOK_SECRET, stale, &raw),
+                )
+                .body(Body::from(raw))?,
         )
         .await?;
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), 65536).await?;
-    Ok((
-        status,
-        if bytes.is_empty() {
-            Value::Null
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let (headers, _) = signed_delivery(WEBHOOK_SECRET, &ping);
+    let mut request = Request::builder().method("POST").uri("/webhooks/accounts");
+    for (name, value) in &headers {
+        if *name == "x-accounts-signature" {
+            let timestamp: i64 = headers[0].1.parse()?;
+            request = request.header(
+                *name,
+                silicon_accounts_client::sign_webhook(WEBHOOK_SECRET, timestamp, b"not json"),
+            );
         } else {
-            serde_json::from_slice(&bytes)
-                .unwrap_or_else(|_| json!(String::from_utf8_lossy(&bytes)))
-        },
-    ))
+            request = request.header(*name, value);
+        }
+    }
+    let response = harness
+        .app
+        .clone()
+        .oneshot(request.body(Body::from("not json"))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(deliver(&harness.app, &ping).await?.1["outcome"], "ping");
+    assert_eq!(
+        deliver(
+            &harness.app,
+            &event("account.mood_changed", json!({"uuid":"zQo"}))
+        )
+        .await?
+        .1["outcome"],
+        "ignored"
+    );
+
+    // account.id_changed, then a duplicate delivery of the same event.
+    let renamed = event(
+        "account.id_changed",
+        json!({"uuid":"zQo","membership_id":"waveform:zQo","kind":"carbon","old_id":"c:ada","new_id":"c:ada-lovelace"}),
+    );
+    assert_eq!(
+        deliver(&harness.app, &renamed).await?.1["outcome"],
+        "id_updated"
+    );
+    let (status, body) = deliver(&harness.app, &renamed).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["duplicate"], true);
+    let (_, me) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/me",
+        &[("authorization", &bearer(&harness.token(ADA)))],
+        None,
+    )
+    .await?;
+    assert_eq!(me["account"]["id"], "c:ada-lovelace");
+    let custodian_id: Option<String> =
+        sqlx::query_scalar("SELECT custodian_id FROM waveform_accounts WHERE account_uuid='K1E'")
+            .fetch_one(&harness.pool)
+            .await?;
+    assert_eq!(custodian_id.as_deref(), Some("c:ada-lovelace"));
+    // A lookup that may have been answered before the change (the stub still says
+    // c:ada) never brings the old id back, for the Carbon or as the Silicon's custodian.
+    harness.accounts.account(ADA.0, ADA.1, ADA.2, None).await;
+    let directory = harness.state.directory();
+    directory.refresh_from_accounts(&"K1E".parse()?).await?;
+    directory.refresh_from_accounts(&"zQo".parse()?).await?;
+    let ids: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT (SELECT current_id FROM waveform_accounts WHERE account_uuid='zQo'), (SELECT custodian_id FROM waveform_accounts WHERE account_uuid='K1E')",
+    )
+    .fetch_one(&harness.pool)
+    .await?;
+    assert_eq!(
+        ids,
+        (
+            Some("c:ada-lovelace".to_owned()),
+            Some("c:ada-lovelace".to_owned())
+        )
+    );
+
+    // account.updated applies only newer versions.
+    let updated = |version: i64, name: &str| {
+        event(
+            "account.updated",
+            json!({"uuid":"zQo","membership_id":"waveform:zQo","changed":["display_name"],"account":{"uuid":"zQo","membership_id":"waveform:zQo","kind":"carbon","id":"c:ada-lovelace","display_name":name,"pfp_url":"https://accounts.example.test/v1/photos/1","version":version}}),
+        )
+    };
+    assert_eq!(
+        deliver(&harness.app, &updated(5, "Ada L")).await?.1["outcome"],
+        "profile_updated"
+    );
+    assert_eq!(
+        deliver(&harness.app, &updated(4, "Old name")).await?.1["outcome"],
+        "stale_or_unknown_account"
+    );
+    let name: Option<String> =
+        sqlx::query_scalar("SELECT display_name FROM waveform_accounts WHERE account_uuid='zQo'")
+            .fetch_one(&harness.pool)
+            .await?;
+    assert_eq!(name.as_deref(), Some("Ada L"));
+
+    // silicon.custodian_changed hands Scout to Bob.
+    let moved = event(
+        "silicon.custodian_changed",
+        json!({"uuid":"K1E","membership_id":"waveform:K1E","from":{"uuid":"zQo","id":"c:ada-lovelace"},"to":{"uuid":"B0b","id":"c:bob"}}),
+    );
+    assert_eq!(
+        deliver(&harness.app, &moved).await?.1["outcome"],
+        "custodian_updated"
+    );
+    let (status, _) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/jobs?account=K1E",
+        &[("authorization", &bearer(&harness.token(BOB)))],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    harness
+        .accounts
+        .account(SCOUT.0, SCOUT.1, SCOUT.2, Some((BOB.0, BOB.2)))
+        .await;
+    let (status, _) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/jobs?account=K1E",
+        &[("authorization", &bearer(&harness.token(ADA)))],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // membership.signed_out: app_revoked keeps the account's other sign-ins.
+    let old_token = harness.token(BOB);
+    let app_revoked = event(
+        "membership.signed_out",
+        json!({"uuid":"B0b","membership_id":"waveform:B0b","reason":"app_revoked"}),
+    );
+    assert_eq!(
+        deliver(&harness.app, &app_revoked).await?.1["outcome"],
+        "ignored_app_revoked"
+    );
+    let (status, _) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/me",
+        &[("authorization", &bearer(&old_token))],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    // Any other reason refuses tokens issued before the event.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let signed_out = event(
+        "membership.signed_out",
+        json!({"uuid":"B0b","membership_id":"waveform:B0b","reason":"stk_rotated"}),
+    );
+    assert_eq!(
+        deliver(&harness.app, &signed_out).await?.1["outcome"],
+        "sign_ins_ended"
+    );
+    let (status, body) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/me",
+        &[("authorization", &bearer(&old_token))],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["reason"], "sign_in_ended");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let (status, _) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/me",
+        &[("authorization", &bearer(&harness.token(BOB)))],
+        None,
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a token issued after the sign-out works"
+    );
+    harness.finish().await
 }
 
 #[tokio::test]
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
-#[allow(clippy::too_many_lines)]
-async fn discovered_identity_reports_permissions_and_webhooks_are_isolated() -> TestResult {
-    use sha2::Digest as _;
-    let (pool, schema) = database().await?;
-    let iam = MockServer::start().await;
-    let state = fixture(pool.clone(), &iam)?;
-    let app = router(state.clone());
-    let id = Uuid::new_v4();
-    let actor = Uuid::new_v4();
-    let secret = format!("ask_{}", "R".repeat(43));
-    mock_discovery(&iam, id, &secret, 1, None).await;
-    let mut authority = snapshot(actor);
-    authority["authorization"]["testing_environment_id"] = json!(id);
-    Mock::given(path("/api/v1/oauth/introspect"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(authority.clone()))
-        .mount(&iam)
+async fn briefcase_access_is_approved_by_the_account_and_ended_by_events() -> TestResult {
+    let harness = Harness::new("").await?;
+    harness
+        .accounts
+        .account(SCOUT.0, SCOUT.1, SCOUT.2, Some((ADA.0, ADA.2)))
         .await;
-    Mock::given(path("/api/v1/app-auth/tokens")).and(body_string_contains("slt=test-carbon"))
-      .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"oat_sandbox","refresh_token":"ort_sandbox","token_type":"Bearer","expires_in":1800,"scope":"roles.read","actor":{"principal_id":actor,"type":"carbon","public_id":"c:test-carbon"},"org_id":"tos"}))).mount(&iam).await;
-    Mock::given(path("/api/v1/app-auth/tokens"))
-        .and(body_string_contains("slt=inactive"))
-        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error":"invalid_grant"})))
-        .mount(&iam)
-        .await;
+    harness.accounts.introspection(true).await;
+    harness.accounts.issues_briefcase_proofs().await;
+    for account in [ADA, SCOUT] {
+        sign_in(&harness, account).await?;
+    }
+    wait_for_custodian(&harness, SCOUT.0).await?;
+    let ada = bearer(&harness.token(ADA));
+    let scout = bearer(&harness.token(SCOUT));
+
+    let (status, body) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/storage-authorizations",
+        &[("authorization", &scout)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["briefcase"]["status"], "missing");
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/storage-authorizations",
+        &[("authorization", &scout)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["briefcase"]["status"], "active");
     assert_eq!(
-        call(
-            &app,
+        body["briefcase"]["scopes"],
+        json!([
+            "briefcase.uploads.reserve",
+            "briefcase.uploads.commit",
+            "briefcase.entries.list",
+            "briefcase.files.read"
+        ])
+    );
+    assert!(
+        !body.to_string().contains("sap_"),
+        "proof tokens never leave Waveform"
+    );
+    // The proof was issued from Scout's own token, for Briefcase, with Waveform's credentials.
+    let issued = harness
+        .accounts
+        .server
+        .received_requests()
+        .await
+        .ok_or("requests")?;
+    let issue = issued
+        .iter()
+        .find(|request| request.url.path() == "/v1/proofs/user-verification")
+        .ok_or("issue")?;
+    let issue_body: Value = serde_json::from_slice(&issue.body)?;
+    assert_eq!(issue_body["receiving_app"], "briefcase");
+    assert_eq!(issue_body["subject_token"], harness_token_from(&scout));
+    assert!(issue.headers.contains_key("idempotency-key"));
+    // Stored encrypted.
+    let cipher: Vec<u8> = sqlx::query_scalar(
+        "SELECT token_cipher FROM waveform_storage_proofs WHERE storage_actor_id=$1",
+    )
+    .bind(storage_key(&harness, SCOUT.0).await?)
+    .fetch_one(&harness.pool)
+    .await?;
+    assert!(!String::from_utf8_lossy(&cipher).contains("sap_briefcase-1"));
+
+    // Ada can see and revoke it for Scout, but cannot approve for Scout.
+    let (status, body) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/storage-authorizations?account=si:scout",
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["briefcase"]["status"], "active");
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/storage-authorizations?account=si:scout",
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "approval_needs_the_account");
+    let (status, body) = send(
+        &harness.app,
+        "DELETE",
+        "/api/v1/storage-authorizations?account=si:scout",
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["briefcase"]["status"], "revoked");
+    assert_eq!(body["briefcase"]["revoked_reason"], "revoked_by_custodian");
+
+    // membership.access_removed ends sign-ins and the proof.
+    let (status, _) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/storage-authorizations",
+        &[("authorization", &scout)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let removed = event(
+        "membership.access_removed",
+        json!({"uuid":"K1E","membership_id":"waveform:K1E"}),
+    );
+    assert_eq!(
+        deliver(&harness.app, &removed).await?.1["outcome"],
+        "sign_ins_ended"
+    );
+    let (_, body) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/storage-authorizations?account=K1E",
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(body["briefcase"]["status"], "revoked");
+    assert_eq!(body["briefcase"]["revoked_reason"], "access_removed");
+    let (status, _) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/me",
+        &[("authorization", &scout)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    harness.finish().await
+}
+
+/// The raw token inside an `Authorization: Bearer` value.
+fn harness_token_from(header: &str) -> &str {
+    header.trim_start_matches("Bearer ")
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn account_deletion_purges_the_accounts_data_and_keeps_a_tombstone() -> TestResult {
+    let harness = Harness::new("").await?;
+    harness.accounts.introspection(true).await;
+    for account in [ADA, BOB] {
+        sign_in(&harness, account).await?;
+    }
+    let ada = bearer(&harness.token(ADA));
+    send(
+        &harness.app,
+        "PATCH",
+        "/api/v1/preferences",
+        &[("authorization", &ada)],
+        Some(json!({"voice_profile":"puck"})),
+    )
+    .await?;
+    send(
+        &harness.app,
+        "PUT",
+        "/api/v1/provider-keys/gemini",
+        &[("authorization", &ada)],
+        Some(json!({"api_key":"AIza-ada"})),
+    )
+    .await?;
+    send(
+        &harness.app,
+        "PUT",
+        "/api/v1/provider-keys/gemini",
+        &[("authorization", &bearer(&harness.token(BOB)))],
+        Some(json!({"api_key":"AIza-bob"})),
+    )
+    .await?;
+    send(
+        &harness.app,
+        "PATCH",
+        "/api/v1/preferences",
+        &[("authorization", &bearer(&harness.token(BOB)))],
+        Some(json!({"voice_profile":"kore"})),
+    )
+    .await?;
+    let ada_key = storage_key(&harness, ADA.0).await?;
+    let bob_key = storage_key(&harness, BOB.0).await?;
+    for key in [ada_key, bob_key] {
+        sqlx::query("INSERT INTO waveform_jobs(id,plane_id,org_id,actor_id,actor_kind,operation,status,first_line,request_digest,idempotency_key_hash,created_at) VALUES($1,$2,'@',$3,'carbon','tts','running','x',$4,$5,now())")
+            .bind(Uuid::now_v7()).bind(Uuid::nil()).bind(key).bind(vec![1_u8; 32]).bind(vec![2_u8; 32])
+            .execute(&harness.pool).await?;
+        sqlx::query("INSERT INTO waveform_held_audio(request_id, storage_actor_id, filename, audio, reason, expires_at) VALUES($1,$2,'a.mp3','\\x01'::bytea,'delegated_call',now()+interval '1 day')")
+            .bind(Uuid::now_v7()).bind(key)
+            .execute(&harness.pool).await?;
+    }
+    let deleted = event(
+        "account.deleted",
+        json!({"uuid":"zQo","membership_id":"waveform:zQo"}),
+    );
+    assert_eq!(
+        deliver(&harness.app, &deleted).await?.1["outcome"],
+        "account_deleted"
+    );
+    for table in [
+        "waveform_provider_keys",
+        "waveform_account_preferences",
+        "waveform_jobs",
+    ] {
+        let ada_rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {table} WHERE actor_id=$1"
+        )))
+        .bind(ada_key)
+        .fetch_one(&harness.pool)
+        .await?;
+        let bob_rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {table} WHERE actor_id=$1"
+        )))
+        .bind(bob_key)
+        .fetch_one(&harness.pool)
+        .await?;
+        assert_eq!(ada_rows, 0, "{table}");
+        assert!(bob_rows > 0, "{table} keeps other accounts' data");
+    }
+    let held: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM waveform_held_audio WHERE storage_actor_id=$1")
+            .bind(ada_key)
+            .fetch_one(&harness.pool)
+            .await?;
+    assert_eq!(held, 0);
+    let (id, deleted_at): (Option<String>, Option<time::OffsetDateTime>) = sqlx::query_as(
+        "SELECT current_id, deleted_at FROM waveform_accounts WHERE account_uuid='zQo'",
+    )
+    .fetch_one(&harness.pool)
+    .await?;
+    assert!(id.is_none() && deleted_at.is_some());
+    // The tombstone keeps refusing the deleted account's tokens, even new ones.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let (status, body) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/me",
+        &[("authorization", &bearer(&harness.token(ADA)))],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["reason"], "account_deleted");
+    harness.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn speech_runs_for_accounts_and_for_apps_with_proofs() -> TestResult {
+    let harness = Harness::new("waveform.tts=interface;waveform.stt=interface,dm").await?;
+    harness.accounts.issues_briefcase_proofs().await;
+    briefcase_accepts_uploads(&harness.briefcase).await;
+    let ada = bearer(&harness.token(ADA));
+
+    // A direct request stores the MP3 in Ada's Briefcase files.
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/tts",
+        &[
+            ("authorization", &ada),
+            ("idempotency-key", "tts-direct-0001"),
+        ],
+        Some(json!({"text":"Hello from Ada"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["storage"]["status"], "stored");
+    assert!(
+        body["file_url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with(&harness.briefcase.uri()))
+    );
+    assert!(body["audio_url"].is_null());
+    let briefcase_requests = harness
+        .briefcase
+        .received_requests()
+        .await
+        .ok_or("requests")?;
+    assert!(
+        briefcase_requests
+            .iter()
+            .filter(|request| request.method == "POST")
+            .all(|request| {
+                request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Proof sap_briefcase-1")
+            })
+    );
+    // Replaying the same key returns the same result without new provider work.
+    let (status, replay) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/tts",
+        &[
+            ("authorization", &ada),
+            ("idempotency-key", "tts-direct-0001"),
+        ],
+        Some(json!({"text":"Hello from Ada"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay["request_id"], body["request_id"]);
+
+    // Interface calls for Ada with a proof: the audio is held by Waveform.
+    harness
+        .accounts
+        .valid_proof("sap_interface-tts", ADA, "interface", &["waveform.tts"])
+        .await;
+    let (status, held) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/tts",
+        &[
+            ("authorization", "Proof sap_interface-tts"),
+            ("idempotency-key", "tts-proof-0001"),
+        ],
+        Some(json!({"text":"Hello for Ada"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    assert_eq!(held["storage"]["status"], "held");
+    assert_eq!(held["storage"]["reason"], "delegated_call");
+    assert!(held["file_url"].is_null());
+    let audio_url = held["audio_url"].as_str().ok_or("audio_url")?;
+    let audio_path = audio_url.trim_start_matches("http://127.0.0.1:4161");
+    let (status, bytes, headers) = send_raw(
+        &harness.app,
+        "GET",
+        audio_path,
+        &[("authorization", "Proof sap_interface-tts")],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "audio/mpeg");
+    assert!(bytes.len() > 1_000);
+    // Ada can fetch it too; Bob cannot (it answers like a missing file).
+    let (status, _, _) = send_raw(
+        &harness.app,
+        "GET",
+        audio_path,
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = send_raw(
+        &harness.app,
+        "GET",
+        audio_path,
+        &[("authorization", &bearer(&harness.token(BOB)))],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // The job records which app asked.
+    let (_, jobs) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/jobs?operation=tts",
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(jobs["items"][0]["issuing_app"], "interface");
+    assert!(jobs["items"][1]["issuing_app"].is_null());
+
+    // Proofs are refused outside their scope, issuer allow-list, or validity.
+    harness
+        .accounts
+        .valid_proof("sap_stt-only", ADA, "interface", &["waveform.stt"])
+        .await;
+    harness
+        .accounts
+        .valid_proof("sap_from-dm", ADA, "dm", &["waveform.tts", "waveform.stt"])
+        .await;
+    harness.accounts.invalid_proof("sap_revoked").await;
+    for (proof, status, reason) in [
+        (
+            "Proof sap_stt-only",
+            StatusCode::FORBIDDEN,
+            "proof_scope_missing",
+        ),
+        (
+            "Proof sap_from-dm",
+            StatusCode::FORBIDDEN,
+            "proof_issuer_not_allowed",
+        ),
+        (
+            "Proof sap_revoked",
+            StatusCode::UNAUTHORIZED,
+            "invalid_proof",
+        ),
+    ] {
+        let (got, body) = send(
+            &harness.app,
             "POST",
-            "/api/v1/auth/login",
-            None,
-            json!({"slt":"test-carbon"})
+            "/api/v1/tts",
+            &[
+                ("authorization", proof),
+                ("idempotency-key", "tts-proof-refused"),
+            ],
+            Some(json!({"text":"no"})),
         )
-        .await?
-        .0,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        sandbox_call(
-            &app,
-            &secret,
-            "/api/v1/auth/login",
-            json!({"slt":"test-carbon"}),
-            "discovered-identity-login"
-        )
-        .await?
-        .0,
-        StatusCode::OK
-    );
-    assert!(
-        !sandbox_call(
-            &app,
-            &secret,
-            "/api/v1/auth/login",
-            json!({"slt":"inactive"}),
-            "inactive-identity-login"
-        )
-        .await?
-        .0
-        .is_success()
-    );
-    // The secret does not grant the missing speech scope or local lifecycle control.
-    let mut headers = HeaderMap::new();
-    headers.insert("x-testing-environment-key", secret.parse()?);
-    headers.insert("x-org-id", "tos".parse()?);
-    headers.insert("authorization", "Bearer oat_sandbox".parse()?);
-    assert!(state.authorize_test_speech(&headers, "tts").await.is_err());
-    assert_eq!(
-        sandbox_call(
-            &app,
-            &secret,
-            "/api/v1/testing-environment/clean",
-            json!({}),
-            "clean"
-        )
-        .await?
-        .0,
-        StatusCode::CONFLICT
-    );
-    let report = json!({"message":"Sandbox report only","client_version":"test"});
-    let (status, first) =
-        sandbox_call(&app, &secret, "/api/v1/reports", report.clone(), "report-1").await?;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    assert_eq!(first["notification"], "simulated");
-    assert_eq!(
-        sandbox_call(&app, &secret, "/api/v1/reports", report.clone(), "report-1")
-            .await?
-            .1,
-        first
-    );
-    assert_eq!(
-        sandbox_call(
-            &app,
-            &secret,
-            "/api/v1/reports",
-            json!({"message":"Different"}),
-            "report-1"
-        )
-        .await?
-        .0,
-        StatusCode::CONFLICT
-    );
-    assert_eq!(
-        sandbox_call(
-            &app,
-            &secret,
-            "/api/v1/reports",
-            json!({"message":secret}),
-            "secret"
-        )
-        .await?
-        .0,
-        StatusCode::BAD_REQUEST
-    );
-    for n in 2..=10 {
-        assert_eq!(
-            sandbox_call(
-                &app,
-                &secret,
-                "/api/v1/reports",
-                report.clone(),
-                &format!("report-{n}")
-            )
-            .await?
-            .0,
-            StatusCode::ACCEPTED
-        );
-    }
-    assert_eq!(
-        sandbox_call(&app, &secret, "/api/v1/reports", report, "report-11")
-            .await?
-            .0,
-        StatusCode::TOO_MANY_REQUESTS
-    );
-    assert!(state.deliver_report().await.is_ok());
-    assert_eq!(
-        sandbox_call(
-            &app,
-            &secret,
-            "/api/v1/telemetry",
-            json!({"event":"page_view"}),
-            "event"
-        )
-        .await?
-        .0,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        sandbox_call(
-            &app,
-            &secret,
-            "/api/v1/telemetry",
-            json!({"event":"page_view","secret":"not-allowed"}),
-            "event"
-        )
-        .await?
-        .0,
-        StatusCode::UNPROCESSABLE_ENTITY
-    );
-    let production_reports: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM waveform_bug_reports WHERE plane_id=$1")
-            .bind(Uuid::nil())
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(production_reports, 0);
-    let test_root = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
-    sqlx::query("UPDATE waveform_environments SET webhook_key_digest=$1 WHERE id=$2")
-        .bind(format!("{:x}", Sha256::digest(test_root.as_bytes())))
-        .bind(id)
-        .execute(&pool)
         .await?;
-    let event_id = Uuid::new_v4();
-    let event=json!({"test":{"testing_key":test_root,"metadata":{"spec_version":"1.0","event_id":event_id,"event_type":"session.revoked.v1","occurred_at":"2026-09-07T00:00:00Z","organization_id":Uuid::from_u128(2),"aggregate":{"type":"session","id":actor,"version":2}},"data":{"private":"must-not-persist"}}}).to_string();
-    assert_eq!(
-        webhook(&app, event_id, &event, true).await?,
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        webhook(&app, event_id, &event, false).await?,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        webhook(&app, event_id, &event, false).await?,
-        StatusCode::NO_CONTENT
-    );
-    let events: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM waveform_webhook_events WHERE plane_id=$1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(events, 1);
-    let other = event.replace(test_root, "Z1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6");
-    assert_eq!(
-        webhook(&app, event_id, &other, false).await?,
-        StatusCode::UNAUTHORIZED
-    );
-    // Live IAM disagreement about the bearer plane is rejected, without production fallback.
-    iam.reset().await;
-    mock_discovery(&iam, id, &secret, 1, None).await;
-    authority["authorization"]["testing_environment_id"] = Value::Null;
-    Mock::given(path("/api/v1/oauth/introspect"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(authority))
-        .mount(&iam)
+        assert_eq!(got, status, "{proof}");
+        assert_eq!(body["error"]["reason"], reason);
+    }
+
+    // Briefcase down: a direct request still completes, held with the reason.
+    harness.briefcase.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/uploads/reserve"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&harness.briefcase)
         .await;
-    assert_eq!(
-        sandbox_call(
-            &app,
-            &secret,
-            "/api/v1/reports",
-            json!({"message":"wrong world"}),
-            "wrong"
-        )
-        .await?
-        .0,
-        StatusCode::FORBIDDEN
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/tts",
+        &[
+            ("authorization", &ada),
+            ("idempotency-key", "tts-direct-0002"),
+        ],
+        Some(json!({"text":"Briefcase is down"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["storage"]["reason"], "briefcase_unavailable");
+    assert!(
+        body["storage"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Briefcase is unavailable"))
     );
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&pool)
-        .await?;
-    pool.close().await;
-    Ok(())
+
+    // STT: a direct caller reads its source with Waveform's Briefcase proof;
+    // DM may transcribe for Ada because Ada's Briefcase access already exists.
+    let source = briefcase_serves_source(&harness.briefcase).await;
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/stt",
+        &[
+            ("authorization", &ada),
+            ("idempotency-key", "stt-direct-0001"),
+        ],
+        Some(json!({"file_url": source})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["transcript"], TEST_STT_TEXT);
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/stt",
+        &[
+            ("authorization", "Proof sap_from-dm"),
+            ("idempotency-key", "stt-proof-0001"),
+        ],
+        Some(json!({"file_url": source})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // A Silicon that never used Waveform directly has no Briefcase access to lend.
+    harness
+        .accounts
+        .valid_proof("sap_for-scout", SCOUT, "interface", &["waveform.stt"])
+        .await;
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/stt",
+        &[
+            ("authorization", "Proof sap_for-scout"),
+            ("idempotency-key", "stt-proof-0002"),
+        ],
+        Some(json!({"file_url": source})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "storage_authorization_required");
+    assert!(
+        body["error"]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("waveform storage approve"))
+    );
+    harness.finish().await
 }
 
 #[tokio::test]
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
-async fn honeycomb_lifecycle_import_establishes_and_preserves_the_bound_plane() -> TestResult {
-    let (pool, schema) = database().await?;
-    let iam = MockServer::start().await;
-    let state = fixture(pool.clone(), &iam)?;
-    let app = router(state.clone());
-    let id = Uuid::new_v4();
-    let token = "test-only-honeycomb-service-token-123456";
-    // The real coordinator imports an app after earlier participants have advanced
-    // the shared revision. It does not send a separate prepare to that app first.
-    let mut op = json!({"operation_id":Uuid::new_v4(),"environment_id":id,"org_id":"tos","app_id":"waveform","environment_revision":6,"generation":1,"key_version":1,"action":"import","testing_key":"never-persist-this-root-key","snapshot":{"app_id":"waveform","selected_release":"0.5.1","source_revision":2},"reason":"requested","retired_apps":[]});
-    let route = |op: &Value| {
-        format!(
-            "/internal/honeycomb/organizations/tos/testing-environments/{id}/operations/{}",
-            op["operation_id"].as_str().unwrap_or_default()
-        )
-    };
-    let (status, receipt) = call(&app, "PUT", &route(&op), Some(token), op.clone()).await?;
+async fn contract_negotiation_and_operator_deprecation_are_durable() -> TestResult {
+    let harness = Harness::new("").await?;
+    let (status, body, headers) =
+        send_raw(&harness.app, "GET", "/api/v1/accounts", &[], None).await?;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(headers["x-waveform-api-version"], "v1");
+    assert_eq!(headers["x-waveform-contract-version"], "2.0.0");
+    assert_eq!(headers["x-waveform-protocol-version"], "1");
+    for (route, header, value) in [
+        ("/api/v2/accounts", "x-waveform-api-version", "v2"),
+        ("/api/v1/accounts", "x-waveform-api-version", "v2"),
+        ("/api/v1/accounts", "x-waveform-protocol-version", "2"),
+    ] {
+        let (status, _) = send(&harness.app, "GET", route, &[(header, value)], None).await?;
+        assert_eq!(
+            status,
+            StatusCode::NOT_ACCEPTABLE,
+            "{route} {header}={value}"
+        );
+    }
+    let (status, discovery) = send(&harness.app, "GET", "/api/contracts", &[], None).await?;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(receipt["state"], "completed");
-    assert_eq!(receipt["environment_revision"], 6);
-    assert_eq!(receipt["environment_id"], id.to_string());
-    assert_eq!(receipt["operation_id"], op["operation_id"]);
-    assert_eq!(
-        call(&app, "PUT", &route(&op), Some(token), op.clone())
-            .await?
-            .1,
-        receipt
-    );
-    // Keep the original action in the immutable request hash.
-    let mut changed = op.clone();
-    changed["action"] = json!("prepare");
-    assert_eq!(
-        call(&app, "PUT", &route(&changed), Some(token), changed.clone())
-            .await?
-            .0,
-        StatusCode::CONFLICT
-    );
-    changed = op.clone();
-    changed["operation_id"] = json!(Uuid::new_v4());
-    assert_eq!(
-        call(&app, "PUT", &route(&changed), Some(token), changed.clone())
-            .await?
-            .0,
-        StatusCode::CONFLICT
-    );
-    changed["environment_revision"] = json!(7);
-    changed["generation"] = json!(2);
-    assert_eq!(
-        call(&app, "PUT", &route(&changed), Some(token), changed.clone())
-            .await?
-            .0,
-        StatusCode::CONFLICT
-    );
-    let secret = format!("ask_{}", "I".repeat(43));
-    mock_discovery(&iam, id, &secret, 1, None).await;
-    drop(
-        state
-            .discover_plane(&secret)
+    assert_eq!(discovery["contracts"][0]["contract_version"], "2.0.0");
+    assert_eq!(discovery["compatibility"][0]["cli"], ">=0.6.0, <0.7.0");
+
+    // Deprecation is an operator command now; it needs an active successor.
+    assert!(
+        super::contracts::deprecate(&harness.pool, "v1", "v2")
             .await
-            .map_err(|_| "discovery failed")?,
+            .is_err()
     );
-    let actor = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO waveform_account_preferences(plane_id,org_id,actor_id) VALUES($1,'tos',$2)",
+    sqlx::query("INSERT INTO waveform_api_contracts(version,contract_version,state) VALUES('v2','3.0.0','active')").execute(&harness.pool).await?;
+    super::contracts::deprecate(&harness.pool, "v1", "v2").await?;
+    sqlx::query("UPDATE waveform_api_contracts SET deprecated_at=now()-interval '8 days',last_request_at=now()-interval '6 days' WHERE version='v1'").execute(&harness.pool).await?;
+    assert_eq!(
+        harness.state.sunset_contracts().await?,
+        0,
+        "recent traffic keeps v1"
+    );
+    let (status, _, headers) = send_raw(&harness.app, "GET", "/api/v1/accounts", &[], None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.contains_key("deprecation"));
+    sqlx::query("UPDATE waveform_api_contracts SET last_request_at=now()-interval '7 days' WHERE version='v1'").execute(&harness.pool).await?;
+    assert_eq!(harness.state.sunset_contracts().await?, 1);
+    let (status, body) = send(&harness.app, "GET", "/api/v1/accounts", &[], None).await?;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body["error"]["code"], "api_version_sunset");
+    let (status, _) = send(&harness.app, "GET", "/api/contracts", &[], None).await?;
+    assert_eq!(status, StatusCode::OK, "discovery survives retirement");
+    harness.finish().await
+}
+
+/// IAM-era rows as origin/main (migration 0015) stores them.
+async fn seed_iam_era(pool: &PgPool, vault: &Vault, keys: &[(&str, Uuid)]) -> TestResult {
+    let nil = Uuid::nil();
+    for (public_id, key) in keys {
+        sqlx::query("INSERT INTO waveform_actor_keys(plane_id, public_id, storage_actor_id) VALUES($1,$2,$3)")
+            .bind(nil).bind(*public_id).bind(*key).execute(pool).await?;
+    }
+    let ada = keys[0].1;
+    for (org, voice, age, openai) in [
+        ("tos", "puck", "2 days", "sk-old-tos"),
+        ("acme", "charon", "1 day", "sk-new-acme"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO waveform_account_preferences(plane_id, org_id, actor_id, voice_profile, tts_order, updated_at) VALUES($1,$2,$3,$4,'[\"openai\",\"gemini\",\"elevenlabs\"]', now()-interval '{age}')")))
+            .bind(nil).bind(org).bind(ada).bind(voice).execute(pool).await?;
+        let sealed = vault.seal(
+            openai,
+            &crate::control::legacy_key_context(org, ada, "openai"),
+        )?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO waveform_provider_keys(plane_id, org_id, actor_id, provider, secret_cipher, updated_at) VALUES($1,$2,$3,'openai',$4, now()-interval '{age}')")))
+            .bind(nil).bind(org).bind(ada).bind(sealed).execute(pool).await?;
+        sqlx::query("INSERT INTO waveform_jobs(id,plane_id,org_id,actor_id,actor_kind,operation,status,first_line,request_digest,idempotency_key_hash,created_at,finished_at,duration_ms,provider) VALUES($1,$2,$3,$4,'carbon','tts','completed',$5,$6,$7,now()-interval '3 days',now()-interval '3 days',900,'gemini')")
+            .bind(Uuid::now_v7()).bind(nil).bind(org).bind(ada).bind(format!("job in {org}")).bind(vec![1_u8; 32]).bind(vec![2_u8; 32])
+            .execute(pool).await?;
+    }
+    let gemini = vault.seal(
+        "AIza-tos-only",
+        &crate::control::legacy_key_context("tos", ada, "gemini"),
+    )?;
+    sqlx::query("INSERT INTO waveform_provider_keys(plane_id, org_id, actor_id, provider, secret_cipher) VALUES($1,'tos',$2,'gemini',$3)")
+        .bind(nil).bind(ada).bind(gemini).execute(pool).await?;
+    sqlx::query("INSERT INTO waveform_storage_grants(plane_id, org_id, actor_id, endpoint_id, token_cipher, expires_at) VALUES($1,'tos',$2,'briefcase.files.read','\\x01'::bytea, now()+interval '1 hour')")
+        .bind(nil).bind(ada).execute(pool).await?;
+    sqlx::query("INSERT INTO waveform_bug_reports(id, plane_id, org_id, actor_id, idempotency_key, payload, status) VALUES($1,$2,'tos',$3,'report-1','{\"message\":\"old\"}','sent')")
+        .bind(Uuid::now_v7()).bind(nil).bind(ada).execute(pool).await?;
+    for (public_id, key) in &keys[1..] {
+        let kind = if public_id.starts_with("si:") {
+            "silicon"
+        } else {
+            "carbon"
+        };
+        sqlx::query("INSERT INTO waveform_jobs(id,plane_id,org_id,actor_id,actor_kind,operation,status,first_line,request_digest,idempotency_key_hash,created_at) VALUES($1,$2,'tos',$3,$4,'stt','running','',$5,$6,now())")
+            .bind(Uuid::now_v7()).bind(nil).bind(*key).bind(kind).bind(vec![1_u8; 32]).bind(vec![2_u8; 32])
+            .execute(pool).await?;
+    }
+    Ok(())
+}
+
+async fn count(pool: &PgPool, sql: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+        .fetch_one(pool)
+        .await?)
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn iam_era_data_upgrades_and_links_to_accounts_without_loss() -> TestResult {
+    use crate::operator::{LinkOptions, link_identities, parse_mapping};
+    use secrecy::ExposeSecret as _;
+    let (pool, schema) = database_with(Some(15)).await?;
+    let vault = Vault::new(&SecretString::from("19".repeat(32)))?;
+    let (ada, scout, gone, legacy) = (
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+    );
+    seed_iam_era(
+        &pool,
+        &vault,
+        &[("c:ada", ada), ("si:scout", scout), ("c:gone", gone)],
     )
-    .bind(id)
-    .bind(actor)
-    .execute(&pool)
     .await?;
-    op["operation_id"] = json!(Uuid::new_v4());
-    op["environment_revision"] = json!(7);
+    // A pre-IAM 3 account kept its principal UUID as its key and has no public id row.
+    sqlx::query("INSERT INTO waveform_jobs(id,plane_id,org_id,actor_id,actor_kind,operation,status,first_line,request_digest,idempotency_key_hash,created_at) VALUES($1,$2,'tos',$3,'silicon','tts','running','legacy',$4,$5,now())")
+        .bind(Uuid::now_v7()).bind(Uuid::nil()).bind(legacy).bind(vec![1_u8; 32]).bind(vec![2_u8; 32])
+        .execute(&pool).await?;
+    let jobs_before = count(&pool, "SELECT count(*) FROM waveform_jobs").await?;
+
+    // The upgrade itself (0016, 0017) keeps every byte and seeds the IAM mapping.
+    sqlx::migrate!().run(&pool).await?;
     assert_eq!(
-        call(&app, "PUT", &route(&op), Some(token), op.clone())
-            .await?
-            .1["state"],
-        "completed"
+        count(&pool, "SELECT count(*) FROM waveform_jobs").await?,
+        jobs_before
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM waveform_account_preferences WHERE plane_id=$1 AND actor_id=$2"
+        count(
+            &pool,
+            "SELECT count(*) FROM waveform_identity_links WHERE accounts_uuid IS NULL"
         )
-        .bind(id)
-        .bind(actor)
-        .fetch_one(&pool)
         .await?,
-        1
+        3
     );
-    assert!(state.test_fence(id).await.is_ok());
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&pool)
-        .await?;
-    pool.close().await;
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
-#[allow(
-    clippy::too_many_lines,
-    clippy::unwrap_used,
-    reason = "Sequential lifecycle integration assertions on local fixtures"
-)]
-async fn honeycomb_lifecycle_replays_fences_cleans_and_keeps_tombstones() -> TestResult {
-    let (pool, schema) = database().await?;
-    let iam = MockServer::start().await;
-    let state = fixture(pool.clone(), &iam)?;
-    let app = router(state.clone());
-    let id = Uuid::new_v4();
-    let secret = format!("ask_{}", "H".repeat(43));
-    let mut op = json!({"operation_id":Uuid::new_v4(),"environment_id":id,"org_id":"tos","app_id":"waveform","environment_revision":1,"generation":1,"key_version":1,"action":"prepare","testing_key":"never-persist-this-root-key","snapshot":{}});
-    let route = |op: &Value| {
-        format!(
-            "/internal/honeycomb/organizations/tos/testing-environments/{id}/operations/{}",
-            op["operation_id"].as_str().unwrap()
-        )
-    };
-    let token = "test-only-honeycomb-service-token-123456";
     assert_eq!(
-        call(&app, "PUT", &route(&op), Some(&secret), op.clone())
-            .await?
-            .0,
-        StatusCode::UNAUTHORIZED
+        count(&pool, "SELECT count(*) FROM waveform_provider_keys").await?,
+        3
     );
-    let (status, receipt) = call(&app, "PUT", &route(&op), Some(token), op.clone()).await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(receipt["state"], "completed");
-    assert!(!receipt.to_string().contains("root-key"));
-    assert_eq!(
-        call(&app, "PUT", &route(&op), Some(token), op.clone())
-            .await?
-            .1,
-        receipt
-    );
-    let mut changed = op.clone();
-    changed["reason"] = json!("changed body");
-    assert_eq!(
-        call(&app, "PUT", &route(&changed), Some(token), changed.clone())
-            .await?
-            .0,
-        StatusCode::CONFLICT
-    );
-    mock_discovery(&iam, id, &secret, 1, None).await;
-    let plane = state
-        .discover_plane(&secret)
-        .await
-        .map_err(|_| "discovery failed")?;
-    drop(plane);
-    let actor = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO waveform_account_preferences(plane_id,org_id,actor_id) VALUES($1,'tos',$2)",
+    let contract: String = sqlx::query_scalar(
+        "SELECT contract_version FROM waveform_api_contracts WHERE version='v1'",
     )
-    .bind(id)
-    .bind(actor)
-    .execute(&pool)
+    .fetch_one(&pool)
     .await?;
-    let fence = state.test_fence(id).await.map_err(|_| "fence failed")?;
-    op["operation_id"] = json!(Uuid::new_v4());
-    op["environment_revision"] = json!(2);
-    op["generation"] = json!(2);
-    op["action"] = json!("clean");
-    let clean = op.clone();
-    let app_clone = app.clone();
-    let url = route(&op);
-    let cleaning = tokio::spawn(async move {
-        call(&app_clone, "PUT", &url, Some(token), clean)
-            .await
-            .map_err(|e| e.to_string())
-    });
-    // Wait for the durable pending barrier, without releasing the running request.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let pending: bool = sqlx::query_scalar(
-                "SELECT state='pending' FROM waveform_lifecycle WHERE environment_id=$1",
-            )
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if pending {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+    assert_eq!(contract, "2.0.0");
+
+    let mapping = parse_mapping(&format!(
+        "iam_principal_id,accounts_uuid\nc:ada,zQo\nsi:scout,K1E\n{legacy},L3g\nc:nobody,N0b\n"
+    ))
+    .map_err(|errors| errors.join("; "))?;
+    // Dry run: a full report, nothing applied.
+    let report = link_identities(
+        &pool,
+        Some(&vault),
+        &mapping,
+        LinkOptions {
+            dry_run: true,
+            ..LinkOptions::default()
+        },
+    )
     .await?;
-    assert!(state.test_fence(id).await.is_err());
-    assert!(!cleaning.is_finished());
-    drop(fence);
-    assert_eq!(cleaning.await??.1["state"], "completed");
-    let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM waveform_account_preferences WHERE plane_id=$1")
-            .bind(id)
+    assert_eq!(
+        (
+            report.linked,
+            report.unmatched.clone(),
+            report.conflicts.len()
+        ),
+        (3, vec!["c:nobody".to_owned()], 0)
+    );
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM waveform_account_keys").await?,
+        0
+    );
+    // Real run.
+    let report = link_identities(&pool, Some(&vault), &mapping, LinkOptions::default()).await?;
+    assert_eq!(report.linked, 3);
+    assert_eq!(report.preferences_consolidated, 1);
+    assert_eq!(report.provider_keys_resealed, 2);
+    assert_eq!(report.storage_grants_invalidated, 1);
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM waveform_account_keys WHERE source='link_identities'"
+        )
+        .await?,
+        3
+    );
+    let legacy_key: Uuid = sqlx::query_scalar(
+        "SELECT storage_actor_id FROM waveform_account_keys WHERE account_uuid='L3g'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(legacy_key, legacy);
+    let silicon_kind: String =
+        sqlx::query_scalar("SELECT kind FROM waveform_account_keys WHERE account_uuid='L3g'")
             .fetch_one(&pool)
             .await?;
-    assert_eq!(count, 0);
-    assert!(
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM waveform_environments WHERE id=$1)"
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await?
-    );
-    // Retrying clean does not erase new data written after its completed receipt.
-    sqlx::query(
-        "INSERT INTO waveform_account_preferences(plane_id,org_id,actor_id) VALUES($1,'tos',$2)",
-    )
-    .bind(id)
-    .bind(actor)
-    .execute(&pool)
-    .await?;
+    assert_eq!(silicon_kind, "silicon");
+    // Nothing was deleted; legacy rows stay next to the consolidated ones.
     assert_eq!(
-        call(&app, "PUT", &route(&op), Some(token), op.clone())
-            .await?
-            .1["state"],
-        "completed"
+        count(&pool, "SELECT count(*) FROM waveform_provider_keys").await?,
+        5
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM waveform_account_preferences WHERE plane_id=$1"
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await?,
+        count(&pool, "SELECT count(*) FROM waveform_account_preferences").await?,
+        3
+    );
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM waveform_storage_grants").await?,
         1
     );
-    let older_operation = op.clone();
-    for (revision, action) in [
-        (3, "disable"),
-        (4, "restore"),
-        (5, "rotate-key"),
-        (6, "purge"),
-    ] {
-        op["operation_id"] = json!(Uuid::new_v4());
-        op["environment_revision"] = json!(revision);
-        op["action"] = json!(action);
-        if action == "rotate-key" {
-            op["key_version"] = json!(2);
-        }
-        assert_eq!(
-            call(&app, "PUT", &route(&op), Some(token), op.clone())
-                .await?
-                .1["state"],
-            "completed"
-        );
-        if action == "disable" || action == "purge" {
-            assert!(state.discover_plane(&secret).await.is_err());
-        }
-        if action == "restore" {
-            assert!(state.discover_plane(&secret).await.is_ok());
-        }
-        if action == "rotate-key" {
-            assert!(state.discover_plane(&secret).await.is_err());
-        }
-    }
+    // Idempotent.
+    let again = link_identities(&pool, Some(&vault), &mapping, LinkOptions::default()).await?;
     assert_eq!(
-        call(&app, "PUT", &route(&op), Some(token), op.clone())
-            .await?
-            .1["state"],
-        "completed"
+        (
+            again.linked,
+            again.already_linked,
+            again.provider_keys_resealed
+        ),
+        (0, 3, 0)
     );
-    let mut new_stale = older_operation;
-    new_stale["operation_id"] = json!(Uuid::new_v4());
+    // A different account for linked data is a conflict, and nothing changes...
+    let conflicting = parse_mapping("si:scout,S2s\n").map_err(|errors| errors.join("; "))?;
+    let report = link_identities(&pool, Some(&vault), &conflicting, LinkOptions::default()).await?;
+    assert_eq!(report.conflicts.len(), 1);
     assert_eq!(
-        call(
-            &app,
-            "PUT",
-            &route(&new_stale),
-            Some(token),
-            new_stale.clone()
+        count(
+            &pool,
+            "SELECT count(*) FROM waveform_account_keys WHERE account_uuid='S2s'"
         )
-        .await?
-        .0,
-        StatusCode::CONFLICT
+        .await?,
+        0
     );
-    assert!(
-        !sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM waveform_environments WHERE id=$1)"
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await?
+    // ...unless the operator explicitly relinks a link this command made.
+    let report = link_identities(
+        &pool,
+        Some(&vault),
+        &conflicting,
+        LinkOptions {
+            relink: true,
+            ..LinkOptions::default()
+        },
+    )
+    .await?;
+    assert_eq!((report.linked, report.conflicts.len()), (1, 0));
+    let back = parse_mapping("si:scout,K1E\n").map_err(|errors| errors.join("; "))?;
+    link_identities(
+        &pool,
+        Some(&vault),
+        &back,
+        LinkOptions {
+            relink: true,
+            ..LinkOptions::default()
+        },
+    )
+    .await?;
+
+    // The linked accounts sign in and see their pre-cutover data.
+    let harness = Harness::over(pool.clone(), schema, "").await?;
+    let ada_bearer = bearer(&harness.token(ADA));
+    let (status, jobs) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/jobs",
+        &[("authorization", &ada_bearer)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{jobs}");
+    assert_eq!(jobs["items"].as_array().map(Vec::len), Some(2));
+    let (_, preferences) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/preferences",
+        &[("authorization", &ada_bearer)],
+        None,
+    )
+    .await?;
+    assert_eq!(
+        preferences["voice_profile"], "charon",
+        "the newest legacy preference wins"
     );
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&pool)
-        .await?;
-    pool.close().await;
-    Ok(())
-}
-#[path = "source_target_tests.rs"]
-mod source_target_tests;
-
-#[test]
-fn provider_failures_do_not_clear_application_sessions() {
-    for (status, code, expected) in [
-        (401, "invalid_client", StatusCode::SERVICE_UNAVAILABLE),
-        (403, "invalid_client", StatusCode::SERVICE_UNAVAILABLE),
-        (400, "invalid_request", StatusCode::SERVICE_UNAVAILABLE),
-        (401, "unknown_auth_failure", StatusCode::SERVICE_UNAVAILABLE),
-        (400, "invalid_grant", StatusCode::UNAUTHORIZED),
-        (401, "invalid_grant", StatusCode::UNAUTHORIZED),
-        (400, "refresh_token_reuse", StatusCode::UNAUTHORIZED),
-        (401, "unauthenticated", StatusCode::UNAUTHORIZED),
-    ] {
-        let error = silicon_iam_client::ApiError {
-            status,
-            code: code.to_owned(),
-            message: "provider response".to_owned(),
-            details: None,
-            request_id: None,
-        };
-        assert_eq!(ControlError::iam(error.into()).status, expected);
-    }
-}
-
-/// Install an already-approved encrypted fixture grant using the same selected
-/// account/plane binding as the HTTP broker (the broker itself is tested end to end).
-pub(super) async fn seed_storage(
-    state: &ControlState,
-    root: Option<&str>,
-    org: &str,
-    selected_org: &str,
-    subject: &str,
-    testing: bool,
-) -> TestResult {
-    let mut headers = HeaderMap::new();
-    headers.insert("authorization", "Bearer oat_fixture".parse()?);
-    headers.insert("x-org-id", org.parse()?);
-    if let Some(root) = root {
-        headers.insert("x-testing-environment-key", root.parse()?);
-    }
-    let identity = state
-        .identity(&headers)
+    let actor = crate::domain::auth::AuthorizedActor {
+        actor: crate::domain::identity::Actor::new(
+            crate::domain::identity::ActorKind::Carbon,
+            crate::domain::identity::ActorId::new(ada)?,
+        ),
+        account: crate::domain::identity::AccountRef {
+            uuid: "zQo".parse()?,
+            id: "c:ada".to_owned(),
+        },
+        originating_application: None,
+        expires_at: None,
+        scopes: Vec::new(),
+        token_family: None,
+    };
+    let keys = crate::application::ports::ProviderKeyStore::load(harness.state.as_ref(), &actor)
         .await
-        .map_err(|_| "fixture identity")?;
-    for endpoint in super::storage::ENDPOINTS {
-        let body = json!({"grant_id":Uuid::new_v4(),"access_token":format!("oba_{endpoint}"),"refresh_token":format!("obr_{endpoint}"),"token_type":"Bearer","expires_in":1800,"expires_at":"2099-01-01T00:00:00Z","audience":"briefcase","endpoint_id":endpoint,"org_id":selected_org,"actor":{"type":if subject.starts_with("si:"){"silicon"}else{"carbon"},"public_id":subject},"scope":"","testing_context":testing.then(||json!({"app_id":"briefcase","app_secret":format!("ask_{}","B".repeat(43)),"iam_test_key":"I".repeat(32)}))});
-        let context = format!(
-            "storage-grant/{}/{}/{}/{endpoint}",
-            identity.plane.id, org, identity.storage_actor_id
-        );
-        let cipher = state
-            .vault()
-            .map_err(|_| "vault")?
-            .seal(&body.to_string(), &context)?;
-        sqlx::query("INSERT INTO waveform_storage_grants(plane_id,org_id,actor_id,endpoint_id,token_cipher,expires_at) VALUES($1,$2,$3,$4,$5,'2099-01-01') ON CONFLICT(plane_id,org_id,actor_id,endpoint_id) DO UPDATE SET token_cipher=excluded.token_cipher,invalidated_at=NULL")
-            .bind(identity.plane.id).bind(org).bind(identity.storage_actor_id).bind(endpoint).bind(cipher).execute(&state.pool).await?;
-    }
-    Ok(())
+        .map_err(|error| error.to_string())?;
+    assert_eq!(
+        keys[&crate::domain::provider::ProviderName::OpenAi].expose_secret(),
+        "sk-new-acme"
+    );
+    assert_eq!(
+        keys[&crate::domain::provider::ProviderName::Gemini].expose_secret(),
+        "AIza-tos-only"
+    );
+
+    // An account that signed in before its mapping ran can be merged when its new key is unused.
+    sign_in(&harness, ("Fr3", "carbon", "c:gone")).await?;
+    let late = parse_mapping("c:gone,Fr3\n").map_err(|errors| errors.join("; "))?;
+    let report = link_identities(&pool, Some(&vault), &late, LinkOptions::default()).await?;
+    assert_eq!(report.conflicts.len(), 1, "{:?}", report.conflicts);
+    let report = link_identities(
+        &pool,
+        Some(&vault),
+        &late,
+        LinkOptions {
+            merge: true,
+            ..LinkOptions::default()
+        },
+    )
+    .await?;
+    assert_eq!((report.linked, report.conflicts.len()), (1, 0));
+    let merged: Uuid = sqlx::query_scalar(
+        "SELECT storage_actor_id FROM waveform_account_keys WHERE account_uuid='Fr3'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(merged, gone);
+    harness.finish().await
 }

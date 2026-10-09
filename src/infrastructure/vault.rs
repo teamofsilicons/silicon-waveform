@@ -10,7 +10,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 /// Encryption key held outside PostgreSQL. Associated data binds every secret
-/// to its plane, owner and purpose, preventing encrypted-row substitution.
+/// to its owner and purpose, preventing encrypted-row substitution.
 #[derive(Clone)]
 pub struct Vault {
     key: Zeroizing<[u8; 32]>,
@@ -18,6 +18,10 @@ pub struct Vault {
 
 impl Vault {
     /// Parses a 32-byte lowercase hex deployment key without retaining its text.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted reason unless the key is 64 lowercase hex characters.
     pub fn new(encoded: &SecretString) -> Result<Self, &'static str> {
         let raw = encoded.expose_secret().as_bytes();
         if raw.len() != 64 {
@@ -37,6 +41,10 @@ impl Vault {
     }
 
     /// Encrypts a secret with a fresh random 192-bit nonce.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted reason if encryption fails.
     pub fn seal(&self, value: &str, context: &str) -> Result<Vec<u8>, &'static str> {
         let cipher = XChaCha20Poly1305::new((&*self.key).into());
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -56,6 +64,10 @@ impl Vault {
     }
 
     /// Decrypts a secret only when its original storage context matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted reason for a wrong key, wrong context or damaged ciphertext.
     pub fn open(&self, stored: &[u8], context: &str) -> Result<SecretString, &'static str> {
         if stored.len() < 40 {
             return Err("invalid encrypted secret");
@@ -77,6 +89,10 @@ impl Vault {
     }
 
     /// Creates an indexed digest without disclosing secret material to the DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted reason if the MAC cannot be keyed.
     pub fn digest(&self, value: &str, purpose: &str) -> Result<Vec<u8>, &'static str> {
         let mut mac = <Hmac<Sha256> as hmac::Mac>::new_from_slice(&*self.key)
             .map_err(|_| "secret digest failed")?;

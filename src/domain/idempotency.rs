@@ -13,11 +13,15 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::{
-    identity::{Actor, OrganizationId, RequestId},
-    media::{BriefcaseFileUrl, MediaDuration, StoredAudio, TemporaryMediaUrl},
+    identity::{Actor, ApplicationId, RequestId},
+    media::{AudioStorage, MediaDuration},
     provider::ProviderName,
     speech::{SttRequest, SttResult, TtsRequest, TtsResult},
 };
+
+/// Value written into the retained legacy `org_id` columns of every new row.
+/// Rows are owned by an account alone; `@` can never collide with a legacy value.
+pub const ACCOUNT_SCOPE: &str = "@";
 
 /// Minimum public idempotency-key length.
 pub const MIN_IDEMPOTENCY_KEY_LENGTH: usize = 8;
@@ -101,15 +105,13 @@ pub enum IdempotencyKeyError {
     InvalidCharacters,
 }
 
-/// Complete tenant and operation boundary for one idempotency key.
+/// Complete account and operation boundary for one idempotency key.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct IdempotencyScope {
-    /// Isolated Waveform plane; nil identifies production.
+    /// Legacy plane column; always nil (production) in the Accounts era.
     pub plane_id: uuid::Uuid,
-    /// Represented actor, including actor kind.
+    /// Represented account: kind and private storage key.
     pub actor: Actor,
-    /// Verified organization membership.
-    pub organization_id: OrganizationId,
     /// Speech operation.
     pub operation: SpeechOperation,
     /// Caller key.
@@ -327,15 +329,15 @@ pub struct IdempotencyClaim {
     pub lease_duration: Duration,
 }
 
-/// Durable TTS fields retained without an expiring delivery capability.
+/// Durable TTS fields retained for provider-free replay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletedTtsOperation {
     /// Profile used for the original synthesis.
     pub voice_profile: Option<super::voice::VoiceProfileRef>,
     /// Original operation correlation ID.
     pub request_id: RequestId,
-    /// Stable authenticated Briefcase reference.
-    pub permanent_url: BriefcaseFileUrl,
+    /// Where the MP3 was put: Briefcase, or held by Waveform.
+    pub storage: AudioStorage,
     /// Provider that produced the stored audio.
     pub provider: ProviderName,
     /// Measured normalized-audio duration.
@@ -349,24 +351,17 @@ impl CompletedTtsOperation {
         Self {
             voice_profile: result.voice_profile.clone(),
             request_id: result.request_id,
-            permanent_url: result.audio.permanent_url.clone(),
+            storage: result.storage.clone(),
             provider: result.provider,
             duration: result.duration,
         }
     }
 
-    /// Materializes the public response with a newly authorized temporary URL.
+    /// Materializes the public response of a replay.
     #[must_use]
-    pub fn with_temporary_url(self, temporary_url: TemporaryMediaUrl) -> TtsResult {
-        let mut result = TtsResult::new(
-            self.request_id,
-            StoredAudio {
-                permanent_url: self.permanent_url,
-                temporary_url: Some(temporary_url),
-            },
-            self.provider,
-            self.duration,
-        );
+    pub fn into_result(self) -> TtsResult {
+        let mut result =
+            TtsResult::new(self.request_id, self.storage, self.provider, self.duration);
         result.voice_profile = self.voice_profile;
         result
     }
@@ -443,8 +438,10 @@ pub struct IdempotencyRelease {
 pub struct SpeechJobStart {
     /// Profile selected for TTS; absent for STT and legacy callers.
     pub voice_profile: Option<super::voice::VoiceProfileRef>,
-    /// Authoritative actor, organization, plane, operation and idempotency scope.
+    /// Authoritative account, operation and idempotency scope.
     pub scope: IdempotencyScope,
+    /// The app that called for the account with a proof, recorded on the job.
+    pub issuing_app: Option<ApplicationId>,
     /// Current attempt ownership token.
     pub lease_id: IdempotencyLeaseId,
     /// First input line for TTS; empty until STT produces a transcript.

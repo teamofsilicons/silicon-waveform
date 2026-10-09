@@ -485,44 +485,6 @@ impl fmt::Display for BriefcaseFileUrl {
     }
 }
 
-/// Expiring HTTPS delivery URL. Debug output is intentionally redacted.
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct TemporaryMediaUrl(Url);
-
-impl TemporaryMediaUrl {
-    /// Validates a credential-free HTTPS URL, allowing a signed query string.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MediaError::InvalidUrl`] when the URL is unsafe or contains
-    /// a fragment.
-    pub fn new(value: Url) -> Result<Self, MediaError> {
-        validate_https_url(&value)?;
-        if value.fragment().is_some() {
-            return Err(MediaError::InvalidUrl);
-        }
-        Ok(Self(value))
-    }
-
-    /// Returns the URL for explicit boundary translation.
-    #[must_use]
-    pub const fn as_url(&self) -> &Url {
-        &self.0
-    }
-}
-
-impl fmt::Debug for TemporaryMediaUrl {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("TemporaryMediaUrl([REDACTED])")
-    }
-}
-
-impl fmt::Display for TemporaryMediaUrl {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 /// Safe filename for generated TTS audio in Briefcase.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GeneratedAudioFileName(String);
@@ -559,13 +521,111 @@ impl fmt::Display for GeneratedAudioFileName {
     }
 }
 
-/// Durable and immediate-playback references returned by Briefcase.
+/// Why Waveform kept generated audio itself instead of storing it in Briefcase.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldReason {
+    /// Another app called for the account with a proof; Waveform holds no
+    /// Waveform sign-in for the account, so it cannot act at Briefcase.
+    DelegatedCall,
+    /// Waveform could not get a Briefcase proof for the account.
+    StorageNotAuthorized,
+    /// Briefcase refused the proof or the upload.
+    BriefcaseRefused,
+    /// Briefcase could not be reached or failed.
+    BriefcaseUnavailable,
+    /// Briefcase did not answer in time.
+    BriefcaseTimeout,
+    /// Briefcase does not offer the delegated upload contract Waveform needs.
+    BriefcaseContractUnavailable,
+}
+
+impl HeldReason {
+    /// Stable wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DelegatedCall => "delegated_call",
+            Self::StorageNotAuthorized => "storage_not_authorized",
+            Self::BriefcaseRefused => "briefcase_refused",
+            Self::BriefcaseUnavailable => "briefcase_unavailable",
+            Self::BriefcaseTimeout => "briefcase_timeout",
+            Self::BriefcaseContractUnavailable => "briefcase_contract_unavailable",
+        }
+    }
+
+    /// Exact explanation for the response.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::DelegatedCall => {
+                "Not stored in Briefcase: another app called Waveform for this account with a proof, and Waveform only stores in Briefcase when the account calls it directly. Fetch audio_url with the same proof before it expires."
+            }
+            Self::StorageNotAuthorized => {
+                "Not stored in Briefcase: Waveform could not get Briefcase access for this account. Run `waveform storage approve` (or sign in again) and retry with a new Idempotency-Key to store future speech."
+            }
+            Self::BriefcaseRefused => {
+                "Not stored in Briefcase: Briefcase refused Waveform's access or the upload. The audio is held by Waveform at audio_url until it expires."
+            }
+            Self::BriefcaseUnavailable => {
+                "Not stored in Briefcase: Briefcase is unavailable. The audio is held by Waveform at audio_url until it expires."
+            }
+            Self::BriefcaseTimeout => {
+                "Not stored in Briefcase: Briefcase did not answer in time. The audio is held by Waveform at audio_url until it expires."
+            }
+            Self::BriefcaseContractUnavailable => {
+                "Not stored in Briefcase: Briefcase does not offer the upload contract Waveform needs yet. The audio is held by Waveform at audio_url until it expires."
+            }
+        }
+    }
+}
+
+impl FromStr for HeldReason {
+    type Err = MediaError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        [
+            Self::DelegatedCall,
+            Self::StorageNotAuthorized,
+            Self::BriefcaseRefused,
+            Self::BriefcaseUnavailable,
+            Self::BriefcaseTimeout,
+            Self::BriefcaseContractUnavailable,
+        ]
+        .into_iter()
+        .find(|reason| reason.as_str() == value)
+        .ok_or(MediaError::InvalidUrl)
+    }
+}
+
+/// Where a generated MP3 ended up.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoredAudio {
-    /// Durable authenticated reference.
-    pub permanent_url: BriefcaseFileUrl,
-    /// Expiring immediate-playback reference.
-    pub temporary_url: Option<TemporaryMediaUrl>,
+pub enum AudioStorage {
+    /// Stored in the account's own Briefcase files.
+    Briefcase {
+        /// Durable authenticated Briefcase reference.
+        permanent_url: BriefcaseFileUrl,
+    },
+    /// Held by Waveform until `expires_at`, served to the requesting account.
+    Held {
+        /// Why it is not in Briefcase.
+        reason: HeldReason,
+        /// Waveform URL serving the MP3 (`GET /api/v1/audio/{request_id}`).
+        audio_url: Url,
+        /// When Waveform deletes it.
+        expires_at: OffsetDateTime,
+    },
+}
+
+impl AudioStorage {
+    /// The Briefcase reference, when the audio is in Briefcase.
+    #[must_use]
+    pub const fn permanent_url(&self) -> Option<&BriefcaseFileUrl> {
+        match self {
+            Self::Briefcase { permanent_url } => Some(permanent_url),
+            Self::Held { .. } => None,
+        }
+    }
 }
 
 /// Media validation failure.
@@ -597,8 +657,26 @@ pub enum MediaError {
     InvalidPermanentUrl,
 }
 
+/// True for hosts that never leave this machine (`localhost`, `*.localhost`,
+/// `127.0.0.0/8`, `::1`). Plain `http://` is accepted only for these, so a local
+/// stack works while production stays on HTTPS (configuration enforces HTTPS in
+/// production regardless).
+#[must_use]
+pub fn is_loopback_host(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
 fn validate_https_url(value: &Url) -> Result<(), MediaError> {
-    if value.scheme() != "https"
+    let secure = value.scheme() == "https" || (value.scheme() == "http" && is_loopback_host(value));
+    if !secure
         || value.host_str().is_none()
         || !value.username().is_empty()
         || value.password().is_some()
@@ -618,7 +696,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        AudioArtifact, BriefcaseFileUrl, BriefcaseOrigin, GeneratedAudioFileName,
+        AudioArtifact, BriefcaseFileUrl, BriefcaseOrigin, GeneratedAudioFileName, HeldReason,
         MAX_SOURCE_MEDIA_BYTES, MediaError, MediaSizeLimit, ProviderAudioFormat, SourceMedia,
         SourceMediaType,
     };
@@ -663,6 +741,44 @@ mod tests {
         assert!(
             artifact.is_ok_and(|value| { !format!("{value:?}").contains("very-secret-audio") })
         );
+    }
+
+    #[test]
+    fn loopback_http_is_allowed_for_local_stacks_only() {
+        for local in [
+            "http://localhost:4100/u/zQo/a.mp3",
+            "http://127.0.0.1:4100/a.mp3",
+            "http://[::1]:4100/a.mp3",
+        ] {
+            assert!(
+                Url::parse(local)
+                    .map_err(|_| MediaError::InvalidUrl)
+                    .and_then(BriefcaseFileUrl::new)
+                    .is_ok(),
+                "{local}"
+            );
+        }
+        assert!(
+            Url::parse("http://localhost.attacker.test/a.mp3")
+                .map_err(|_| MediaError::InvalidUrl)
+                .and_then(BriefcaseFileUrl::new)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn held_reasons_round_trip() {
+        for reason in [
+            HeldReason::DelegatedCall,
+            HeldReason::StorageNotAuthorized,
+            HeldReason::BriefcaseRefused,
+            HeldReason::BriefcaseUnavailable,
+            HeldReason::BriefcaseTimeout,
+            HeldReason::BriefcaseContractUnavailable,
+        ] {
+            assert_eq!(HeldReason::from_str(reason.as_str()), Ok(reason));
+            assert!(!reason.message().is_empty());
+        }
     }
 
     #[test]

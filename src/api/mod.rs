@@ -5,7 +5,7 @@ pub mod headers;
 pub mod middleware;
 pub mod model;
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -27,7 +27,6 @@ use crate::{
     domain::{
         capabilities::Capabilities,
         identity::RequestId,
-        provider::{STT_PROVIDER_CHAIN, TTS_PROVIDER_CHAIN, resolve_order},
         speech::{SpeechValidationError, SttResult, TtsResult},
     },
 };
@@ -52,7 +51,6 @@ const TRANSPORT_DEADLINE_ALLOWANCE: Duration = Duration::from_secs(5);
 pub struct ApiState {
     control: Option<Arc<crate::control::ControlState>>,
     service: Arc<WaveformService>,
-    fixture_service: Option<Arc<WaveformService>>,
     readiness: ReadinessChecks,
     tts_deadline: Duration,
     stt_deadline: Duration,
@@ -70,7 +68,6 @@ impl ApiState {
         Self {
             control: None,
             service,
-            fixture_service: None,
             readiness,
             tts_deadline,
             stt_deadline,
@@ -81,14 +78,6 @@ impl ApiState {
     #[must_use]
     pub fn with_control(mut self, control: Arc<crate::control::ControlState>) -> Self {
         self.control = Some(control);
-        self
-    }
-
-    /// Adds the deterministic speech service used only after the control plane
-    /// authenticates an explicitly selected test environment.
-    #[must_use]
-    pub fn with_fixture_service(mut self, service: Arc<WaveformService>) -> Self {
-        self.fixture_service = Some(service);
         self
     }
 }
@@ -143,11 +132,11 @@ pub fn router(state: ApiState, server: &ServerSettings) -> Router {
     );
     let sensitive_headers = [
         header::AUTHORIZATION,
+        HeaderName::from_static("idempotency-key"),
+        HeaderName::from_static("x-accounts-signature"),
+        // Retired IAM-era credentials are still redacted if an old client sends them.
         HeaderName::from_static("x-iam-obo-access-token"),
         HeaderName::from_static("x-iam-obo-access-proof"),
-        HeaderName::from_static("idempotency-key"),
-        HeaderName::from_static("x-testing-environment-key"),
-        HeaderName::from_static("x-silicon-iam-signature"),
     ];
 
     let control = state.control.clone();
@@ -183,198 +172,84 @@ pub fn router(state: ApiState, server: &ServerSettings) -> Router {
         .layer(axum_middleware::from_fn(middleware::request_id))
 }
 
-#[allow(clippy::too_many_lines)]
 async fn synthesize(
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: Result<Json<TtsRequestBody>, JsonRejection>,
 ) -> Response {
     let candidate_request_id = headers::request_id(&headers);
-    let raw_headers = headers.clone();
     let headers = match SpeechHeaders::parse(&headers) {
         Ok(headers) => headers,
         Err(error) => return header_error(&error, candidate_request_id).into_response(),
     };
-    let mut request = match body {
+    let request = match body {
         Ok(Json(body)) => match body.into_domain() {
             Ok(request) => request,
             Err(error) => return body_error(&error, headers.request_id).into_response(),
         },
         Err(error) => return json_error(&error, headers.request_id).into_response(),
     };
-    // The control-plane IAM lookup currently authenticates bearer sessions.
-    // OBO speech requests are authorized by the application IAM adapter and
-    // must retain the configured default chain until a matching OBO identity
-    // lookup is available here.
-    let _request_fence = if raw_headers.contains_key("x-testing-environment-key") {
-        let Some(control) = &state.control else {
-            return ApiError::not_ready(headers.request_id).into_response();
-        };
-        match control.speech_fence(&raw_headers).await {
-            Ok(fence) => fence,
-            Err(error) => return error.into_response(),
-        }
-    } else {
-        None
-    };
-    let account_order = if raw_headers.get("authorization").is_some()
-        && let Some(control) = &state.control
+    if request
+        .provider_order
+        .as_ref()
+        .is_some_and(std::vec::Vec::is_empty)
     {
-        match control.effective_provider_order(&raw_headers, "tts").await {
-            Ok(order) => order,
-            Err(error) => return error.into_response(),
-        }
-    } else {
-        TTS_PROVIDER_CHAIN.to_vec()
-    };
-    let requested_order = match request.provider_order.take() {
-        Some(order) if order.is_empty() => {
-            return ApiError::invalid_request(headers.request_id).into_response();
-        }
-        Some(order) => order,
-        None => Vec::new(),
-    };
-    let Some(provider_order) = resolve_order(&requested_order, &account_order) else {
         return ApiError::invalid_request(headers.request_id).into_response();
-    };
-    request = request.with_provider_order(provider_order);
+    }
     let request_id = headers.request_id;
-    let mut context = SpeechRequestContext {
+    let context = SpeechRequestContext {
         request_id,
-        plane_id: uuid::Uuid::nil(),
-        organization_id: headers.organization_id,
         credentials: headers.credentials,
         idempotency_key: headers.idempotency_key,
     };
-
-    let test_authorization = if raw_headers.get("x-testing-environment-key").is_some() {
-        let Some(control) = &state.control else {
-            return ApiError::not_ready(request_id).into_response();
-        };
-        let Some(fixture_service) = &state.fixture_service else {
-            return ApiError::not_ready(request_id).into_response();
-        };
-        let selected = match control.authorize_test_speech(&raw_headers, "tts").await {
-            Ok(selected) => selected,
-            Err(error) => return error.into_response(),
-        };
-        context.plane_id = selected.plane_id;
-        let service =
-            Arc::new(fixture_service.with_storage_ports(selected.iam, selected.briefcase));
-        Some((service, selected.authorization, selected.fence))
-    } else {
-        None
-    };
-    let operation: Pin<Box<dyn Future<Output = Result<_, _>> + Send>> =
-        if let Some((fixture_service, authorization, fence)) = test_authorization {
-            Box::pin(async move {
-                let _fence = fence;
-                fixture_service
-                    .synthesize_pre_authorized(context, request, authorization)
-                    .await
-            })
-        } else {
-            Box::pin(state.service.synthesize(context, request))
-        };
-
-    match tokio::time::timeout(state.tts_deadline, operation).await {
+    match tokio::time::timeout(
+        state.tts_deadline,
+        state.service.synthesize(context, request),
+    )
+    .await
+    {
         Ok(Ok(response)) => tts_success(response),
         Ok(Err(error)) => ApiError::from_waveform(error, request_id).into_response(),
         Err(_) => ApiError::request_timeout(request_id).into_response(),
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn transcribe(
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: Result<Json<SttRequestBody>, JsonRejection>,
 ) -> Response {
     let candidate_request_id = headers::request_id(&headers);
-    let raw_headers = headers.clone();
     let headers = match SpeechHeaders::parse(&headers) {
         Ok(headers) => headers,
         Err(error) => return header_error(&error, candidate_request_id).into_response(),
     };
-    let mut request = match body {
+    let request = match body {
         Ok(Json(body)) => match body.into_domain() {
             Ok(request) => request,
             Err(error) => return body_error(&error, headers.request_id).into_response(),
         },
         Err(error) => return json_error(&error, headers.request_id).into_response(),
     };
-    let _request_fence = if raw_headers.contains_key("x-testing-environment-key") {
-        let Some(control) = &state.control else {
-            return ApiError::not_ready(headers.request_id).into_response();
-        };
-        match control.speech_fence(&raw_headers).await {
-            Ok(fence) => fence,
-            Err(error) => return error.into_response(),
-        }
-    } else {
-        None
-    };
-    let account_order = if raw_headers.get("authorization").is_some()
-        && let Some(control) = &state.control
+    if request
+        .provider_order
+        .as_ref()
+        .is_some_and(std::vec::Vec::is_empty)
     {
-        match control.effective_provider_order(&raw_headers, "stt").await {
-            Ok(order) => order,
-            Err(error) => return error.into_response(),
-        }
-    } else {
-        STT_PROVIDER_CHAIN.to_vec()
-    };
-    let requested_order = match request.provider_order.take() {
-        Some(order) if order.is_empty() => {
-            return ApiError::invalid_request(headers.request_id).into_response();
-        }
-        Some(order) => order,
-        None => Vec::new(),
-    };
-    let Some(provider_order) = resolve_order(&requested_order, &account_order) else {
         return ApiError::invalid_request(headers.request_id).into_response();
-    };
-    request = request.with_provider_order(provider_order);
+    }
     let request_id = headers.request_id;
-    let mut context = SpeechRequestContext {
+    let context = SpeechRequestContext {
         request_id,
-        plane_id: uuid::Uuid::nil(),
-        organization_id: headers.organization_id,
         credentials: headers.credentials,
         idempotency_key: headers.idempotency_key,
     };
-
-    let test_authorization = if raw_headers.get("x-testing-environment-key").is_some() {
-        let Some(control) = &state.control else {
-            return ApiError::not_ready(request_id).into_response();
-        };
-        let Some(fixture_service) = &state.fixture_service else {
-            return ApiError::not_ready(request_id).into_response();
-        };
-        let selected = match control.authorize_test_speech(&raw_headers, "stt").await {
-            Ok(selected) => selected,
-            Err(error) => return error.into_response(),
-        };
-        context.plane_id = selected.plane_id;
-        let service =
-            Arc::new(fixture_service.with_storage_ports(selected.iam, selected.briefcase));
-        Some((service, selected.authorization, selected.fence))
-    } else {
-        None
-    };
-    let operation: Pin<Box<dyn Future<Output = Result<_, _>> + Send>> =
-        if let Some((fixture_service, authorization, fence)) = test_authorization {
-            Box::pin(async move {
-                let _fence = fence;
-                fixture_service
-                    .transcribe_pre_authorized(context, request, authorization)
-                    .await
-            })
-        } else {
-            Box::pin(state.service.transcribe(context, request))
-        };
-
-    match tokio::time::timeout(state.stt_deadline, operation).await {
+    match tokio::time::timeout(
+        state.stt_deadline,
+        state.service.transcribe(context, request),
+    )
+    .await
+    {
         Ok(Ok(response)) => stt_success(response),
         Ok(Err(error)) => ApiError::from_waveform(error, request_id).into_response(),
         Err(_) => ApiError::request_timeout(request_id).into_response(),
@@ -453,15 +328,10 @@ fn insert_request_id(response: &mut Response, request_id: RequestId) {
 
 fn header_error(error: &HeaderError, request_id: RequestId) -> ApiError {
     match error {
-        HeaderError::MissingCredentials
-        | HeaderError::InvalidAuthorization
-        | HeaderError::InvalidCredential(_) => ApiError::unauthenticated(request_id),
+        HeaderError::Credentials(failure) => ApiError::authentication(*failure, request_id),
         HeaderError::MissingHeader(_)
         | HeaderError::InvalidHeader(_)
         | HeaderError::DuplicateHeader(_)
-        | HeaderError::IncompleteOboCredentials
-        | HeaderError::AmbiguousCredentials
-        | HeaderError::InvalidIdentity(_)
         | HeaderError::InvalidIdempotencyKey => ApiError::invalid_request(request_id),
     }
 }

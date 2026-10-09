@@ -1,162 +1,80 @@
-//! Application login: issued SLTs, plus IAM-validated public IDs in testing only.
+//! Discovery and the signed-in account.
 
-use super::{ControlError, ControlState};
+use std::sync::Arc;
+
 use axum::{
     Json,
     extract::State,
     response::{IntoResponse as _, Response},
 };
-use http::{HeaderMap, StatusCode, header};
-use serde::Deserialize;
-use silicon_iam_client::{IdempotencyKey, Mutation, models};
-use std::sync::Arc;
+use http::{HeaderMap, header};
+use serde_json::{Value, json};
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Login {
-    slt: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Refresh {
-    refresh_token: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Logout {
-    token: String,
-}
+use super::{ControlError, ControlState};
+use crate::{domain::auth::WaveformAction, infrastructure::directory::AccountRecord};
 
-fn validate_token(token: &str, prefix: &str) -> Result<(), ControlError> {
-    if !token.starts_with(prefix)
-        || token.len() > 16_384
-        || token.len() <= prefix.len()
-        || !token.bytes().all(|value| value.is_ascii_graphic())
-    {
-        return Err(ControlError::bad_request("invalid_token"));
-    }
-    Ok(())
-}
-
-fn mutation(headers: &HeaderMap) -> Result<Mutation, ControlError> {
-    super::single_header(headers, "idempotency-key")?.map_or_else(
-        || Ok(Mutation::new()),
-        |key| {
-            IdempotencyKey::parse(key)
-                .map(Mutation::with_key)
-                .map_err(|_| ControlError::bad_request("invalid_idempotency_key"))
-        },
+/// Where to sign in and where the docs are. Public, no credentials.
+pub(super) async fn discovery(State(state): State<Arc<ControlState>>) -> Response {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "app_id": state.app_id,
+            "accounts_url": state.accounts_url,
+            "api_url": state.public_url.as_str().trim_end_matches('/'),
+            "docs_url": "https://docs.waveform.teamofsilicons.com",
+            "proof_scopes": crate::config::PROOF_SCOPES,
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
     )
+        .into_response()
 }
 
-pub(super) async fn iam(
+fn account_json(record: &AccountRecord) -> Value {
+    json!({
+        "uuid": record.uuid,
+        "id": record.current_id,
+        "kind": record.kind,
+        "display_name": record.display_name,
+        "pfp_url": record.pfp_url,
+        "custodian": record.custodian.as_ref().map(|(uuid, id)| json!({"uuid": uuid, "id": id})),
+    })
+}
+
+/// The signed-in account (bearer tokens only).
+pub(super) async fn me(
     State(state): State<Arc<ControlState>>,
     headers: HeaderMap,
 ) -> Result<Response, ControlError> {
-    // Discovery is public, but an explicit sandbox must still be valid.
-    let testing_environment_id =
-        if super::single_header(&headers, "x-testing-environment-key")?.is_some() {
-            state.plane(&headers).await?.iam_environment_id
-        } else {
-            None
-        };
+    let caller = state
+        .caller(&headers, WaveformAction::ManageAccount)
+        .await?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(serde_json::json!({
+        Json(json!({
+            "authenticated": true,
             "app_id": state.app_id,
-            "iam_base_url": state.iam.base_url(),
-            "testing_environment_id": testing_environment_id,
+            "account": account_json(&caller.record),
+            "via": "bearer",
+            "expires_at": caller.actor.expires_at.and_then(|at| at.format(&time::format_description::well_known::Rfc3339).ok()),
         })),
     )
         .into_response())
 }
 
-pub(super) async fn login(
+/// The Silicons Waveform knows that the signed-in Carbon looks after.
+pub(super) async fn silicons(
     State(state): State<Arc<ControlState>>,
     headers: HeaderMap,
-    Json(body): Json<Login>,
-) -> Result<Response, ControlError> {
-    // IAM calls this an SLT, but serializes it as an OAuth authorization code.
-    let mutation = mutation(&headers)?;
-    let plane = state.plane(&headers).await?;
-    if plane.id.is_nil() || body.slt.starts_with("oac_") {
-        validate_token(&body.slt, "oac_")?;
-    } else if body.slt.is_empty()
-        || body.slt.len() > 256
-        || !body.slt.bytes().all(|b| b.is_ascii_graphic())
-    {
-        return Err(ControlError::bad_request("invalid_test_identity"));
-    }
-    let tokens = plane
-        .iam
-        .oauth()
-        .login(&state.app_id, &body.slt, &mutation)
-        .await
-        .map_err(ControlError::iam)?;
-    if let (Some(org), Some(actor)) = (&tokens.org_id, &tokens.actor) {
-        let storage_actor_id =
-            crate::infrastructure::actor_keys::resolve(&state.pool, plane.id, &actor.public_id)
-                .await?;
-        state
-            .ensure_voice_default(plane.id, org, storage_actor_id)
-            .await?;
-    }
-    Ok(([(header::CACHE_CONTROL, "no-store")], Json(tokens)).into_response())
-}
-
-pub(super) async fn refresh(
-    State(state): State<Arc<ControlState>>,
-    headers: HeaderMap,
-    Json(body): Json<Refresh>,
-) -> Result<Response, ControlError> {
-    validate_token(&body.refresh_token, "ort_")?;
-    let mutation = mutation(&headers)?;
-    let plane = state.plane(&headers).await?;
-    let tokens = plane
-        .iam
-        .oauth()
-        .refresh(&state.app_id, &body.refresh_token, &mutation)
-        .await
-        .map_err(ControlError::iam)?;
-    Ok(([(header::CACHE_CONTROL, "no-store")], Json(tokens)).into_response())
-}
-
-pub(super) async fn logout(
-    State(state): State<Arc<ControlState>>,
-    headers: HeaderMap,
-    Json(body): Json<Logout>,
-) -> Result<StatusCode, ControlError> {
-    if !(body.token.starts_with("oat_") || body.token.starts_with("ort_")) {
-        return Err(ControlError::bad_request("invalid_token"));
-    }
-    validate_token(&body.token, "o")?;
-    let mutation = mutation(&headers)?;
-    let plane = state.plane(&headers).await?;
-    plane
-        .iam
-        .oauth()
-        .revoke(
-            &models::OAuthRevocationRequest {
-                token: body.token,
-                token_type_hint: None,
-            },
-            &mutation,
-        )
-        .await
-        .map_err(ControlError::iam)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-pub(super) async fn me(
-    State(state): State<Arc<ControlState>>,
-    headers: HeaderMap,
-) -> Result<Response, ControlError> {
-    let identity = state
-        .identity_for_org(&headers, super::single_header(&headers, "x-org-id")?)
+) -> Result<Json<Value>, ControlError> {
+    let caller = state
+        .caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(identity.authority),
-    )
-        .into_response())
+    let items = state
+        .directory()
+        .silicons_of(&caller.record.uuid)
+        .await?
+        .iter()
+        .map(account_json)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"items": items})))
 }

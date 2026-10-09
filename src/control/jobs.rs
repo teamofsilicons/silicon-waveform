@@ -1,6 +1,8 @@
-//! Content-free, actor-scoped speech history.
+//! Content-free speech history, owned by the account that made each request.
+//! A custodian may read its Silicons' history (`?account=si:…`).
 
 use super::{ControlError, ControlState};
+use crate::domain::auth::WaveformAction;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -17,11 +19,19 @@ pub(super) struct Filters {
     operation: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
+    account: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct AccountFilter {
+    account: Option<String>,
 }
 #[derive(Serialize)]
 pub(super) struct Job {
     voice_profile: Option<serde_json::Value>,
     id: String,
+    /// App that called Waveform for the account with a proof, when one did.
+    issuing_app: Option<String>,
     operation: String,
     status: String,
     first_line: String,
@@ -33,6 +43,7 @@ pub(super) struct Job {
 }
 #[derive(Serialize)]
 pub(super) struct Page {
+    account: serde_json::Value,
     items: Vec<Job>,
     next_cursor: Option<String>,
 }
@@ -42,12 +53,17 @@ pub(super) struct Page {
 /// different millisecond whose UUID happens to sort below the previous row.
 fn parse_cursor(value: Option<&str>) -> Result<Option<(OffsetDateTime, Uuid)>, ControlError> {
     let Some(value) = value else { return Ok(None) };
-    let Some((timestamp, id)) = value.split_once('|') else {
-        return Err(ControlError::bad_request("invalid_cursor"));
+    let invalid = || {
+        ControlError::bad_request(
+            "invalid_cursor",
+            "cursor must be the next_cursor value of the previous page, unchanged.",
+        )
     };
-    let timestamp = OffsetDateTime::parse(timestamp, &Rfc3339)
-        .map_err(|_| ControlError::bad_request("invalid_cursor"))?;
-    let id = Uuid::parse_str(id).map_err(|_| ControlError::bad_request("invalid_cursor"))?;
+    let Some((timestamp, id)) = value.split_once('|') else {
+        return Err(invalid());
+    };
+    let timestamp = OffsetDateTime::parse(timestamp, &Rfc3339).map_err(|_| invalid())?;
+    let id = Uuid::parse_str(id).map_err(|_| invalid())?;
     Ok(Some((timestamp, id)))
 }
 
@@ -56,22 +72,33 @@ pub(super) async fn list(
     headers: HeaderMap,
     Query(filters): Query<Filters>,
 ) -> Result<Json<Page>, ControlError> {
-    let identity = state.identity(&headers).await?;
+    let caller = state
+        .caller(&headers, WaveformAction::ManageAccount)
+        .await?;
+    let target = state.target(&caller, filters.account.as_deref()).await?;
     crate::infrastructure::idempotency::recover_expired_jobs(&state.pool)
         .await
-        .map_err(|_| ControlError::unavailable("database_unavailable"))?;
+        .map_err(|_| {
+            ControlError::unavailable(
+                "database_unavailable",
+                "Waveform's database is unavailable.",
+            )
+        })?;
     let limit = filters.limit.unwrap_or(50).clamp(1, 100);
     if filters
         .operation
         .as_deref()
         .is_some_and(|value| !matches!(value, "tts" | "stt"))
     {
-        return Err(ControlError::bad_request("invalid_operation"));
+        return Err(ControlError::bad_request(
+            "invalid_operation",
+            "operation must be tts or stt.",
+        ));
     }
     let cursor = parse_cursor(filters.cursor.as_deref())?;
     let (cursor_time, cursor_id) = cursor.map_or((None, None), |(time, id)| (Some(time), Some(id)));
-    let rows = sqlx::query("SELECT id,operation,status,first_line,duration_ms,provider,error_code,created_at,finished_at,voice_profile FROM waveform_jobs WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3 AND ($4::text IS NULL OR operation=$4) AND ($5::timestamptz IS NULL OR created_at < $5 OR (created_at = $5 AND id < $6)) ORDER BY created_at DESC,id DESC LIMIT $7")
-        .bind(identity.plane.id).bind(identity.authority.org_id).bind(identity.storage_actor_id).bind(filters.operation).bind(cursor_time).bind(cursor_id).bind(limit + 1).fetch_all(&state.pool).await?;
+    let rows = sqlx::query("SELECT id,issuing_app,operation,status,first_line,duration_ms,provider,error_code,created_at,finished_at,voice_profile FROM waveform_jobs WHERE plane_id=$1 AND actor_id=$2 AND ($3::text IS NULL OR operation=$3) AND ($4::timestamptz IS NULL OR created_at < $4 OR (created_at = $4 AND id < $5)) ORDER BY created_at DESC,id DESC LIMIT $6")
+        .bind(Uuid::nil()).bind(target.storage_key()).bind(filters.operation).bind(cursor_time).bind(cursor_id).bind(limit + 1).fetch_all(&state.pool).await?;
     let page_limit = usize::try_from(limit).unwrap_or(100);
     let has_more = rows.len() > page_limit;
     let rows = rows.into_iter().take(page_limit).collect::<Vec<_>>();
@@ -89,6 +116,7 @@ pub(super) async fn list(
         .map(|row| -> Result<Job, sqlx::Error> {
             Ok(Job {
                 id: row.try_get::<uuid::Uuid, _>("id")?.to_string(),
+                issuing_app: row.try_get("issuing_app")?,
                 operation: row.try_get("operation")?,
                 status: row.try_get("status")?,
                 first_line: row.try_get("first_line")?,
@@ -110,28 +138,42 @@ pub(super) async fn list(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(Page { items, next_cursor }))
+    Ok(Json(Page {
+        account: serde_json::json!({"uuid": target.record.uuid, "id": target.record.current_id}),
+        items,
+        next_cursor,
+    }))
 }
 
 pub(super) async fn get(
     State(state): State<Arc<ControlState>>,
     headers: HeaderMap,
     Path(job_id): Path<Uuid>,
+    Query(filter): Query<AccountFilter>,
 ) -> Result<Json<Job>, ControlError> {
-    let identity = state.identity(&headers).await?;
+    let caller = state
+        .caller(&headers, WaveformAction::ManageAccount)
+        .await?;
+    let target = state.target(&caller, filter.account.as_deref()).await?;
     crate::infrastructure::idempotency::recover_expired_jobs(&state.pool)
         .await
-        .map_err(|_| ControlError::unavailable("database_unavailable"))?;
-    let row = sqlx::query("SELECT id,operation,status,first_line,duration_ms,provider,error_code,created_at,finished_at,voice_profile FROM waveform_jobs WHERE id=$1 AND plane_id=$2 AND org_id=$3 AND actor_id=$4")
+        .map_err(|_| {
+            ControlError::unavailable(
+                "database_unavailable",
+                "Waveform's database is unavailable.",
+            )
+        })?;
+    // Another account's job id answers exactly like an unknown one.
+    let row = sqlx::query("SELECT id,issuing_app,operation,status,first_line,duration_ms,provider,error_code,created_at,finished_at,voice_profile FROM waveform_jobs WHERE id=$1 AND plane_id=$2 AND actor_id=$3")
         .bind(job_id)
-        .bind(identity.plane.id)
-        .bind(identity.authority.org_id)
-        .bind(identity.storage_actor_id)
+        .bind(Uuid::nil())
+        .bind(target.storage_key())
         .fetch_optional(&state.pool)
         .await?
-        .ok_or_else(ControlError::not_found)?;
+        .ok_or_else(|| ControlError::not_found("not_found", format!("There is no job {job_id} in this account's history.")))?;
     Ok(Json(Job {
         id: row.try_get::<Uuid, _>("id")?.to_string(),
+        issuing_app: row.try_get("issuing_app")?,
         operation: row.try_get("operation")?,
         status: row.try_get("status")?,
         first_line: row.try_get("first_line")?,

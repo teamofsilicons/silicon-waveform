@@ -1,4 +1,10 @@
-//! Actor, organization, application, and request identities.
+//! Account, application and request identities.
+//!
+//! Silicon Accounts gives every Carbon and Silicon a permanent `uuid` (a short,
+//! case-sensitive base62 string such as `zQo`, not an RFC 4122 UUID) and a
+//! changeable public id (`c:handle` or `si:handle`). Waveform keys everything
+//! on the uuid and only displays the id. Rows keep a private storage UUID
+//! ([`ActorId`]) that the account uuid maps to.
 
 use std::{fmt, str::FromStr};
 
@@ -6,26 +12,52 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-const MAX_ORGANIZATION_ID_LENGTH: usize = 64;
+const MAX_ACCOUNT_UUID_LENGTH: usize = 64;
 const MAX_APPLICATION_ID_LENGTH: usize = 80;
+const MAX_PUBLIC_ID_HANDLE_LENGTH: usize = 64;
 
 /// Kind of account that may perform a Waveform speech operation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorKind {
-    /// Human account.
+    /// A Carbon account (`c:` ids).
     Carbon,
-    /// AI-agent account.
+    /// A Silicon account (`si:` ids).
     Silicon,
 }
 
-/// Stable internal identity of a Carbon or Silicon.
+impl ActorKind {
+    /// Stable storage and wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Carbon => "carbon",
+            Self::Silicon => "silicon",
+        }
+    }
+}
+
+impl FromStr for ActorKind {
+    type Err = IdentityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "carbon" => Ok(Self::Carbon),
+            "silicon" => Ok(Self::Silicon),
+            _ => Err(IdentityError::InvalidCharacters {
+                field: "account kind",
+            }),
+        }
+    }
+}
+
+/// Private, stable storage key of a Carbon or Silicon inside Waveform.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(try_from = "Uuid", into = "Uuid")]
 pub struct ActorId(Uuid);
 
 impl ActorId {
-    /// Constructs a non-nil actor identifier.
+    /// Constructs a non-nil storage key.
     ///
     /// # Errors
     ///
@@ -61,12 +93,12 @@ impl fmt::Display for ActorId {
     }
 }
 
-/// A fully qualified Waveform actor.
+/// A fully qualified Waveform actor: account kind plus private storage key.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Actor {
     /// Account kind.
     pub kind: ActorKind,
-    /// Stable internal account ID.
+    /// Private storage key.
     pub id: ActorId,
 }
 
@@ -78,28 +110,39 @@ impl Actor {
     }
 }
 
-/// Public organization handle used to scope all speech work.
+/// Permanent Silicon Accounts identifier (the JWT `sub`). Case-sensitive; compared exactly.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct OrganizationId(String);
+pub struct AccountUuid(String);
 
-impl OrganizationId {
-    /// Returns the normalized organization handle.
+impl AccountUuid {
+    /// Returns the uuid exactly as Silicon Accounts issued it.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl FromStr for OrganizationId {
+impl FromStr for AccountUuid {
     type Err = IdentityError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        normalize_scoped_identifier(value, "organization ID", MAX_ORGANIZATION_ID_LENGTH).map(Self)
+        if !(1..=MAX_ACCOUNT_UUID_LENGTH).contains(&value.len()) {
+            return Err(IdentityError::InvalidLength {
+                field: "account uuid",
+                max_length: MAX_ACCOUNT_UUID_LENGTH,
+            });
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(IdentityError::InvalidCharacters {
+                field: "account uuid",
+            });
+        }
+        Ok(Self(value.to_owned()))
     }
 }
 
-impl TryFrom<String> for OrganizationId {
+impl TryFrom<String> for AccountUuid {
     type Error = IdentityError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
@@ -107,25 +150,50 @@ impl TryFrom<String> for OrganizationId {
     }
 }
 
-impl From<OrganizationId> for String {
-    fn from(value: OrganizationId) -> Self {
+impl From<AccountUuid> for String {
+    fn from(value: AccountUuid) -> Self {
         value.0
     }
 }
 
-impl fmt::Display for OrganizationId {
+impl fmt::Display for AccountUuid {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
 }
 
-/// Registered IAM application handle.
+/// Returns the account kind named by a public id prefix (`c:` or `si:`), or
+/// `None` when the value is not a well-formed public id.
+#[must_use]
+pub fn public_id_kind(value: &str) -> Option<ActorKind> {
+    let (kind, handle) = if let Some(handle) = value.strip_prefix("c:") {
+        (ActorKind::Carbon, handle)
+    } else {
+        (ActorKind::Silicon, value.strip_prefix("si:")?)
+    };
+    ((1..=MAX_PUBLIC_ID_HANDLE_LENGTH).contains(&handle.len())
+        && handle.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        }))
+    .then_some(kind)
+}
+
+/// The account a request acts for: its permanent uuid and its current public id.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountRef {
+    /// Permanent identifier.
+    pub uuid: AccountUuid,
+    /// Current public id (`c:…`/`si:…`) for display; may be empty when unknown.
+    pub id: String,
+}
+
+/// Registered Silicon Accounts application id (for example `waveform`).
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ApplicationId(String);
 
 impl ApplicationId {
-    /// Returns the normalized application handle.
+    /// Returns the bare application id.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -240,8 +308,8 @@ pub enum IdentityError {
         /// Maximum length published for this identifier kind.
         max_length: usize,
     },
-    /// The value contained a character outside the stable identifier alphabet.
-    #[error("{field} may contain only ASCII letters, digits, hyphens, and underscores")]
+    /// The value contained a character outside the identifier alphabet.
+    #[error("{field} contains a character outside its alphabet")]
     InvalidCharacters {
         /// Name of the invalid field.
         field: &'static str,
@@ -260,25 +328,6 @@ pub enum IdentityError {
     },
 }
 
-fn normalize_scoped_identifier(
-    value: &str,
-    field: &'static str,
-    max_length: usize,
-) -> Result<String, IdentityError> {
-    if value != value.trim() || !(1..=max_length).contains(&value.len()) {
-        return Err(IdentityError::InvalidLength { field, max_length });
-    }
-
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(IdentityError::InvalidCharacters { field });
-    }
-
-    Ok(value.to_ascii_lowercase())
-}
-
 fn ensure_non_nil(value: Uuid, field: &'static str) -> Result<Uuid, IdentityError> {
     if value.is_nil() {
         Err(IdentityError::NilUuid { field })
@@ -293,38 +342,30 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::{ApplicationId, IdentityError, OrganizationId, RequestId};
+    use super::{AccountUuid, ActorKind, ApplicationId, IdentityError, RequestId, public_id_kind};
 
     #[test]
-    fn scoped_identifiers_are_normalized() {
-        let organization = OrganizationId::from_str("Team_Of-Silicons");
-        let application = ApplicationId::from_str("silicon-waveform");
-
+    fn account_uuids_are_case_sensitive_base62_text() {
+        let upper = AccountUuid::from_str("zQo");
+        let lower = AccountUuid::from_str("zqo");
+        assert!(upper.is_ok());
+        assert_ne!(upper, lower);
         assert_eq!(
-            organization.map(|value| value.to_string()),
-            Ok("team_of-silicons".to_owned())
+            AccountUuid::from_str("zQo").map(|value| value.to_string()),
+            Ok("zQo".to_owned())
         );
-        assert_eq!(
-            application.map(|value| value.to_string()),
-            Ok("silicon-waveform".to_owned())
-        );
+        for invalid in ["", "has space", "dash-ed", "c:ada", &"a".repeat(65)] {
+            assert!(AccountUuid::from_str(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
-    fn scoped_identifiers_reject_whitespace_and_unicode() {
-        assert_eq!(
-            OrganizationId::from_str(" tos"),
-            Err(IdentityError::InvalidLength {
-                field: "organization ID",
-                max_length: 64,
-            })
-        );
-        assert_eq!(
-            OrganizationId::from_str("tøs"),
-            Err(IdentityError::InvalidCharacters {
-                field: "organization ID"
-            })
-        );
+    fn public_ids_name_their_kind_by_prefix() {
+        assert_eq!(public_id_kind("c:ada"), Some(ActorKind::Carbon));
+        assert_eq!(public_id_kind("si:scout-1"), Some(ActorKind::Silicon));
+        for invalid in ["ada", "c:", "si:UPPER", "si:a:b", "x:ada", "c:a b"] {
+            assert_eq!(public_id_kind(invalid), None, "{invalid}");
+        }
     }
 
     #[test]
@@ -335,24 +376,7 @@ mod tests {
         );
         assert!(ApplicationId::from_str("Waveform").is_err());
         assert!(ApplicationId::from_str("9waveform").is_err());
-        assert!(ApplicationId::from_str("waveform>extra").is_err());
         assert!(ApplicationId::from_str("tos>waveform").is_err());
-    }
-
-    #[test]
-    fn identifier_kinds_enforce_their_authoritative_bounds() {
-        let eighty_characters = "a".repeat(80);
-        let application = ApplicationId::from_str(&eighty_characters);
-        let organization = OrganizationId::from_str(&eighty_characters);
-
-        assert!(application.is_ok());
-        assert_eq!(
-            organization,
-            Err(IdentityError::InvalidLength {
-                field: "organization ID",
-                max_length: 64,
-            })
-        );
         assert_eq!(
             ApplicationId::from_str(&"a".repeat(81)),
             Err(IdentityError::InvalidLength {

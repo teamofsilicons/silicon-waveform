@@ -4,15 +4,15 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::domain::{
-    auth::{AuthorizationRequest, AuthorizedActor, DelegatedAuthorization, DelegationRequest},
+    auth::{AccessToken, AuthFailure, AuthorizationRequest, AuthorizedActor, BriefcaseProof},
     idempotency::{
         IdempotencyClaim, IdempotencyCompletion, IdempotencyDecision, IdempotencyLeaseId,
-        IdempotencyRelease,
+        IdempotencyRelease, SpeechOperation,
     },
-    identity::RequestId,
+    identity::{ActorId, RequestId},
     media::{
-        AudioArtifact, BriefcaseFileUrl, GeneratedAudioFileName, MediaSizeLimit, NormalizedAudio,
-        SourceMedia, StoredAudio, TemporaryMediaUrl,
+        AudioArtifact, BriefcaseFileUrl, GeneratedAudioFileName, HeldReason, MediaSizeLimit,
+        NormalizedAudio, SourceMedia,
     },
     provider::{ProviderError, ProviderName},
     speech::{SttProviderRequest, SttProviderResult, TtsProviderRequest},
@@ -107,72 +107,80 @@ pub enum AudioNormalizationError {
     Failed,
 }
 
-/// Online IAM authorization and proof-exchange boundary.
+/// Silicon Accounts authentication: bearer tokens verified locally against the
+/// cached key set, proofs verified online.
 #[async_trait]
-pub trait IamPort: Send + Sync {
-    /// Introspects or consumes exactly one credential mode and verifies current
-    /// actor membership, organization, audience, and requested action.
-    async fn authorize(&self, request: AuthorizationRequest) -> Result<AuthorizedActor, IamError>;
-
-    /// Mints a new short-lived proof for Briefcase. Implementations must never
-    /// forward an inbound Waveform proof to the different audience.
-    async fn delegate(
+pub trait AccountsPort: Send + Sync {
+    /// Verifies exactly one credential for one action and resolves the account
+    /// to its private storage key.
+    async fn authorize(
         &self,
-        request: DelegationRequest,
-    ) -> Result<DelegatedAuthorization, IamError>;
+        request: AuthorizationRequest,
+    ) -> Result<AuthorizedActor, AccountsError>;
 }
 
-/// Safe IAM failure category.
+/// Safe authentication failure category.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum IamError {
-    /// Storage feature consent is missing or was revoked.
-    #[error("Briefcase authorization is required")]
-    StorageAuthorizationRequired,
-    /// Credential is absent, inactive, expired, malformed, or already consumed.
-    #[error("IAM rejected the credential")]
-    InvalidCredential,
-    /// Verified actor or application lacks the requested action.
-    #[error("IAM denied the action")]
-    Forbidden,
-    /// Verified membership does not match the caller-selected organization.
-    #[error("IAM organization does not match")]
-    OrganizationMismatch,
-    /// IAM has not published the required safe proof-exchange operation.
-    #[error("required IAM contract is unavailable")]
-    ContractUnavailable,
-    /// IAM could not be reached or reported temporary unavailability.
-    #[error("IAM is unavailable")]
+pub enum AccountsError {
+    /// The credential was refused for an exact, caller-visible reason.
+    #[error("{}", .0.message())]
+    Rejected(AuthFailure),
+    /// Silicon Accounts (or Waveform's account store) could not be reached.
+    #[error("Silicon Accounts is unavailable")]
     Unavailable,
-    /// IAM exceeded the configured operation deadline.
-    #[error("IAM timed out")]
+    /// Silicon Accounts exceeded the configured deadline.
+    #[error("Silicon Accounts timed out")]
     Timeout,
-    /// IAM returned a response that could not establish authorization safely.
-    #[error("IAM returned an invalid response")]
-    InvalidResponse,
+}
+
+/// Briefcase access (a User verification proof) Waveform holds for an account.
+#[async_trait]
+pub trait StorageAuthorityPort: Send + Sync {
+    /// Returns a Briefcase proof that is valid for at least a minute. With the
+    /// account's own Waveform access token, a missing or dead proof is replaced
+    /// by a newly issued one; without it only a stored proof can be used.
+    async fn briefcase_proof(
+        &self,
+        actor: &AuthorizedActor,
+        subject_token: Option<&AccessToken>,
+    ) -> Result<BriefcaseProof, StorageAuthorityError>;
+}
+
+/// Why no Briefcase proof is available.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum StorageAuthorityError {
+    /// Waveform holds no usable Briefcase access for the account and cannot create one now.
+    #[error("Waveform holds no Briefcase access for this account")]
+    NotAuthorized,
+    /// Silicon Accounts refused to issue or refresh the proof.
+    #[error("Silicon Accounts refused the Briefcase proof")]
+    Refused,
+    /// Silicon Accounts or the proof store is unavailable.
+    #[error("Briefcase access could not be checked")]
+    Unavailable,
+    /// Silicon Accounts timed out.
+    #[error("Briefcase access check timed out")]
+    Timeout,
 }
 
 /// Input for an authorized, bounded Briefcase source read.
 #[derive(Clone, Debug)]
 pub struct ReadSourceMediaRequest {
-    /// Actor and organization already verified by IAM.
-    pub authorization: AuthorizedActor,
+    /// Briefcase proof for the account.
+    pub proof: BriefcaseProof,
     /// Stable permanent URL to resolve inside Briefcase.
     pub source_url: BriefcaseFileUrl,
-    /// Original request-local subject token used for fresh per-operation proofs.
-    pub subject_token: Option<crate::domain::auth::AccessToken>,
     /// Maximum response size enforced before and during streaming.
     pub size_limit: MediaSizeLimit,
     /// Correlation ID propagated to Briefcase.
     pub request_id: RequestId,
 }
 
-/// Input for a non-content Briefcase read check or delivery-URL issuance.
+/// Input for a non-content Briefcase read check.
 #[derive(Clone, Debug)]
 pub struct BriefcaseFileAccessRequest {
-    /// Actor and organization already verified by IAM.
-    pub authorization: AuthorizedActor,
-    /// Original request-local subject token used for fresh per-operation proofs.
-    pub subject_token: Option<crate::domain::auth::AccessToken>,
+    /// Briefcase proof for the account.
+    pub proof: BriefcaseProof,
     /// Stable permanent file reference whose current access is checked.
     pub file_url: BriefcaseFileUrl,
     /// Current attempt correlation ID propagated to Briefcase.
@@ -182,21 +190,17 @@ pub struct BriefcaseFileAccessRequest {
 /// Input for an idempotent generated-audio upload.
 #[derive(Clone, Debug)]
 pub struct StoreGeneratedAudioRequest {
-    /// Actor and organization already verified by IAM.
-    pub authorization: AuthorizedActor,
-    /// Newly minted Briefcase-audience credential.
-    pub delegated_authorization: DelegatedAuthorization,
+    /// Briefcase proof for the account.
+    pub proof: BriefcaseProof,
     /// Collision-resistant UTC filename.
     pub filename: GeneratedAudioFileName,
     /// Validated MP3 artifact.
     pub audio: NormalizedAudio,
-    /// Stable request-derived key that prevents duplicate files.
-    pub idempotency_key: crate::domain::idempotency::IdempotencyKey,
-    /// Correlation ID propagated to Briefcase.
+    /// Correlation ID; also the stable upload operation id, so retries never duplicate files.
     pub request_id: RequestId,
 }
 
-/// Authorized Briefcase content and generated-audio boundary.
+/// Briefcase content boundary, authorized by Briefcase proofs.
 #[async_trait]
 pub trait BriefcasePort: Send + Sync {
     /// Verifies current read access without transferring the file content.
@@ -205,35 +209,26 @@ pub trait BriefcasePort: Send + Sync {
         request: BriefcaseFileAccessRequest,
     ) -> Result<(), BriefcaseError>;
 
-    /// Verifies current read access and atomically issues a fresh delivery URL.
-    async fn issue_temporary_url(
-        &self,
-        request: BriefcaseFileAccessRequest,
-    ) -> Result<TemporaryMediaUrl, BriefcaseError>;
-
     /// Resolves and reads a permanent URL through Briefcase authorization.
     async fn read_source_media(
         &self,
         request: ReadSourceMediaRequest,
     ) -> Result<SourceMedia, BriefcaseError>;
 
-    /// Stores MP3 in the actor's Waveform app folder and issues a temporary URL.
+    /// Stores the MP3 in the account's Waveform app folder and returns its permanent URL.
     async fn store_generated_audio(
         &self,
         request: StoreGeneratedAudioRequest,
-    ) -> Result<StoredAudio, BriefcaseError>;
+    ) -> Result<BriefcaseFileUrl, BriefcaseError>;
 }
 
 /// Safe Briefcase failure category.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum BriefcaseError {
-    /// Storage feature consent is missing or was revoked.
-    #[error("Briefcase authorization is required")]
-    StorageAuthorizationRequired,
-    /// Delegated proof was rejected.
-    #[error("Briefcase rejected delegated authorization")]
+    /// Briefcase rejected the proof.
+    #[error("Briefcase rejected Waveform's proof")]
     Unauthorized,
-    /// Actor lacks current access to the source or destination.
+    /// Account lacks current access to the source or destination.
     #[error("Briefcase denied access")]
     Forbidden,
     /// Permanent source reference does not resolve to a visible file.
@@ -245,7 +240,7 @@ pub enum BriefcaseError {
     /// Declared or detected source media is unsupported.
     #[error("Briefcase source media type is unsupported")]
     UnsupportedMediaType,
-    /// Safe app-folder or authenticated-content operation is not published.
+    /// Briefcase does not offer the delegated operation Waveform needs.
     #[error("required Briefcase contract is unavailable")]
     ContractUnavailable,
     /// Briefcase could not be reached or reported temporary unavailability.
@@ -258,6 +253,36 @@ pub enum BriefcaseError {
     #[error("Briefcase returned an invalid response")]
     InvalidResponse,
 }
+
+/// Generated speech Waveform keeps when it cannot or must not store it in Briefcase.
+#[derive(Clone, Debug)]
+pub struct HeldAudio {
+    /// Canonical request id; the download path is `/api/v1/audio/{request_id}`.
+    pub request_id: RequestId,
+    /// Owner's private storage key.
+    pub owner: ActorId,
+    /// Generated filename, used as the download name.
+    pub filename: GeneratedAudioFileName,
+    /// Validated MP3.
+    pub audio: NormalizedAudio,
+    /// Why it is not in Briefcase.
+    pub reason: HeldReason,
+}
+
+/// Retention-limited store for held audio.
+#[async_trait]
+pub trait HeldAudioStore: Send + Sync {
+    /// Keeps the audio (idempotently per request id) and returns when it will be deleted.
+    async fn hold(&self, audio: HeldAudio) -> Result<time::OffsetDateTime, HeldAudioError>;
+
+    /// True when audio for this request is still held for this owner.
+    async fn is_held(&self, request_id: RequestId, owner: ActorId) -> Result<bool, HeldAudioError>;
+}
+
+/// Held-audio store failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("Waveform's audio store is unavailable")]
+pub struct HeldAudioError;
 
 /// Shared idempotency state boundary.
 #[async_trait]
@@ -314,18 +339,25 @@ pub trait LeaseIdGenerator: Send + Sync {
     fn new_idempotency_lease_id(&self) -> IdempotencyLeaseId;
 }
 
-/// Account and environment scoped, decrypted provider credentials.
+/// Account-scoped, decrypted provider credentials.
 pub type ProviderKeys = std::collections::HashMap<ProviderName, secrecy::SecretString>;
 
 /// Retrieves personal keys only after the caller has been authorized.
 #[async_trait]
 pub trait ProviderKeyStore: Send + Sync {
-    /// Returns keys for this exact principal, organization, and Waveform plane.
-    async fn load(
+    /// Returns the saved keys of this exact account.
+    async fn load(&self, actor: &AuthorizedActor) -> Result<ProviderKeys, ProviderKeyStoreError>;
+}
+
+/// The account's saved provider order (or Waveform's database defaults).
+#[async_trait]
+pub trait ProviderOrderStore: Send + Sync {
+    /// Complete provider order the account's requests start from.
+    async fn provider_order(
         &self,
-        plane_id: uuid::Uuid,
         actor: &AuthorizedActor,
-    ) -> Result<ProviderKeys, ProviderKeyStoreError>;
+        operation: SpeechOperation,
+    ) -> Result<Vec<ProviderName>, crate::domain::error::WaveformError>;
 }
 
 /// Redacted credential lookup failure; never falls back to deployment billing.
@@ -339,7 +371,6 @@ pub trait VoiceProfileStore: Send + Sync {
     /// Reads one complete mapping; no provider calls or API secrets are involved.
     async fn resolve(
         &self,
-        plane_id: uuid::Uuid,
         actor: &AuthorizedActor,
         requested: Option<&str>,
     ) -> Result<crate::domain::voice::VoiceProfile, crate::domain::error::WaveformError>;

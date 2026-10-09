@@ -2,15 +2,17 @@
 use super::{ControlError, ControlState, single_header};
 use axum::{
     Json,
-    extract::{Path, Request, State},
+    extract::{Request, State},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use http::{HeaderMap, HeaderValue, StatusCode};
-use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::Row as _;
+use sqlx::{PgPool, Row as _};
 use std::sync::Arc;
+
+/// Contract version of API v1 implemented by this build.
+pub const CONTRACT_VERSION: &str = "2.0.0";
 
 pub(super) async fn describe(
     State(state): State<Arc<ControlState>>,
@@ -22,19 +24,19 @@ pub(super) async fn describe(
         Ok(json!({"api_version":row.try_get::<String,_>("version")?,"contract_version":row.try_get::<String,_>("contract_version")?,"state":row.try_get::<String,_>("state")?,"successor":row.try_get::<Option<String>,_>("successor")?,"deprecated_at":date("deprecated_at")?,"sunset_at":date("sunset_at")?}))
     }).collect::<Result<Vec<_>,_>>()?;
     Ok(Json(
-        json!({"service":"silicon-waveform","default_api_version":"v1","protocol_versions":["1"],"contracts":contracts,"compatibility":[{"api_version":"v1","protocol_version":"1","rust_client":">=0.5.0, <0.6.0","cli":">=0.5.0, <0.6.0"}],"policy":{"quiet_days_before_sunset":7,"requires_active_successor":true,"guide":"https://docs.waveform.teamofsilicons.com/api-contracts/"}}),
+        json!({"service":"silicon-waveform","default_api_version":"v1","protocol_versions":["1"],"contracts":contracts,"compatibility":[{"api_version":"v1","protocol_version":"1","contract_version":CONTRACT_VERSION,"rust_client":">=0.6.0, <0.7.0","cli":">=0.6.0, <0.7.0","authentication":["bearer","proof"]}],"policy":{"quiet_days_before_sunset":7,"requires_active_successor":true,"guide":"https://docs.waveform.teamofsilicons.com/api-contracts/"}}),
     ))
 }
 
 impl ControlState {
-    pub(super) async fn sunset_contracts(&self) -> Result<u64, sqlx::Error> {
+    pub(crate) async fn sunset_contracts(&self) -> Result<u64, sqlx::Error> {
         Ok(sqlx::query("UPDATE waveform_api_contracts c SET state='sunset',sunset_at=now() WHERE c.state='deprecated' AND GREATEST(c.deprecated_at,COALESCE(c.last_request_at,c.deprecated_at)) <= now() - interval '7 days' AND EXISTS(SELECT 1 FROM waveform_api_contracts next WHERE next.version=c.successor AND next.state='active')")
             .execute(&self.pool).await?.rows_affected())
     }
-    async fn contract_request(&self, version: &str, testing: bool) -> Result<String, ControlError> {
+    async fn contract_request(&self, version: &str) -> Result<String, ControlError> {
         let mut tx = self.pool.begin().await?;
         let row=sqlx::query("SELECT state,deprecated_at,last_request_at,successor FROM waveform_api_contracts WHERE version=$1 FOR UPDATE")
-            .bind(version).fetch_optional(&mut *tx).await?.ok_or(ControlError{status:StatusCode::NOT_ACCEPTABLE,code:"unsupported_api_version"})?;
+            .bind(version).fetch_optional(&mut *tx).await?.ok_or_else(unsupported_version)?;
         let mut state: String = row.try_get("state")?;
         // Production requests and the maintenance worker share row locking. Traffic
         // at the boundary cannot revive a version whose quiet period has elapsed.
@@ -46,7 +48,7 @@ impl ControlState {
                 state = "sunset".into();
             }
         }
-        if state != "sunset" && !testing {
+        if state != "sunset" {
             sqlx::query("UPDATE waveform_api_contracts SET last_request_at=now() WHERE version=$1")
                 .bind(version)
                 .execute(&mut *tx)
@@ -54,33 +56,43 @@ impl ControlState {
         }
         tx.commit().await?;
         if state == "sunset" {
-            return Err(ControlError {
-                status: StatusCode::GONE,
-                code: "api_version_sunset",
-            });
+            return Err(ControlError::new(
+                StatusCode::GONE,
+                "api_version_sunset",
+                format!(
+                    "API {version} was retired; GET /api/contracts lists the supported versions."
+                ),
+            ));
         }
         Ok(state)
     }
 }
 
+fn unsupported_version() -> ControlError {
+    ControlError::new(
+        StatusCode::NOT_ACCEPTABLE,
+        "unsupported_api_version",
+        "This build serves API v1 only; GET /api/contracts lists the supported versions.",
+    )
+}
+
 fn validate(headers: &HeaderMap, version: &str) -> Result<(), ControlError> {
     if version != "v1" {
-        return Err(ControlError {
-            status: StatusCode::NOT_ACCEPTABLE,
-            code: "unsupported_api_version",
-        });
+        return Err(unsupported_version());
     }
     if single_header(headers, "x-waveform-api-version")?.is_some_and(|v| v != version) {
-        return Err(ControlError {
-            status: StatusCode::NOT_ACCEPTABLE,
-            code: "api_version_mismatch",
-        });
+        return Err(ControlError::new(
+            StatusCode::NOT_ACCEPTABLE,
+            "api_version_mismatch",
+            "X-Waveform-API-Version must match the version in the path (v1).",
+        ));
     }
     if single_header(headers, "x-waveform-protocol-version")?.is_some_and(|v| v != "1") {
-        return Err(ControlError {
-            status: StatusCode::NOT_ACCEPTABLE,
-            code: "unsupported_protocol_version",
-        });
+        return Err(ControlError::new(
+            StatusCode::NOT_ACCEPTABLE,
+            "unsupported_protocol_version",
+            "X-Waveform-Protocol-Version must be 1.",
+        ));
     }
     Ok(())
 }
@@ -98,8 +110,7 @@ pub(crate) async fn negotiate(
     if let Err(error) = validate(request.headers(), &version) {
         return error.into_response();
     }
-    let testing = request.headers().contains_key("x-testing-environment-key");
-    let status = match state.contract_request(&version, testing).await {
+    let status = match state.contract_request(&version).await {
         Ok(status) => status,
         Err(e) => return e.into_response(),
     };
@@ -108,7 +119,7 @@ pub(crate) async fn negotiate(
     headers.insert("x-waveform-api-version", HeaderValue::from_static("v1"));
     headers.insert(
         "x-waveform-contract-version",
-        HeaderValue::from_static("1.0.0"),
+        HeaderValue::from_static(CONTRACT_VERSION),
     );
     headers.insert("x-waveform-protocol-version", HeaderValue::from_static("1"));
     if status == "deprecated" {
@@ -131,136 +142,27 @@ pub(crate) async fn negotiate(
     response
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Deprecate {
-    successor: String,
-}
-pub(super) async fn deprecate(
-    State(state): State<Arc<ControlState>>,
-    headers: HeaderMap,
-    Path(version): Path<String>,
-    Json(body): Json<Deprecate>,
-) -> Result<Json<Value>, ControlError> {
-    state.service_authority(&headers)?;
-    if version == body.successor {
-        return Err(ControlError::bad_request("distinct_successor_required"));
+/// Operator action (`waveform-api contracts deprecate <version> --successor <version>`):
+/// marks a version deprecated. It sunsets after seven days without requests,
+/// once its successor is active. Retry-safe; the start time is kept.
+///
+/// # Errors
+///
+/// A message when the successor is missing, inactive or the same version.
+pub async fn deprecate(pool: &PgPool, version: &str, successor: &str) -> Result<(), String> {
+    if version == successor {
+        return Err("the successor must be a different version".to_owned());
     }
-    let changed=sqlx::query("UPDATE waveform_api_contracts SET state='deprecated',successor=$2,deprecated_at=COALESCE(deprecated_at,now()) WHERE version=$1 AND state IN ('active','deprecated') AND EXISTS(SELECT 1 FROM waveform_api_contracts next WHERE next.version=$2 AND next.state='active') RETURNING version")
-        .bind(version).bind(body.successor).fetch_optional(&state.pool).await?;
+    let changed = sqlx::query("UPDATE waveform_api_contracts SET state='deprecated',successor=$2,deprecated_at=COALESCE(deprecated_at,now()) WHERE version=$1 AND state IN ('active','deprecated') AND EXISTS(SELECT 1 FROM waveform_api_contracts next WHERE next.version=$2 AND next.state='active') RETURNING version")
+        .bind(version)
+        .bind(successor)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| format!("database error: {error}"))?;
     if changed.is_none() {
-        return Err(ControlError::bad_request("active_successor_required"));
+        return Err(format!(
+            "{version} was not deprecated: it must be active or deprecated, and {successor} must already be registered and active"
+        ));
     }
-    Ok(Json(
-        json!({"state":"deprecated","quiet_days_before_sunset":7}),
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::control::tests::{call, database, fixture};
-    use axum::body::{Body, to_bytes};
-    use tower::ServiceExt as _;
-    use wiremock::MockServer;
-
-    #[tokio::test]
-    #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
-    async fn consumer_negotiation_and_quiet_period_are_durable()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (pool, schema) = database().await?;
-        let iam = MockServer::start().await;
-        let state = fixture(pool.clone(), &iam)?;
-        let app = crate::control::router(state.clone()).layer(
-            axum::middleware::from_fn_with_state(state.clone(), negotiate),
-        );
-        // Existing consumers omit negotiation headers and keep the same response shape.
-        let response = app
-            .clone()
-            .oneshot(
-                http::Request::builder()
-                    .uri("/api/v1/iam")
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["x-waveform-api-version"], "v1");
-        assert_eq!(response.headers()["x-waveform-protocol-version"], "1");
-        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
-        assert_eq!(body["app_id"], "waveform");
-        for (path, header, value) in [
-            ("/api/v2/iam", "x-waveform-api-version", "v2"),
-            ("/api/v1/iam", "x-waveform-api-version", "v2"),
-            ("/api/v1/iam", "x-waveform-protocol-version", "2"),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    http::Request::builder()
-                        .uri(path)
-                        .header(header, value)
-                        .body(Body::empty())?,
-                )
-                .await?;
-            assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
-        }
-        assert_eq!(
-            call(
-                &app,
-                "POST",
-                "/internal/contracts/v1/deprecate",
-                Some("test-only-honeycomb-service-token-123456"),
-                json!({"successor":"v2"})
-            )
-            .await?
-            .0,
-            StatusCode::BAD_REQUEST
-        );
-        sqlx::query("INSERT INTO waveform_api_contracts(version,contract_version,state) VALUES('v2','2.0.0','active')").execute(&pool).await?;
-        assert_eq!(
-            call(
-                &app,
-                "POST",
-                "/internal/contracts/v1/deprecate",
-                Some("test-only-honeycomb-service-token-123456"),
-                json!({"successor":"v2"})
-            )
-            .await?
-            .0,
-            StatusCode::OK
-        );
-        sqlx::query("UPDATE waveform_api_contracts SET deprecated_at=now()-interval '8 days',last_request_at=now()-interval '6 days' WHERE version='v1'").execute(&pool).await?;
-        assert_eq!(state.sunset_contracts().await?, 0);
-        assert_eq!(
-            state
-                .contract_request("v1", false)
-                .await
-                .map_err(|_| "contract")?,
-            "deprecated"
-        );
-        let fresh:bool=sqlx::query_scalar("SELECT last_request_at>now()-interval '1 minute' FROM waveform_api_contracts WHERE version='v1'").fetch_one(&pool).await?;
-        assert!(fresh);
-        sqlx::query("UPDATE waveform_api_contracts SET last_request_at=now()-interval '6 days' WHERE version='v1'").execute(&pool).await?;
-        state
-            .contract_request("v1", true)
-            .await
-            .map_err(|_| "test contract")?;
-        let isolated:bool=sqlx::query_scalar("SELECT last_request_at<now()-interval '5 days' FROM waveform_api_contracts WHERE version='v1'").fetch_one(&pool).await?;
-        assert!(isolated);
-        sqlx::query("UPDATE waveform_api_contracts SET last_request_at=now()-interval '7 days' WHERE version='v1'").execute(&pool).await?;
-        assert_eq!(state.sunset_contracts().await?, 1);
-        assert_eq!(
-            call(&app, "GET", "/api/v1/iam", None, Value::Null).await?.0,
-            StatusCode::GONE
-        );
-        let (status, discovery) = call(&app, "GET", "/api/contracts", None, Value::Null).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(discovery["contracts"][0]["state"], "sunset");
-        assert_eq!(state.sunset_contracts().await?, 0);
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-            .execute(&pool)
-            .await?;
-        pool.close().await;
-        Ok(())
-    }
+    Ok(())
 }

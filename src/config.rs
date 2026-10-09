@@ -1,6 +1,7 @@
 //! Typed, validated runtime configuration loaded from environment variables.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env, fmt,
     net::SocketAddr,
     num::{NonZeroU32, NonZeroUsize},
@@ -27,10 +28,12 @@ pub struct Settings {
     pub server: ServerSettings,
     /// PostgreSQL pool controls.
     pub database: DatabaseSettings,
-    /// Silicon IAM integration settings.
-    pub iam: IamSettings,
-    /// Product secret storage and IAM webhook verification.
+    /// Silicon Accounts integration settings.
+    pub accounts: AccountsSettings,
+    /// Product secret storage.
     pub control: ControlSettings,
+    /// Waveform's own public origin and development switches.
+    pub public: PublicSettings,
     /// Silicon Briefcase integration settings.
     pub briefcase: BriefcaseSettings,
     /// Speech-provider settings.
@@ -43,6 +46,8 @@ pub struct Settings {
     pub limits: LimitSettings,
     /// Structured logging settings.
     pub telemetry: TelemetrySettings,
+    /// Variables from the IAM and Honeycomb era that are still set but no longer read.
+    pub obsolete_variables: Vec<&'static str>,
 }
 
 /// Deployment environment.
@@ -88,40 +93,102 @@ pub struct DatabaseSettings {
     pub statement_timeout: Duration,
 }
 
-/// Silicon IAM authorization settings.
+/// Silicon Accounts integration settings.
 #[derive(Clone, Debug)]
-pub struct IamSettings {
-    /// IAM service base URL.
-    pub base_url: Url,
-    /// Waveform's IAM application identifier.
+pub struct AccountsSettings {
+    /// Public origin of Silicon Accounts; access tokens carry it as `iss`.
+    pub public_url: Url,
+    /// Server-to-server origin (defaults to the public origin).
+    pub api_url: Url,
+    /// Waveform's app id: the `aud` of accepted access tokens.
     pub app_id: String,
-    /// Waveform's IAM application secret.
+    /// Waveform's app secret (server only).
     pub app_secret: SecretString,
-    /// IAM access-token introspection endpoint path.
-    pub token_introspection_path: String,
-    /// IAM OBO proof verification endpoint path.
-    pub obo_verify_path: String,
-    /// Required audience for inbound OBO proofs.
-    pub audience: String,
-    /// IAM action required for text-to-speech.
-    pub tts_action: String,
-    /// IAM action required for speech-to-text.
-    pub stt_action: String,
-    /// Deadline for one IAM request.
+    /// `whsec_…` secret that signs Accounts webhook deliveries.
+    pub webhook_secret: Option<SecretString>,
+    /// The previous webhook secret, accepted during a rotation.
+    pub previous_webhook_secret: Option<SecretString>,
+    /// Deadline for one call to Silicon Accounts.
     pub timeout: Duration,
+    /// Apps allowed to call Waveform with proofs, per scope.
+    pub proof_issuers: ProofIssuers,
 }
 
-/// Secrets for product storage and authenticated lifecycle notifications.
+impl AccountsSettings {
+    /// The exact `iss` value Silicon Accounts puts in access tokens: the public
+    /// origin without a trailing slash.
+    #[must_use]
+    pub fn issuer(&self) -> String {
+        self.public_url.as_str().trim_end_matches('/').to_owned()
+    }
+}
+
+/// Proof scopes Waveform honours.
+pub const PROOF_SCOPES: [&str; 2] = ["waveform.tts", "waveform.stt"];
+
+/// Per-scope allow-list of apps that may call Waveform with a User verification proof.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProofIssuers(BTreeMap<String, BTreeSet<String>>);
+
+impl ProofIssuers {
+    /// Parses `scope=app,app;scope=app` (whitespace ignored). Empty allows no app.
+    ///
+    /// # Errors
+    ///
+    /// Returns a reason when a scope is not one Waveform honours or an app id is malformed.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for entry in value
+            .split(';')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let (scope, apps) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("`{entry}` must look like scope=app[,app]"))?;
+            let scope = scope.trim();
+            if !PROOF_SCOPES.contains(&scope) {
+                return Err(format!(
+                    "`{scope}` is not a scope Waveform honours (use waveform.tts or waveform.stt)"
+                ));
+            }
+            let allowed = map.entry(scope.to_owned()).or_default();
+            for app in apps.split(',').map(str::trim).filter(|app| !app.is_empty()) {
+                app.parse::<crate::domain::identity::ApplicationId>()
+                    .map_err(|_| format!("`{app}` is not a valid app id"))?;
+                allowed.insert(app.to_owned());
+            }
+        }
+        Ok(Self(map))
+    }
+
+    /// True when `app_id` may call with `scope`.
+    #[must_use]
+    pub fn allows(&self, scope: &str, app_id: &str) -> bool {
+        self.0.get(scope).is_some_and(|apps| apps.contains(app_id))
+    }
+
+    /// True when no app is allowed for any scope.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.values().all(BTreeSet::is_empty)
+    }
+}
+
+/// Secrets for product storage.
 #[derive(Clone, Debug)]
 pub struct ControlSettings {
-    /// Dedicated Honeycomb participant credential, independent of runtime sessions.
-    pub honeycomb_token: Option<SecretString>,
     /// Independent 32-byte key encoded as 64 lowercase hexadecimal characters.
     pub encryption_key: Option<SecretString>,
-    /// Caller-chosen IAM Application webhook signing secret.
-    pub webhook_secret: Option<SecretString>,
-    /// Exact IAM signing-key version currently configured for this Application.
-    pub webhook_key_version: i64,
+}
+
+/// Waveform's own public origin and development switches.
+#[derive(Clone, Debug)]
+pub struct PublicSettings {
+    /// Absolute origin clients reach Waveform at (held audio URLs are built from it).
+    pub base_url: Url,
+    /// Development and CI only: replace every paid provider with the prerecorded fixtures.
+    pub speech_fixtures: bool,
 }
 
 /// Silicon Briefcase access and download settings.
@@ -131,12 +198,10 @@ pub struct BriefcaseSettings {
     pub base_url: Url,
     /// Exact allowed origin for permanent Briefcase URLs.
     pub permanent_origin: Url,
-    /// Exact allowed origin for temporary media downloads.
-    pub cdn_origin: Url,
-    /// Waveform's Briefcase application-folder identifier.
+    /// Briefcase's app id: the receiving app of Waveform's User verification proofs.
     pub app_id: String,
-    /// Canonical Briefcase Application audience used for IAM OBO exchange.
-    pub audience: String,
+    /// Waveform's folder in each account's Briefcase drive (drive-relative path).
+    pub app_folder: String,
     /// Deadline for one Briefcase API request.
     pub timeout: Duration,
     /// Deadline for a bounded source-media download.
@@ -320,51 +385,291 @@ impl Settings {
 
     fn from_source(source: &impl EnvironmentSource) -> Result<Self, SettingsError> {
         let environment = parse_or(source, "WAVEFORM_ENVIRONMENT", "development")?;
+        reject_renamed_variables(source)?;
         let limits = load_limits(source)?;
         let server = load_server(source, &limits)?;
         let database = load_database(source, environment)?;
-        let iam = load_iam(source)?;
+        let accounts = load_accounts(source, environment)?;
         let control = ControlSettings {
-            honeycomb_token: optional_secret(source, "WAVEFORM_HONEYCOMB_SERVICE_TOKEN", 32, 512)?,
             encryption_key: optional_secret(source, "WAVEFORM_ENCRYPTION_KEY", 64, 64)?,
-            webhook_secret: optional_secret(source, "WAVEFORM_WEBHOOK_SIGNING_SECRET", 32, 512)?,
-            webhook_key_version: parse_or(source, "WAVEFORM_WEBHOOK_KEY_VERSION", "1")?,
         };
-        if control.webhook_key_version < 1 {
-            return Err(invalid("WAVEFORM_WEBHOOK_KEY_VERSION", "must be positive"));
-        }
         if environment == RuntimeEnvironment::Production {
             if control.encryption_key.is_none() {
                 return Err(SettingsError::Missing("WAVEFORM_ENCRYPTION_KEY"));
             }
-            if control.webhook_secret.is_none() {
-                return Err(SettingsError::Missing("WAVEFORM_WEBHOOK_SIGNING_SECRET"));
+            if accounts.webhook_secret.is_none() {
+                return Err(SettingsError::Missing("WAVEFORM_ACCOUNTS_WEBHOOK_SECRET"));
             }
         }
-        let briefcase = load_briefcase(source, &iam.app_id, &limits)?;
+        let public = load_public(source, environment, &server)?;
+        let briefcase = load_briefcase(source, &accounts.app_id, &limits)?;
         let providers = load_providers(source)?;
         let audio = load_audio(source)?;
         let idempotency = load_idempotency(source)?;
         let telemetry = load_telemetry(source)?;
         validate_idempotency_lease(&idempotency, &server)?;
-        validate_workflow_deadlines(&server, &database, &iam, &briefcase, &providers, &audio)?;
+        validate_workflow_deadlines(
+            &server, &database, &accounts, &briefcase, &providers, &audio,
+        )?;
+        let obsolete_variables = obsolete_variables(source)?;
 
         let settings = Self {
             environment,
             server,
             database,
-            iam,
+            accounts,
             control,
+            public,
             briefcase,
             providers,
             audio,
             idempotency,
             limits,
             telemetry,
+            obsolete_variables,
         };
         validate_environment_safety(&settings)?;
         Ok(settings)
     }
+}
+
+/// IAM- and Honeycomb-era variables that are no longer read. Their presence is
+/// reported once at boot so operators can delete them.
+const OBSOLETE_VARIABLES: [&str; 15] = [
+    "WAVEFORM_IAM_BASE_URL",
+    "WAVEFORM_IAM_APP_ID",
+    "WAVEFORM_IAM_APP_SECRET",
+    "WAVEFORM_IAM_TOKEN_INTROSPECTION_PATH",
+    "WAVEFORM_IAM_OBO_VERIFY_PATH",
+    "WAVEFORM_IAM_AUDIENCE",
+    "WAVEFORM_IAM_TTS_ACTION",
+    "WAVEFORM_IAM_STT_ACTION",
+    "WAVEFORM_IAM_TIMEOUT_SECONDS",
+    "WAVEFORM_WEBHOOK_SIGNING_SECRET",
+    "WAVEFORM_WEBHOOK_KEY_VERSION",
+    "WAVEFORM_WEBHOOK_PUBLIC_URL",
+    "WAVEFORM_HONEYCOMB_SERVICE_TOKEN",
+    "SILICON_IAM_CLIENT_AUTO_UPDATE",
+    "WAVEFORM_BRIEFCASE_CDN_ORIGIN",
+];
+
+fn obsolete_variables(source: &impl EnvironmentSource) -> Result<Vec<&'static str>, SettingsError> {
+    let mut present = Vec::new();
+    for name in OBSOLETE_VARIABLES {
+        if optional(source, name)?.is_some() {
+            present.push(name);
+        }
+    }
+    Ok(present)
+}
+
+/// A renamed variable whose old meaning would silently change behaviour is refused.
+fn reject_renamed_variables(source: &impl EnvironmentSource) -> Result<(), SettingsError> {
+    if optional(source, "WAVEFORM_BRIEFCASE_AUDIENCE")?.is_some() {
+        return Err(invalid(
+            "WAVEFORM_BRIEFCASE_AUDIENCE",
+            "was renamed to WAVEFORM_BRIEFCASE_APP_ID (Briefcase's app id, the receiving app of Waveform's proofs); move the value there and delete this variable",
+        ));
+    }
+    Ok(())
+}
+
+fn load_accounts(
+    source: &impl EnvironmentSource,
+    environment: RuntimeEnvironment,
+) -> Result<AccountsSettings, SettingsError> {
+    let public_url = accounts_origin(
+        "ACCOUNTS_URL",
+        &value_or(
+            source,
+            "ACCOUNTS_URL",
+            "https://accounts.teamofsilicons.com",
+        )?,
+        environment,
+    )?;
+    let api_url = match optional(source, "ACCOUNTS_API_URL")? {
+        Some(value) => accounts_origin("ACCOUNTS_API_URL", &value, environment)?,
+        None => public_url.clone(),
+    };
+    let app_id = bounded_string(
+        "WAVEFORM_APP_ID",
+        value_or(source, "WAVEFORM_APP_ID", "waveform")?,
+        1,
+        80,
+    )?;
+    app_id
+        .parse::<crate::domain::identity::ApplicationId>()
+        .map_err(|_| invalid("WAVEFORM_APP_ID", "must be a bare app id such as waveform"))?;
+    let webhook_secret = load_webhook_secret(source, "WAVEFORM_ACCOUNTS_WEBHOOK_SECRET")?;
+    let previous_webhook_secret =
+        load_webhook_secret(source, "WAVEFORM_ACCOUNTS_WEBHOOK_SECRET_PREVIOUS")?;
+    if previous_webhook_secret.is_some() && webhook_secret.is_none() {
+        return Err(invalid(
+            "WAVEFORM_ACCOUNTS_WEBHOOK_SECRET_PREVIOUS",
+            "needs WAVEFORM_ACCOUNTS_WEBHOOK_SECRET (the current secret) to be set too",
+        ));
+    }
+    let proof_issuers = ProofIssuers::parse(&value_or(source, "WAVEFORM_PROOF_ISSUERS", "")?)
+        .map_err(|reason| invalid("WAVEFORM_PROOF_ISSUERS", reason))?;
+    Ok(AccountsSettings {
+        public_url,
+        api_url,
+        app_id,
+        app_secret: secret_required(source, "WAVEFORM_APP_SECRET", 1, MAX_SECRET_CHARS)?,
+        webhook_secret,
+        previous_webhook_secret,
+        timeout: duration_seconds(source, "WAVEFORM_ACCOUNTS_TIMEOUT_SECONDS", 5, 1, 60)?,
+        proof_issuers,
+    })
+}
+
+fn load_webhook_secret(
+    source: &impl EnvironmentSource,
+    name: &'static str,
+) -> Result<Option<SecretString>, SettingsError> {
+    let secret = optional_secret(source, name, 7, 512)?;
+    if secret
+        .as_ref()
+        .is_some_and(|value| !value.expose_secret().starts_with("whsec_"))
+    {
+        return Err(invalid(
+            name,
+            "must be the whsec_… secret Silicon Accounts generated for Waveform's webhook",
+        ));
+    }
+    Ok(secret)
+}
+
+/// An Accounts origin: http(s), a host, no credentials, query or fragment.
+/// Plain http is allowed only for loopback hosts, and never in production.
+fn accounts_origin(
+    name: &'static str,
+    value: &str,
+    environment: RuntimeEnvironment,
+) -> Result<Url, SettingsError> {
+    let url = Url::parse(value).map_err(|_| invalid(name, "must be a valid absolute URL"))?;
+    validate_http_url(name, &url)?;
+    if !matches!(url.path(), "" | "/") {
+        return Err(invalid(
+            name,
+            "must be an origin such as https://accounts.teamofsilicons.com, without a path",
+        ));
+    }
+    if url.scheme() == "http"
+        && (environment == RuntimeEnvironment::Production
+            || !crate::domain::media::is_loopback_host(&url))
+    {
+        return Err(invalid(
+            name,
+            "must use https (plain http is allowed only for a loopback host outside production)",
+        ));
+    }
+    Ok(url)
+}
+
+fn load_public(
+    source: &impl EnvironmentSource,
+    environment: RuntimeEnvironment,
+    server: &ServerSettings,
+) -> Result<PublicSettings, SettingsError> {
+    let default = if environment == RuntimeEnvironment::Production {
+        "https://backend.waveform.teamofsilicons.com".to_owned()
+    } else {
+        format!("http://127.0.0.1:{}", server.bind_addr.port())
+    };
+    let base_url = http_url_or(source, "WAVEFORM_PUBLIC_URL", &default)?;
+    let speech_fixtures = parse_or(source, "WAVEFORM_SPEECH_FIXTURES", "false")?;
+    if environment == RuntimeEnvironment::Production && speech_fixtures {
+        return Err(invalid(
+            "WAVEFORM_SPEECH_FIXTURES",
+            "must not be enabled in production: it replaces every paid speech provider with prerecorded fixtures",
+        ));
+    }
+    Ok(PublicSettings {
+        base_url,
+        speech_fixtures,
+    })
+}
+
+fn load_briefcase(
+    source: &impl EnvironmentSource,
+    waveform_app_id: &str,
+    limits: &LimitSettings,
+) -> Result<BriefcaseSettings, SettingsError> {
+    let base_url = http_url_or(
+        source,
+        "WAVEFORM_BRIEFCASE_BASE_URL",
+        "http://127.0.0.1:8082",
+    )?;
+    let app_id = bounded_string(
+        "WAVEFORM_BRIEFCASE_APP_ID",
+        value_or(source, "WAVEFORM_BRIEFCASE_APP_ID", "briefcase")?,
+        1,
+        80,
+    )?;
+    if app_id == waveform_app_id {
+        return Err(invalid(
+            "WAVEFORM_BRIEFCASE_APP_ID",
+            "is now Briefcase's app id (the app Waveform's proofs are for), not Waveform's own; set it to briefcase or delete it",
+        ));
+    }
+    app_id
+        .parse::<crate::domain::identity::ApplicationId>()
+        .map_err(|_| {
+            invalid(
+                "WAVEFORM_BRIEFCASE_APP_ID",
+                "must be a bare app id such as briefcase",
+            )
+        })?;
+    let app_folder = bounded_string(
+        "WAVEFORM_BRIEFCASE_APP_FOLDER",
+        value_or(source, "WAVEFORM_BRIEFCASE_APP_FOLDER", "apps/waveform")?,
+        1,
+        255,
+    )?;
+    if app_folder.starts_with('/')
+        || app_folder.ends_with('/')
+        || app_folder
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(invalid(
+            "WAVEFORM_BRIEFCASE_APP_FOLDER",
+            "must be a drive-relative folder path such as apps/waveform",
+        ));
+    }
+    let settings = BriefcaseSettings {
+        permanent_origin: origin_url_or(
+            source,
+            "WAVEFORM_BRIEFCASE_PERMANENT_ORIGIN",
+            "https://127.0.0.1:8082",
+        )?,
+        base_url,
+        app_id,
+        app_folder,
+        timeout: duration_seconds(source, "WAVEFORM_BRIEFCASE_TIMEOUT_SECONDS", 10, 1, 120)?,
+        download_timeout: duration_seconds(
+            source,
+            "WAVEFORM_BRIEFCASE_DOWNLOAD_TIMEOUT_SECONDS",
+            30,
+            1,
+            300,
+        )?,
+        max_download_bytes: usize_in_range(
+            source,
+            "WAVEFORM_BRIEFCASE_MAX_DOWNLOAD_BYTES",
+            MAX_MEDIA_BYTES,
+            1_024,
+            MAX_MEDIA_BYTES,
+        )?,
+    };
+    if settings.max_download_bytes < limits.max_media_bytes {
+        return Err(invalid(
+            "WAVEFORM_BRIEFCASE_MAX_DOWNLOAD_BYTES",
+            "must be at least WAVEFORM_MAX_MEDIA_BYTES",
+        ));
+    }
+    Ok(settings)
 }
 
 fn load_limits(source: &impl EnvironmentSource) -> Result<LimitSettings, SettingsError> {
@@ -461,111 +766,6 @@ fn load_database(
         )?,
     };
     validate_database_url(environment, &settings.url)?;
-    Ok(settings)
-}
-
-fn load_iam(source: &impl EnvironmentSource) -> Result<IamSettings, SettingsError> {
-    let app_id = bounded_string(
-        "WAVEFORM_IAM_APP_ID",
-        value_or(source, "WAVEFORM_IAM_APP_ID", "waveform")?,
-        1,
-        80,
-    )?;
-    Ok(IamSettings {
-        base_url: http_url_or(source, "WAVEFORM_IAM_BASE_URL", "http://127.0.0.1:8081")?,
-        app_id: app_id.clone(),
-        app_secret: secret_required(source, "WAVEFORM_IAM_APP_SECRET", 1, MAX_SECRET_CHARS)?,
-        token_introspection_path: endpoint_path(
-            "WAVEFORM_IAM_TOKEN_INTROSPECTION_PATH",
-            value_or(
-                source,
-                "WAVEFORM_IAM_TOKEN_INTROSPECTION_PATH",
-                "/api/v1/oauth/introspect",
-            )?,
-        )?,
-        obo_verify_path: endpoint_path(
-            "WAVEFORM_IAM_OBO_VERIFY_PATH",
-            value_or(
-                source,
-                "WAVEFORM_IAM_OBO_VERIFY_PATH",
-                "/api/v1/obo-access/token-verifications",
-            )?,
-        )?,
-        audience: bounded_string(
-            "WAVEFORM_IAM_AUDIENCE",
-            optional(source, "WAVEFORM_IAM_AUDIENCE")?.unwrap_or_else(|| app_id.clone()),
-            1,
-            80,
-        )?,
-        tts_action: action_name(
-            "WAVEFORM_IAM_TTS_ACTION",
-            value_or(source, "WAVEFORM_IAM_TTS_ACTION", "self.identity.read")?,
-        )?,
-        stt_action: action_name(
-            "WAVEFORM_IAM_STT_ACTION",
-            value_or(source, "WAVEFORM_IAM_STT_ACTION", "self.identity.read")?,
-        )?,
-        timeout: duration_seconds(source, "WAVEFORM_IAM_TIMEOUT_SECONDS", 5, 1, 60)?,
-    })
-}
-
-fn load_briefcase(
-    source: &impl EnvironmentSource,
-    iam_app_id: &str,
-    limits: &LimitSettings,
-) -> Result<BriefcaseSettings, SettingsError> {
-    let base_url = http_url_or(
-        source,
-        "WAVEFORM_BRIEFCASE_BASE_URL",
-        "http://127.0.0.1:8082",
-    )?;
-    let settings = BriefcaseSettings {
-        permanent_origin: origin_url_or(
-            source,
-            "WAVEFORM_BRIEFCASE_PERMANENT_ORIGIN",
-            "https://127.0.0.1:8082",
-        )?,
-        cdn_origin: origin_url_or(
-            source,
-            "WAVEFORM_BRIEFCASE_CDN_ORIGIN",
-            "https://127.0.0.1:8082",
-        )?,
-        base_url,
-        app_id: bounded_string(
-            "WAVEFORM_BRIEFCASE_APP_ID",
-            optional(source, "WAVEFORM_BRIEFCASE_APP_ID")?.unwrap_or_else(|| iam_app_id.to_owned()),
-            1,
-            80,
-        )?,
-        audience: bounded_string(
-            "WAVEFORM_BRIEFCASE_AUDIENCE",
-            optional(source, "WAVEFORM_BRIEFCASE_AUDIENCE")?
-                .unwrap_or_else(|| "briefcase".to_owned()),
-            3,
-            80,
-        )?,
-        timeout: duration_seconds(source, "WAVEFORM_BRIEFCASE_TIMEOUT_SECONDS", 10, 1, 120)?,
-        download_timeout: duration_seconds(
-            source,
-            "WAVEFORM_BRIEFCASE_DOWNLOAD_TIMEOUT_SECONDS",
-            30,
-            1,
-            300,
-        )?,
-        max_download_bytes: usize_in_range(
-            source,
-            "WAVEFORM_BRIEFCASE_MAX_DOWNLOAD_BYTES",
-            MAX_MEDIA_BYTES,
-            1_024,
-            MAX_MEDIA_BYTES,
-        )?,
-    };
-    if settings.max_download_bytes < limits.max_media_bytes {
-        return Err(invalid(
-            "WAVEFORM_BRIEFCASE_MAX_DOWNLOAD_BYTES",
-            "must be at least WAVEFORM_MAX_MEDIA_BYTES",
-        ));
-    }
     Ok(settings)
 }
 
@@ -795,7 +995,7 @@ fn load_telemetry(source: &impl EnvironmentSource) -> Result<TelemetrySettings, 
 fn validate_workflow_deadlines(
     server: &ServerSettings,
     database: &DatabaseSettings,
-    iam: &IamSettings,
+    accounts: &AccountsSettings,
     briefcase: &BriefcaseSettings,
     providers: &ProviderSettings,
     audio: &AudioSettings,
@@ -806,14 +1006,14 @@ fn validate_workflow_deadlines(
         .saturating_add(providers.elevenlabs.timeout)
         .saturating_add(providers.openai.tts_timeout)
         .saturating_add(audio.timeout.saturating_mul(3))
-        .saturating_add(iam.timeout.saturating_mul(2))
+        .saturating_add(accounts.timeout.saturating_mul(3))
         .saturating_add(briefcase.timeout)
         .saturating_add(database.statement_timeout.saturating_mul(2))
         .saturating_add(ORCHESTRATION_HEADROOM);
     if server.tts_deadline < tts_attempt_budget {
         return Err(invalid(
             "WAVEFORM_TTS_DEADLINE_SECONDS",
-            "must cover provider, codec, IAM, Briefcase, storage, and orchestration budgets",
+            "must cover provider, codec, Silicon Accounts, Briefcase, storage, and orchestration budgets",
         ));
     }
 
@@ -822,7 +1022,7 @@ fn validate_workflow_deadlines(
         .stt_timeout
         .saturating_add(providers.openai.stt_timeout)
         .saturating_add(providers.deepgram.timeout)
-        .saturating_add(iam.timeout.saturating_mul(2))
+        .saturating_add(accounts.timeout.saturating_mul(3))
         .saturating_add(briefcase.timeout)
         .saturating_add(briefcase.download_timeout)
         .saturating_add(database.statement_timeout.saturating_mul(2))
@@ -830,7 +1030,7 @@ fn validate_workflow_deadlines(
     if server.stt_deadline < stt_attempt_budget {
         return Err(invalid(
             "WAVEFORM_STT_DEADLINE_SECONDS",
-            "must cover provider, IAM, Briefcase, storage, and orchestration budgets",
+            "must cover provider, Silicon Accounts, Briefcase, storage, and orchestration budgets",
         ));
     }
     Ok(())
@@ -860,23 +1060,21 @@ fn validate_environment_safety(settings: &Settings) -> Result<(), SettingsError>
             "must be an absolute path in production",
         ));
     }
-    if settings.iam.app_secret.expose_secret().chars().count() < 32 {
+    if settings.accounts.app_secret.expose_secret().chars().count() < 32 {
         return Err(invalid(
-            "WAVEFORM_IAM_APP_SECRET",
+            "WAVEFORM_APP_SECRET",
             "must contain at least 32 characters in production",
         ));
     }
 
     for (name, url) in [
-        ("WAVEFORM_IAM_BASE_URL", &settings.iam.base_url),
+        ("ACCOUNTS_URL", &settings.accounts.public_url),
+        ("ACCOUNTS_API_URL", &settings.accounts.api_url),
+        ("WAVEFORM_PUBLIC_URL", &settings.public.base_url),
         ("WAVEFORM_BRIEFCASE_BASE_URL", &settings.briefcase.base_url),
         (
             "WAVEFORM_BRIEFCASE_PERMANENT_ORIGIN",
             &settings.briefcase.permanent_origin,
-        ),
-        (
-            "WAVEFORM_BRIEFCASE_CDN_ORIGIN",
-            &settings.briefcase.cdn_origin,
         ),
         (
             "WAVEFORM_GEMINI_BASE_URL",
@@ -992,34 +1190,6 @@ fn validate_http_url(name: &'static str, url: &Url) -> Result<(), SettingsError>
         return Err(invalid(name, "must not contain a query or fragment"));
     }
     Ok(())
-}
-
-fn endpoint_path(name: &'static str, value: String) -> Result<String, SettingsError> {
-    let value = bounded_string(name, value, 2, 512)?;
-    if !value.starts_with('/')
-        || value.starts_with("//")
-        || value.contains('?')
-        || value.contains('#')
-    {
-        return Err(invalid(
-            name,
-            "must be an absolute HTTP path without query or fragment",
-        ));
-    }
-    Ok(value)
-}
-
-fn action_name(name: &'static str, value: String) -> Result<String, SettingsError> {
-    let value = bounded_string(name, value, 1, 128)?;
-    if !value.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'>')
-    }) {
-        return Err(invalid(
-            name,
-            "must contain only letters, numbers, period, underscore, hyphen, colon, or greater-than",
-        ));
-    }
-    Ok(value)
 }
 
 fn bounded_value_or(
@@ -1260,7 +1430,7 @@ mod tests {
                     "postgres://waveform:password@localhost/waveform".to_owned(),
                 ),
                 (
-                    "WAVEFORM_IAM_APP_SECRET",
+                    "WAVEFORM_APP_SECRET",
                     "a-distinctive-secret-that-must-be-redacted".to_owned(),
                 ),
                 (
@@ -1286,8 +1456,18 @@ mod tests {
         let settings = Settings::from_source(&TestEnvironment::valid())?;
 
         assert_eq!(settings.environment, RuntimeEnvironment::Development);
-        assert_eq!(settings.iam.tts_action, "self.identity.read");
-        assert_eq!(settings.iam.stt_action, "self.identity.read");
+        assert_eq!(settings.accounts.app_id, "waveform");
+        assert_eq!(
+            settings.accounts.issuer(),
+            "https://accounts.teamofsilicons.com"
+        );
+        assert_eq!(settings.accounts.api_url, settings.accounts.public_url);
+        assert!(settings.accounts.proof_issuers.is_empty());
+        assert!(settings.accounts.webhook_secret.is_none());
+        assert_eq!(settings.briefcase.app_id, "briefcase");
+        assert_eq!(settings.briefcase.app_folder, "apps/waveform");
+        assert_eq!(settings.public.base_url.as_str(), "http://127.0.0.1:8080/");
+        assert!(!settings.public.speech_fixtures);
         assert_eq!(settings.limits.max_text_chars, 4_096);
         assert_eq!(settings.limits.max_media_bytes, 25 * 1_024 * 1_024);
         assert_eq!(settings.idempotency.ttl, Duration::from_hours(24));
@@ -1297,30 +1477,156 @@ mod tests {
         assert!(settings.providers.deepgram.mip_opt_out);
         assert_eq!(settings.audio.max_input_bytes, 25 * 1_024 * 1_024);
         assert_eq!(settings.briefcase.permanent_origin.scheme(), "https");
-        assert_eq!(settings.briefcase.cdn_origin.scheme(), "https");
-        assert_eq!(
-            settings.iam.token_introspection_path,
-            "/api/v1/oauth/introspect"
-        );
         assert!(!settings.providers.require_full_chain);
+        assert!(settings.obsolete_variables.is_empty());
         Ok(())
     }
 
     #[test]
-    fn explicit_iam_introspection_path_override_is_preserved() -> Result<(), SettingsError> {
+    fn local_stack_accounts_urls_and_proof_issuers_are_parsed() -> Result<(), SettingsError> {
         let mut environment = TestEnvironment::valid();
+        environment.set("ACCOUNTS_URL", "http://localhost:9590");
+        environment.set("ACCOUNTS_API_URL", "http://127.0.0.1:9589/");
         environment.set(
-            "WAVEFORM_IAM_TOKEN_INTROSPECTION_PATH",
-            "/api/v1/auth/tokens/introspect",
+            "WAVEFORM_PROOF_ISSUERS",
+            " waveform.tts=interface ; waveform.stt=interface, dm ",
         );
-
+        environment.set(
+            "WAVEFORM_ACCOUNTS_WEBHOOK_SECRET",
+            "whsec_local-test-secret",
+        );
         let settings = Settings::from_source(&environment)?;
 
+        assert_eq!(settings.accounts.issuer(), "http://localhost:9590");
+        assert_eq!(settings.accounts.api_url.as_str(), "http://127.0.0.1:9589/");
+        assert!(
+            settings
+                .accounts
+                .proof_issuers
+                .allows("waveform.tts", "interface")
+        );
+        assert!(settings.accounts.proof_issuers.allows("waveform.stt", "dm"));
+        assert!(!settings.accounts.proof_issuers.allows("waveform.tts", "dm"));
+        Ok(())
+    }
+
+    #[test]
+    fn accounts_settings_refuse_unsafe_or_ambiguous_values() {
+        for (name, value, expected) in [
+            (
+                "ACCOUNTS_URL",
+                "http://accounts.example.test",
+                "ACCOUNTS_URL",
+            ),
+            (
+                "ACCOUNTS_URL",
+                "https://accounts.example.test/v1",
+                "ACCOUNTS_URL",
+            ),
+            ("ACCOUNTS_API_URL", "ftp://127.0.0.1", "ACCOUNTS_API_URL"),
+            (
+                "WAVEFORM_PROOF_ISSUERS",
+                "waveform.admin=interface",
+                "WAVEFORM_PROOF_ISSUERS",
+            ),
+            (
+                "WAVEFORM_PROOF_ISSUERS",
+                "waveform.tts",
+                "WAVEFORM_PROOF_ISSUERS",
+            ),
+            (
+                "WAVEFORM_ACCOUNTS_WEBHOOK_SECRET",
+                "not-a-whsec",
+                "WAVEFORM_ACCOUNTS_WEBHOOK_SECRET",
+            ),
+            (
+                "WAVEFORM_BRIEFCASE_APP_ID",
+                "waveform",
+                "WAVEFORM_BRIEFCASE_APP_ID",
+            ),
+            (
+                "WAVEFORM_BRIEFCASE_AUDIENCE",
+                "briefcase",
+                "WAVEFORM_BRIEFCASE_AUDIENCE",
+            ),
+            (
+                "WAVEFORM_BRIEFCASE_APP_FOLDER",
+                "/apps/waveform",
+                "WAVEFORM_BRIEFCASE_APP_FOLDER",
+            ),
+            ("WAVEFORM_APP_ID", "Waveform", "WAVEFORM_APP_ID"),
+        ] {
+            let mut environment = TestEnvironment::valid();
+            environment.set(name, value);
+            assert!(
+                matches!(Settings::from_source(&environment), Err(SettingsError::Invalid { name, .. }) if name == expected),
+                "{name}={value}"
+            );
+        }
+        let mut environment = TestEnvironment::valid();
+        environment.0.remove("WAVEFORM_APP_SECRET");
         assert_eq!(
-            settings.iam.token_introspection_path,
-            "/api/v1/auth/tokens/introspect"
+            Settings::from_source(&environment).err(),
+            Some(SettingsError::Missing("WAVEFORM_APP_SECRET"))
+        );
+    }
+
+    #[test]
+    fn obsolete_iam_variables_are_reported_not_read() -> Result<(), SettingsError> {
+        let mut environment = TestEnvironment::valid();
+        environment.set("WAVEFORM_IAM_APP_SECRET", "old-secret");
+        environment.set("WAVEFORM_HONEYCOMB_SERVICE_TOKEN", "old-token");
+        let settings = Settings::from_source(&environment)?;
+        assert_eq!(
+            settings.obsolete_variables,
+            vec![
+                "WAVEFORM_IAM_APP_SECRET",
+                "WAVEFORM_HONEYCOMB_SERVICE_TOKEN"
+            ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn production_requires_webhook_secret_https_and_no_fixtures() {
+        let production = || {
+            let mut environment = TestEnvironment::valid();
+            environment.set("WAVEFORM_ENVIRONMENT", "production");
+            environment.set(
+                "WAVEFORM_DATABASE_URL",
+                "postgres://waveform:password@db.internal/waveform?sslmode=verify-full",
+            );
+            environment.set("WAVEFORM_ENCRYPTION_KEY", "19".repeat(32));
+            environment.set(
+                "WAVEFORM_APP_SECRET",
+                "sa_app_waveform_a-long-production-secret-value",
+            );
+            environment
+        };
+        assert_eq!(
+            Settings::from_source(&production()).err(),
+            Some(SettingsError::Missing("WAVEFORM_ACCOUNTS_WEBHOOK_SECRET"))
+        );
+        let mut environment = production();
+        environment.set("WAVEFORM_ACCOUNTS_WEBHOOK_SECRET", "whsec_production");
+        environment.set("WAVEFORM_SPEECH_FIXTURES", "true");
+        assert!(matches!(
+            Settings::from_source(&environment),
+            Err(SettingsError::Invalid {
+                name: "WAVEFORM_SPEECH_FIXTURES",
+                ..
+            })
+        ));
+        let mut environment = production();
+        environment.set("WAVEFORM_ACCOUNTS_WEBHOOK_SECRET", "whsec_production");
+        environment.set("ACCOUNTS_URL", "http://localhost:9590");
+        assert!(matches!(
+            Settings::from_source(&environment),
+            Err(SettingsError::Invalid {
+                name: "ACCOUNTS_URL",
+                ..
+            })
+        ));
     }
 
     #[test]

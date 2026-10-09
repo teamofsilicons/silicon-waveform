@@ -5,8 +5,9 @@
 //! key returns a redacted configuration failure, allowing the application service
 //! to continue to the next documented provider without making a network call.
 //! Readiness separately requires at least one configured provider for both TTS
-//! and STT. Released IAM delegation and Briefcase read/upload contracts are wired;
-//! readiness does not perform paid speech calls or consume user credentials.
+//! and STT (or the development speech fixtures). Silicon Accounts authentication,
+//! Briefcase proofs and held audio are wired here; readiness performs no paid
+//! speech calls and consumes no account credentials.
 
 use std::{future::IntoFuture as _, str::FromStr as _, sync::Arc, time::Duration};
 
@@ -24,10 +25,11 @@ use crate::{
     api::{ApiState, ReadinessChecks},
     application::{
         ports::{
-            AudioNormalizer, BriefcasePort, IamPort, IdempotencyStore, LeaseIdGenerator,
-            SpeechToTextProvider, TextToSpeechProvider,
+            AccountsPort, AudioNormalizer, BriefcasePort, IdempotencyStore, LeaseIdGenerator,
+            SpeechToTextProvider, StorageAuthorityError, StorageAuthorityPort,
+            TextToSpeechProvider,
         },
-        service::{ServicePolicy, WaveformService},
+        service::{ServicePolicy, StorageBoundary, WaveformService},
     },
     config::{
         DeepgramSettings, ElevenLabsSettings, GeminiSettings, OpenAiSettings, ProviderSettings,
@@ -41,15 +43,20 @@ use crate::{
 };
 
 use super::{
+    accounts::AccountsGateway,
     audio::{AudioNormalizerConfig, FfmpegAudioNormalizer},
-    auth::IamHttpAdapter,
-    briefcase::FailClosedBriefcaseStore,
+    authenticator::AccountsAuthenticator,
+    briefcase::BriefcaseHttp,
+    directory::AccountDirectory,
+    held_audio::PostgresHeldAudio,
     idempotency::PostgresIdempotencyStore,
     providers::{
         DeepgramConfig, DeepgramProvider, ElevenLabsConfig, ElevenLabsProvider, GeminiConfig,
         GeminiProvider, OpenAiConfig, OpenAiProvider, PROVIDER_RETRY_BASE_DELAY,
         ProviderHttpConfig, TransientRetry,
     },
+    storage_proofs::StorageProofs,
+    vault::Vault,
 };
 
 const USER_AGENT: &str = concat!("silicon-waveform/", env!("CARGO_PKG_VERSION"));
@@ -58,7 +65,7 @@ const PROVIDER_RESPONSE_OVERHEAD_BYTES: usize = 1_024 * 1_024;
 const CLEANUP_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const DATABASE_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 const DATABASE_MAX_LIFETIME: Duration = Duration::from_mins(30);
-const ENVIRONMENT_CLEANUP_INTERVAL: Duration = Duration::from_hours(1);
+const MAINTENANCE_INTERVAL: Duration = Duration::from_hours(1);
 const DEPENDENCY_CONTRACTS_AVAILABLE: bool = true;
 
 /// Redacted process bootstrap or lifecycle failure.
@@ -85,9 +92,9 @@ pub enum RuntimeError {
     /// An embedded schema migration could not be applied.
     #[error("failed to migrate the PostgreSQL schema")]
     DatabaseMigration,
-    /// IAM adapter settings could not be represented safely.
-    #[error("failed to construct the IAM adapter")]
-    IamConfiguration,
+    /// Silicon Accounts settings could not be represented safely.
+    #[error("failed to construct the Silicon Accounts client")]
+    AccountsConfiguration,
     /// Briefcase adapter settings could not be represented safely.
     #[error("failed to construct the Briefcase adapter")]
     BriefcaseConfiguration,
@@ -120,7 +127,28 @@ pub async fn run_from_env() -> Result<(), RuntimeError> {
 
     let settings = Settings::from_env()?;
     telemetry::init(&settings).map_err(|_| RuntimeError::Telemetry)?;
+    if !settings.obsolete_variables.is_empty() {
+        tracing::warn!(
+            variables = ?settings.obsolete_variables,
+            "these IAM- and Honeycomb-era variables are no longer read; delete them"
+        );
+    }
     run(settings).await
+}
+
+/// Connects to PostgreSQL and applies the embedded migrations, for operator
+/// commands that run without serving.
+///
+/// # Errors
+///
+/// Returns a redacted error when the database cannot be reached or migrated.
+pub async fn connect_and_migrate(settings: &Settings) -> Result<PgPool, RuntimeError> {
+    let pool = connect_database(settings).await?;
+    if sqlx::migrate!().run(&pool).await.is_err() {
+        close_pool(&pool, settings.server.shutdown_timeout).await;
+        return Err(RuntimeError::DatabaseMigration);
+    }
+    Ok(pool)
 }
 
 async fn run(settings: Settings) -> Result<(), RuntimeError> {
@@ -213,27 +241,56 @@ async fn compose_and_serve(
     let configured_stt_providers = provider_chains.availability.stt_count();
     let provider_chains_configured = configured_tts_providers > 0 && configured_stt_providers > 0;
 
-    let iam: Arc<dyn IamPort> = Arc::new(
-        IamHttpAdapter::new(&settings.iam)
-            .map_err(|_| RuntimeError::IamConfiguration)?
-            .with_storage_audience(&settings.briefcase.audience)
-            .with_identity_store(pool.clone())
-            .with_storage_grants(
-                settings
-                    .control
-                    .encryption_key
-                    .as_ref()
-                    .map(|key| crate::control::storage::StorageGrants::new(pool.clone(), key))
-                    .transpose()
-                    .map_err(|_| RuntimeError::IamConfiguration)?,
-            ),
+    let gateway = Arc::new(
+        AccountsGateway::new(&settings.accounts)
+            .map_err(|_| RuntimeError::AccountsConfiguration)?,
     );
-    let briefcase: Arc<dyn BriefcasePort> = Arc::new(
-        FailClosedBriefcaseStore::new(&settings.briefcase)
-            .map_err(|_| RuntimeError::BriefcaseConfiguration)?
-            .with_uploads(&settings.briefcase)
-            .with_reads(&settings.briefcase, iam.clone()),
+    let directory = AccountDirectory::new(pool.clone(), gateway.clone());
+    let authenticator = AccountsAuthenticator::new(
+        gateway.clone(),
+        directory,
+        settings.accounts.proof_issuers.clone(),
     );
+    let accounts: Arc<dyn AccountsPort> = Arc::new(authenticator.clone());
+    let storage_proofs = settings
+        .control
+        .encryption_key
+        .as_ref()
+        .map(|key| {
+            Vault::new(key).map(|vault| {
+                StorageProofs::new(
+                    pool.clone(),
+                    vault,
+                    gateway.clone(),
+                    settings.briefcase.app_id.clone(),
+                )
+            })
+        })
+        .transpose()
+        .map_err(|_| RuntimeError::ServiceConfiguration)?;
+    if storage_proofs.is_none() {
+        tracing::warn!(
+            "WAVEFORM_ENCRYPTION_KEY is not set: Waveform cannot hold Briefcase access, so speech is held by Waveform and STT cannot read Briefcase sources"
+        );
+    }
+    let authority: Arc<dyn StorageAuthorityPort> = match &storage_proofs {
+        Some(proofs) => Arc::new(proofs.clone()),
+        None => Arc::new(NoStorageAuthority),
+    };
+    let briefcase_http = Arc::new(
+        BriefcaseHttp::new(&settings.briefcase, &settings.accounts.app_id)
+            .map_err(|_| RuntimeError::BriefcaseConfiguration)?,
+    );
+    let briefcase: Arc<dyn BriefcasePort> = briefcase_http.clone();
+    let held_audio = PostgresHeldAudio::new(pool.clone(), settings.idempotency.ttl);
+    if settings.accounts.webhook_secret.is_none() {
+        tracing::warn!(
+            "WAVEFORM_ACCOUNTS_WEBHOOK_SECRET is not set: POST /webhooks/accounts answers 503 and revocations arrive only through introspection"
+        );
+    }
+    if settings.accounts.proof_issuers.is_empty() {
+        tracing::info!("WAVEFORM_PROOF_ISSUERS is empty: no app may call Waveform with a proof");
+    }
 
     let audio = Arc::new(FfmpegAudioNormalizer::new(AudioNormalizerConfig {
         ffmpeg_path: settings.audio.ffmpeg_path.clone(),
@@ -265,57 +322,51 @@ async fn compose_and_serve(
         settings.limits.max_text_chars,
         RequestDigestKey::new(settings.idempotency.digest_key.expose_secret().as_bytes())
             .map_err(|_| RuntimeError::ServiceConfiguration)?,
+        settings.public.base_url.clone(),
     )
     .map_err(|_| RuntimeError::ServiceConfiguration)?;
 
     let control = Arc::new(
-        crate::control::ControlState::new(pool.clone(), settings)
-            .map_err(|_| RuntimeError::ServiceConfiguration)?,
-    );
-    let service = Arc::new(
-        WaveformService::new(
-            iam.clone(),
-            briefcase.clone(),
-            idempotency_port.clone(),
-            audio_port.clone(),
-            Arc::new(UuidLeaseIdGenerator),
-            provider_chains.tts,
-            provider_chains.stt,
-            policy,
+        crate::control::ControlState::new(
+            pool.clone(),
+            settings,
+            authenticator,
+            storage_proofs,
+            briefcase_http,
+            held_audio.clone(),
         )
-        .map_err(|_| RuntimeError::ServiceConfiguration)?
-        .with_provider_keys(control.clone())
-        .with_voice_profiles(control.clone()),
+        .map_err(|_| RuntimeError::ServiceConfiguration)?,
     );
-    // Test requests reuse orchestration and persistence. The router replaces
-    // storage ports with paired test IAM/Briefcase clients before execution;
-    // only billable speech generation uses deterministic fixtures.
-    let fixture_policy = ServicePolicy::new(
-        settings.idempotency.lease,
-        media_limit,
-        BriefcaseOrigin::new(settings.briefcase.permanent_origin.clone())
-            .map_err(|_| RuntimeError::ServiceConfiguration)?,
-        settings.limits.max_text_chars,
-        RequestDigestKey::new(settings.idempotency.digest_key.expose_secret().as_bytes())
-            .map_err(|_| RuntimeError::ServiceConfiguration)?,
-    )
-    .map_err(|_| RuntimeError::ServiceConfiguration)?;
-    let (fixture_tts, fixture_stt) =
-        crate::infrastructure::testing::database_provider_chains(&pool);
-    let fixture_service = Arc::new(
-        WaveformService::new(
-            iam,
+    let (tts_providers, stt_providers) = if settings.public.speech_fixtures {
+        tracing::warn!(
+            "WAVEFORM_SPEECH_FIXTURES is on: every speech request returns the prerecorded fixtures; no paid provider is called"
+        );
+        crate::infrastructure::testing::database_provider_chains(&pool)
+    } else {
+        (provider_chains.tts, provider_chains.stt)
+    };
+    let mut service = WaveformService::new(
+        accounts,
+        StorageBoundary {
+            authority,
             briefcase,
-            idempotency_port.clone(),
-            audio_port.clone(),
-            Arc::new(UuidLeaseIdGenerator),
-            fixture_tts,
-            fixture_stt,
-            fixture_policy,
-        )
-        .map_err(|_| RuntimeError::ServiceConfiguration)?
-        .with_voice_profiles(control.clone()),
-    );
+            held_audio: Arc::new(held_audio.clone()),
+        },
+        idempotency_port.clone(),
+        audio_port.clone(),
+        Arc::new(UuidLeaseIdGenerator),
+        tts_providers,
+        stt_providers,
+        policy,
+    )
+    .map_err(|_| RuntimeError::ServiceConfiguration)?
+    .with_voice_profiles(control.clone())
+    .with_provider_orders(control.clone());
+    if !settings.public.speech_fixtures {
+        service = service.with_provider_keys(control.clone());
+    }
+    let service = Arc::new(service);
+    let provider_chains_configured = settings.public.speech_fixtures || provider_chains_configured;
     let readiness = ReadinessChecks::new(
         idempotency_port,
         audio_port,
@@ -328,8 +379,7 @@ async fn compose_and_serve(
         settings.server.tts_deadline,
         settings.server.stt_deadline,
     )
-    .with_control(control.clone())
-    .with_fixture_service(fixture_service);
+    .with_control(control.clone());
     let application = crate::api::router(state, &settings.server);
     let listener = TcpListener::bind(settings.server.bind_addr)
         .await
@@ -338,13 +388,14 @@ async fn compose_and_serve(
     let cleanup_shutdown = CancellationToken::new();
     let cleanup_task = spawn_cleanup(
         idempotency,
+        held_audio,
         cleanup_shutdown.clone(),
         settings.idempotency.cleanup_interval,
         settings.idempotency.cleanup_batch.get(),
     );
     let environment_cleanup_shutdown = CancellationToken::new();
     let environment_cleanup_task =
-        spawn_environment_cleanup(control.clone(), environment_cleanup_shutdown.clone());
+        spawn_maintenance(control.clone(), environment_cleanup_shutdown.clone());
 
     tracing::info!(
         bind_address = %settings.server.bind_addr,
@@ -406,13 +457,15 @@ async fn serve_until_shutdown(
     server_result
 }
 
-fn spawn_environment_cleanup(
+/// Delivers queued bug reports every few seconds and retires deprecated API
+/// contracts hourly.
+fn spawn_maintenance(
     control: Arc<crate::control::ControlState>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
-        let mut last_cleanup = tokio::time::Instant::now() - ENVIRONMENT_CLEANUP_INTERVAL;
+        let mut last_sunset_check = tokio::time::Instant::now() - MAINTENANCE_INTERVAL;
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -420,12 +473,12 @@ fn spawn_environment_cleanup(
                 () = shutdown.cancelled() => break,
                 _ = ticker.tick() => {
                     if control.deliver_report().await.is_err() { tracing::warn!("report delivery will retry"); }
-                    if last_cleanup.elapsed() < ENVIRONMENT_CLEANUP_INTERVAL { continue; }
-                    last_cleanup = tokio::time::Instant::now();
-                    match control.cleanup_environments().await {
-                    Ok(changed) if changed > 0 => tracing::info!(changed, "test environments cleaned"),
-                    Ok(_) => {}
-                    Err(_) => tracing::warn!("test environment cleanup failed"),
+                    if last_sunset_check.elapsed() < MAINTENANCE_INTERVAL { continue; }
+                    last_sunset_check = tokio::time::Instant::now();
+                    match control.sunset_contracts().await {
+                        Ok(changed) if changed > 0 => tracing::info!(changed, "deprecated API contracts sunset"),
+                        Ok(_) => {}
+                        Err(_) => tracing::warn!("API contract sunset check failed"),
                     }
                 },
             }
@@ -433,8 +486,24 @@ fn spawn_environment_cleanup(
     })
 }
 
+/// Storage authority used when no encryption key is configured: Waveform can
+/// hold no Briefcase access, so speech is held and STT sources cannot be read.
+struct NoStorageAuthority;
+
+#[async_trait::async_trait]
+impl StorageAuthorityPort for NoStorageAuthority {
+    async fn briefcase_proof(
+        &self,
+        _actor: &crate::domain::auth::AuthorizedActor,
+        _subject_token: Option<&crate::domain::auth::AccessToken>,
+    ) -> Result<crate::domain::auth::BriefcaseProof, StorageAuthorityError> {
+        Err(StorageAuthorityError::NotAuthorized)
+    }
+}
+
 fn spawn_cleanup(
     store: Arc<PostgresIdempotencyStore>,
+    held_audio: PostgresHeldAudio,
     shutdown: CancellationToken,
     interval: Duration,
     batch_size: u32,
@@ -458,6 +527,11 @@ fn spawn_cleanup(
                         } else {
                             tracing::warn!("bounded idempotency cleanup failed");
                         }
+                    }
+                    if let Ok(deleted) = held_audio.delete_expired(batch_size).await {
+                        tracing::debug!(deleted_audio = deleted, "expired held audio deleted");
+                    } else {
+                        tracing::warn!("held audio cleanup failed");
                     }
                 }
             }

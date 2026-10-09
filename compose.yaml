@@ -27,13 +27,12 @@ services:
       WAVEFORM_ENVIRONMENT: development
       WAVEFORM_BIND_ADDR: 0.0.0.0:8080
       WAVEFORM_DATABASE_URL: postgres://silicon_waveform:silicon_waveform@postgres:5432/silicon_waveform
-      WAVEFORM_IAM_BASE_URL: http://host.docker.internal:8081
-      WAVEFORM_IAM_APP_ID: waveform
-      WAVEFORM_IAM_APP_SECRET: ${WAVEFORM_IAM_APP_SECRET:-local-development-only-secret}
+      ACCOUNTS_URL: ${ACCOUNTS_URL:-https://accounts.teamofsilicons.com}
+      WAVEFORM_APP_ID: waveform
+      WAVEFORM_APP_SECRET: ${WAVEFORM_APP_SECRET:-local-development-only-secret}
       WAVEFORM_IDEMPOTENCY_DIGEST_KEY: ${WAVEFORM_IDEMPOTENCY_DIGEST_KEY:-local-development-only-idempotency-digest-key}
       WAVEFORM_BRIEFCASE_BASE_URL: http://host.docker.internal:8082
       WAVEFORM_BRIEFCASE_PERMANENT_ORIGIN: https://host.docker.internal:8082
-      WAVEFORM_BRIEFCASE_CDN_ORIGIN: https://host.docker.internal:8082
       WAVEFORM_FFMPEG_PATH: /usr/bin/ffmpeg
       WAVEFORM_LOG_FILTER: silicon_waveform=debug,tower_http=info
       WAVEFORM_LOG_JSON: "false"

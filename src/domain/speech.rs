@@ -8,7 +8,7 @@ use super::{
     capabilities::{Capabilities, TtsOutputFormat},
     identity::RequestId,
     language::LanguageHint,
-    media::{BriefcaseFileUrl, MediaDuration, SourceMedia, StoredAudio},
+    media::{AudioStorage, BriefcaseFileUrl, MediaDuration, SourceMedia},
     provider::ProviderName,
     voice::{ProviderVoice, VoiceProfile},
 };
@@ -129,7 +129,7 @@ impl TtsRequest {
 /// Provider-ready TTS input with language policy already applied.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TtsProviderRequest {
-    /// Prerecorded sandbox clip selected by the resolved account voice profile.
+    /// Prerecorded fixture clip selected by the resolved account voice profile.
     pub fixture_voice: Option<String>,
     /// Validated controls for this provider only.
     pub options: super::tts_options::TtsProviderOptions,
@@ -171,8 +171,8 @@ pub struct TtsResult {
     pub voice_profile: Option<super::voice::VoiceProfileRef>,
     /// Original request correlation ID.
     pub request_id: RequestId,
-    /// Durable and temporary Briefcase references.
-    pub audio: StoredAudio,
+    /// Where the MP3 is: the account's Briefcase files, or held by Waveform.
+    pub storage: AudioStorage,
     /// Provider that produced the successful artifact.
     pub provider: ProviderName,
     /// Guaranteed normalized encoding.
@@ -186,14 +186,14 @@ impl TtsResult {
     #[must_use]
     pub const fn new(
         request_id: RequestId,
-        audio: StoredAudio,
+        storage: AudioStorage,
         provider: ProviderName,
         duration: MediaDuration,
     ) -> Self {
         Self {
             voice_profile: None,
             request_id,
-            audio,
+            storage,
             provider,
             output_format: TtsOutputFormat::Mp3,
             duration,

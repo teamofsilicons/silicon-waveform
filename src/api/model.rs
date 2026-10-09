@@ -9,7 +9,7 @@ use url::Url;
 use crate::domain::{
     capabilities::Capabilities,
     language::{LanguageHint, LanguageHintError},
-    media::{BriefcaseFileUrl, MediaError},
+    media::{AudioStorage, BriefcaseFileUrl, MediaError},
     provider::ProviderName,
     speech::{SpeechText, SpeechValidationError, SttRequest, SttResult, TtsRequest, TtsResult},
 };
@@ -27,8 +27,7 @@ pub struct TtsRequestBody {
     text: String,
     voice_profile: Option<String>,
     lang: Option<String>,
-    /// Optional provider prefix, completed against account defaults by the
-    /// delivery layer.
+    /// Optional provider prefix, completed against the account's saved order.
     provider_order: Option<Vec<ProviderName>>,
 }
 
@@ -85,8 +84,7 @@ pub struct SttRequestBody {
     provider_keys: crate::domain::provider_keys::ProviderApiKeys,
     file_url: String,
     language: Option<String>,
-    /// Optional provider prefix, completed against account defaults by the
-    /// delivery layer.
+    /// Optional provider prefix, completed against the account's saved order.
     provider_order: Option<Vec<ProviderName>>,
 }
 
@@ -127,20 +125,71 @@ impl SttRequestBody {
 pub struct TtsResponseBody {
     voice_profile: Option<crate::domain::voice::VoiceProfileRef>,
     request_id: String,
-    file_url: String,
+    /// Permanent Briefcase URL; `null` when Waveform holds the audio instead.
+    file_url: Option<String>,
+    /// Always `null`; kept for older clients.
     temporary_url: Option<String>,
+    /// Waveform URL serving the MP3 when it is held by Waveform.
+    audio_url: Option<String>,
+    storage: StorageBody,
     media_type: &'static str,
     provider: &'static str,
     duration_ms: u64,
 }
 
+/// Where the generated MP3 is, and why when it is not in Briefcase.
+#[derive(Serialize)]
+pub struct StorageBody {
+    /// `stored` (in the account's Briefcase files) or `held` (by Waveform).
+    status: &'static str,
+    /// Why the audio is held; absent when stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// Exact explanation; absent when stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'static str>,
+    /// When Waveform deletes held audio (RFC 3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<String>,
+}
+
 impl From<TtsResult> for TtsResponseBody {
     fn from(result: TtsResult) -> Self {
+        let (file_url, audio_url, storage) = match result.storage {
+            AudioStorage::Briefcase { permanent_url } => (
+                Some(permanent_url.to_string()),
+                None,
+                StorageBody {
+                    status: "stored",
+                    reason: None,
+                    message: None,
+                    expires_at: None,
+                },
+            ),
+            AudioStorage::Held {
+                reason,
+                audio_url,
+                expires_at,
+            } => (
+                None,
+                Some(audio_url.to_string()),
+                StorageBody {
+                    status: "held",
+                    reason: Some(reason.as_str()),
+                    message: Some(reason.message()),
+                    expires_at: expires_at
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .ok(),
+                },
+            ),
+        };
         Self {
             voice_profile: result.voice_profile,
             request_id: result.request_id.to_string(),
-            file_url: result.audio.permanent_url.to_string(),
-            temporary_url: result.audio.temporary_url.map(|url| url.to_string()),
+            file_url,
+            temporary_url: None,
+            audio_url,
+            storage,
             media_type: result.output_format.as_mime_str(),
             provider: result.provider.as_str(),
             duration_ms: result.duration.as_millis(),
