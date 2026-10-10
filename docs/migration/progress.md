@@ -374,6 +374,13 @@ that adds this section.
   Result: the restored database has only the first row, 17 migrations, no extra table, tables and database owned by
   `waveform_ship_owner`; `waveform_ship_rt_cutover_20261010t091500z` holds both rows and the table; `waveform-api
   migrate` on the restored database exits 0. Both databases and the role were dropped afterwards.
+- **The rewritten `native.env` boots the new service in production mode:** a production-like IAM-era env (origin/main's
+  `.env.example` plus the overrides of origin/main's `deploy/aws/install.py` and `deploy/native/install.py`, 82 keys)
+  run through `cutover_env` loses the 17 IAM/Honeycomb-era keys and gains `ACCOUNTS_URL`, `WAVEFORM_APP_SECRET`,
+  `WAVEFORM_ACCOUNTS_WEBHOOK_SECRET` and `WAVEFORM_PROOF_ISSUERS` (69 keys). `waveform-api migrate` with the earlier env
+  stops at settings ("invalid environment variable WAVEFORM_BRIEFCASE_AUDIENCE: was renamed…"); with the rewritten env it
+  passes every production setting check and stops only at "failed to connect to PostgreSQL" (the host `postgres` does
+  not resolve off the server).
 - **Credential preflight** against the shared stack (`http://127.0.0.1:9589`, Waveform's dev credentials):
   right secret → accepted (`{"active":false}`); wrong secret → "Silicon Accounts refused Waveform's app credentials
   (401)"; unreachable port → "could not be reached".
