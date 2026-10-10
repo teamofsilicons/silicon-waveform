@@ -4,20 +4,21 @@
 
 | Setting | Default | Change |
 | --- | --- | --- |
+| Waveform API | `https://backend.waveform.teamofsilicons.com` | `--url` or `WAVEFORM_URL` |
+| Silicon Accounts | `https://accounts.teamofsilicons.com` | `--accounts-url` or `ACCOUNTS_URL` |
+| Profile (one saved sign-in each) | `default` | `--profile NAME` or `WAVEFORM_PROFILE` |
 | State home | `SILICON_HOME`, otherwise `HOME` | `waveform config home /existing/directory` |
-| API URL | `https://backend.waveform.teamofsilicons.com` | `--url` or `WAVEFORM_URL` |
-| Sandbox | Production | `--app-secret-file FILE` or `--test APP_SECRET_OR_UUID` |
-| CLI updates | Honeycomb | `honeycomb update` |
 | Local telemetry | On | `waveform config telemetry off` or `WAVEFORM_TELEMETRY=0` |
-| Account telemetry | On | `waveform telemetry off` or website preferences |
+| Account telemetry | On | `waveform telemetry off` or the website's settings |
 
-CLI secrets are kept in private files under the selected home's `.waveform/dir`. Production and test sessions are separate. `ISI` is optional context; no command requires it.
+`waveform config show` prints the effective values. The CLI keeps its sign-ins in private files under the state
+home's `.waveform/dir` (`0600` files in a `0700` directory), one per Silicon Accounts origin and profile, so a
+development sign-in never replaces a production one. Plain `http://` URLs are accepted only for this machine.
 
 ## Updates
 
-Install with `honeycomb install 'waveform'`; update with `honeycomb update`.
-The CLI does not run an updater. Stop a legacy updater with `waveform daemon stop`
-and remove its launchd/systemd registration. Rust clients never update dependencies
+Install with `silicon-apps install waveform` (development releases: `silicon-apps install 'waveform>dev'`). Silicon
+Apps updates installed apps every minute; the CLI runs no updater of its own. Rust clients never update dependencies
 at runtime; manage their versions in your application's Cargo manifest and lockfile.
 
 ## Service configuration
@@ -46,7 +47,9 @@ Both Accounts URLs are origins without a path. Plain `http` is accepted only for
 Waveform's app at Silicon Accounts needs:
 
 - a webhook at `https://backend.waveform.teamofsilicons.com/webhooks/accounts` with every update event (the default);
-- the redirect URIs of the Waveform website and of the CLI's sign-in;
+- the Waveform website's redirect URI (`https://waveform.teamofsilicons.com/auth/callback`) and origin;
+- `device_flow` and `public_client` turned on, for the CLI's sign-in (the device flow for Carbons, short-lived
+  token exchange without a secret for Silicons);
 - the apps allowed in `WAVEFORM_PROOF_ISSUERS` agreeing to send `waveform.tts` / `waveform.stt` proofs.
 
 ### Waveform
@@ -99,6 +102,6 @@ They read the same environment as the service.
 waveform report 'Reproduction steps and observed behavior' --pr https://github.com/teamofsilicons/silicon-waveform/pull/123
 ```
 
-PR links are optional. Reports require a signed-in identity, are limited to ten per actor per hour and are stored before acknowledgment. Keep the printed retry key and reuse `--idempotency KEY` if the result is uncertain. Production delivery is queued through Postmark from `waveform@teamofsilicons.com` to `saketdev12@gmail.com`, `shubhastro2@gmails.com`, and `bugs@teamofsilicons.com`. A queued acknowledgment is not a delivery receipt. Temporary delivery failures retry with backoff. Test reports simulate delivery.
+PR links are optional. Reports require a signed-in account, are limited to ten per account per hour and are stored before acknowledgment. Keep the printed retry key and reuse `--idempotency KEY` if the result is uncertain. Production delivery is queued through Postmark from `waveform@teamofsilicons.com` to `saketdev12@gmail.com`, `shubhastro2@gmails.com`, and `bugs@teamofsilicons.com`. A queued acknowledgment is not a delivery receipt. Temporary delivery failures retry with backoff. A Waveform without a configured mail service refuses reports (`503 postmark_not_configured`).
 
 Remove all credentials before submitting reports. Attach a minimal reproduction and a PR when you can; the repository is open for contributions.

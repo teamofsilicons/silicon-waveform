@@ -1,239 +1,231 @@
 # Waveform CLI
 
-Install with `honeycomb install 'waveform'`. Commands use
-`https://backend.waveform.teamofsilicons.com` by default. Set `WAVEFORM_URL` or
-pass `--url <backend>` before the command to select another server; for local
-development, use `--url http://127.0.0.1:8080`.
+`waveform` turns text into speech and transcribes audio, for Carbons and Silicons. Everything you do belongs to the
+account you signed in as: your speech history, settings, provider keys and audio. Speech is stored in your own
+Briefcase files.
 
-Build with `cargo build --manifest-path cli/Cargo.toml`; run
-`waveform --help` or `waveform <command> --help` for the complete grammar.
-Select an independent account and organization with `--profile NAME` or `WAVEFORM_PROFILE` (default: `default`). Use a separate profile name for each account/organization pair. The default profile retains `<home>/.waveform/dir/session-<scope-digest>.json`; named profiles use `<home>/.waveform/dir/profiles/NAME/session-<scope-digest>.json`
-with private directory/file permissions. By default `<home>` is `SILICON_HOME`
-when that environment variable is present, otherwise `~`; use
-`waveform config home <existing-directory>` to select another home before
-logging in. The explicit setting takes precedence over that default and is
-persisted in `<default-home>/.waveform/config.json` (under `SILICON_HOME` when set).
-The selected directory is canonicalized. `waveform login <slt>` accepts an
-SLT (the hidden `--slt` spelling remains supported) and `waveform refresh`
-rotates the saved access/refresh pair; it never prompts for
-an IAM password. In an interactive terminal the SLT prompt disables echo so
-the token is not shown while typing; when stdin is piped, login reads one line
-so noninteractive jobs can provide an SLT without a terminal. `waveform logout`
-revokes the selected refresh family and removes only that profile/server/world session.
-
-`waveform config home <location>` is local-only and does not contact Waveform.
-It rejects missing paths and files with `not a directory`; the selected
-directory is created only when a later command needs to write session or test
-environment state.
-
-Use `--app-secret-file FILE` (or `-` for stdin) to supply Waveform's IAM testing app_secret.
-`--test APP_SECRET_OR_UUID` also works; after initial discovery the UUID resolves from
-private local state. No production login, IAM environment root key or Briefcase key is required.
-Test login accepts an existing active sandbox public ID as well as an IAM test SLT.
-The selected environment prints to stderr after every command, including failures.
-Commands that need actor context use `--org` and `--actor`.
-
-Speech commands:
-
-- `tts <text> --org <id> --actor <id> [--lang <bcp47>] [--voice-profile <profile-id>]`
-- `stt <file-url> --org <id> --actor <id> [--language <bcp47>]`
-- `jobs --org <id> --actor <id> [--operation tts|stt] [--limit 1..100] [--cursor <opaque>]`
-- `jobs --job-id <uuid> --org <id> --actor <id>`
-
-Control commands include `me`, `capabilities`, `preferences`,
-`provider-keys`, `provider-key-set`, and `provider-key-delete`. Preferences
-orders are comma-separated provider names. Provider keys can be saved for the
-account or supplied for just one speech request; secret values are never printed
-or returned by the server.
-
-The historical `test-env` lifecycle commands return `manage_environment_in_honeycomb`. Create, clean, disable, restore and remove environments through Honeycomb. `test-env current` and saved app-secret selectors remain available. Read [testing](testing.md).
-
-## Automatic CLI maintenance
-
-Honeycomb manages native CLI installation and updates. Run `honeycomb update`.
-Waveform never independently replaces the CLI. `waveform daemon stop` disables
-a legacy updater; remove its OS service registration when migrating. Legacy
-`daemon start`, `daemon run`, `daemon install`, and `config auto-update on`
-return migration guidance.
-
-`waveform docs TOPIC` opens bundled guides (`start`, `cli`, `api`, `client`, `iam`,
-`testing`, `configuration`). `waveform report 'details' --pr https://github.com/teamofsilicons/silicon-waveform/pull/123`
-submits an authenticated bug report. The PR is optional; test reports simulate delivery.
-`waveform telemetry off` controls account diagnostics and `waveform config telemetry off`
-controls local diagnostics. See [configuration](configuration.md).
-
-## Session isolation
-
-Sessions are separate for each backend URL and test app secret. Logging in with
-`--test` does not replace the production login; refresh and logout affect only
-the selected session. A UUID selector resolves to the same app-secret session.
-Root-key rotation requires a new test login. UUID-to-key caches are scoped to
-the backend URL as well. `me` derives the organization from the current IAM
-authorization and does not require an extra organization argument.
-
-CLI state follows `UNDERSTANDING.md`: `<configured-home>/.waveform/dir`.
-The small home-location pointer stays at `<default-home>/.waveform/config.json`. Previous
-unscoped `session.json` files are deliberately not imported because they do not
-identify which server and environment issued the credentials. Log in once in
-each selected plane after updating this development build.
-
-## Monitoring speech while it runs
-
-TTS and STT accept `--request-id <uuid>`. If omitted, the CLI generates one and
-prints it to stderr before sending speech. The final response stays on stdout.
-In another terminal use `jobs --org <org> --actor <actor> --job-id <uuid> --wait`
-with the same server and test selection. Waiting tolerates the brief period
-before the job row exists and is bounded by `--timeout-ms`. Reuse the original
-request UUID and idempotency key when retrying an interrupted operation.
-
-A history failure prevents provider work. Cancellation marks the current attempt
-failed when the server can release it; process death is recovered after its
-lease expires. Retrying inside idempotency retention keeps one job ID and row.
-
-## Structured status output
-
-`--json` applies to login, refresh, logout, provider-key mutations, test cleanup,
-and configuration commands as well as data commands. Status commands return a
-`{"message":"…"}` object for mutation acknowledgements; secrets are never included in login status output.
-Progress and failures remain on stderr.
-
-Voice profiles: `voice-profiles --org <id> --actor <id>` lists the catalog and
-mappings. `preferences --org <id> --actor <id> --voice-profile puck` saves an
-account default. `tts "Hello" --org <id> --actor <id> --voice-profile sulafat`
-overrides it for one generation. These commands support the same `--test` selection.
-
-## IAM discovery and login status
-
-`waveform --help` includes this guide and the command list; `-h` prints the short
-command list. Use `waveform <command> --help` for a command's options and required
-arguments, including `waveform login status --help`.
-
-`waveform iam --json` reads public metadata from the selected Waveform backend
-without a saved login. Use the returned `app_id` when obtaining an IAM SLT:
-
-```json
-{"app_id":"waveform","iam_base_url":"https://backend.iam.teamofsilicons.com/","testing_environment_id":null}
-```
-
-The IAM URL comes from server configuration. `testing_environment_id` is the
-upstream IAM environment UUID for a selected sandbox, or null for production.
-No app secret or test key is returned. Use `waveform --url <backend> iam --json`
-to discover another server.
-
-`waveform login status --json` verifies the saved access token through
-`GET /api/v1/auth/me`, then returns:
-
-```json
-{"authenticated":true,"actor":{"actor_type":"carbon","public_id":"c:12345678"},"org_id":"tos","testing_environment_id":null,"profile":"work","url":"https://backend.waveform.teamofsilicons.com","world":"production"}
-```
-
-`actor_type` identifies a `carbon` or `silicon`. With no saved session, or a
-server rejection (HTTP 401/403), it returns `authenticated: false` and null
-identity fields. These status results exit successfully; scripts should inspect
-`authenticated`. Network failures, server errors and malformed responses exit
-nonzero, with diagnostics on stderr. Authenticated commands, including status,
-automatically refresh within 60 seconds of access-token expiry. Saved sessions
-from older CLI versions without a verified actor/org/world binding require an explicit fresh login; their files are retained. Refreshes
-serialize across processes, preserve the captured profile, server, actor, organization and testing environment,
-and reuse the same retry key after an uncertain response. Tokens are never
-printed. Without `--json`, status prints a readable identity or login guidance.
-
-Both commands support `--test <app-secret-or-id>` and the usual server/session
-isolation. Resolving an uncached test UUID still requires a production session
-and organization; a app secret can be used directly for unauthenticated discovery.
-
-## Selecting the default home with SILICON_HOME
-
-Sessions, cached test keys, and updater settings/timestamps all use the resolved
-state directory. Changing `SILICON_HOME` selects a separate configuration and
-does not migrate existing state. An explicit `config home` selection overrides
-the default within that configuration. For example:
+## Install and update
 
 ```sh
-export SILICON_HOME=/existing/agent-home
-waveform config auto-update off
-waveform login <slt>
-waveform login status --json
+silicon-apps install waveform            # production
+silicon-apps install 'waveform>dev'      # development releases
 ```
 
-## API compatibility
+New to Silicon Apps? Bootstrap it from https://apps.teamofsilicons.com/install.sh. Silicon Apps keeps `waveform` up
+to date (it checks every minute); the CLI never updates itself.
 
-`waveform contracts --json` shows API versions, protocol compatibility and deprecation policy.
+## Sign in
 
-## Provider controls and automatic fallback
+Waveform signs you in with [Silicon Accounts](https://accounts.teamofsilicons.com). The CLI never asks for a password
+and never needs an app secret.
 
-TTS calls only the first selected provider by default. Use `--provider gemini`,
-`--provider elevenlabs`, or `--provider openai` to select it. Omission uses your
-saved provider order. `--provider-order` still accepts a comma-separated prefix;
-without `--auto-fallback`, only its first provider is attempted. Add
-`--auto-fallback` to enable the existing sequence of backup providers. STT keeps
-automatic fallback enabled.
+**Carbons** use the device flow:
 
-Supply `--provider-options '<JSON>'` or `--provider-options-file FILE` (`-` reads
-stdin) to control the selected TTS provider. Controls and automatic fallback
-cannot be combined. Supported fields are:
+```sh
+waveform login            # prints a page and a code, then waits
+waveform login --open     # also opens the page in your browser
+```
+
+Open the page in any browser where you are signed in to Silicon Accounts, check that the code matches, and approve.
+The CLI finishes by itself. The code lasts 10 minutes. `--label TEXT` names this sign-in on your account's sign-ins
+page (default: `waveform CLI on <host>`). With `--json`, progress is one JSON object per line on stdout
+(`{"event":"device_code",…}`, `{"event":"slow_down",…}`, then `{"event":"signed_in",…}` or `{"error":…}`).
+
+**Silicons** never see a page. Mint a short-lived token for Waveform and hand it over at once:
+
+```sh
+silicon-accounts login --app waveform -q | waveform login --slt-stdin
+waveform login --slt slt_…        # or as a flag
+waveform login slt_…              # or as an argument
+```
+
+`--slt-stdin` keeps the token out of the process list. A short-lived token works once and lasts 2 minutes. When
+Silicon Accounts refuses one, the error says exactly why (already used, expired, minted for another app, unknown,
+Waveform's access removed, the Silicon's sign-in ended) and how to mint a fresh one.
+
+**Check the sign-in:**
+
+```sh
+waveform login status             # readable; exits 1 when signed out
+waveform login status --json      # always exits 0
+waveform login status --offline   # reads the saved sign-in only, no network
+```
+
+Signed out, `--json` prints `{"authenticated":false}` (sometimes with `reason` and `message`, for example
+`legacy_session`). Signed in it prints:
+
+```json
+{"authenticated":true,"app_id":"waveform","uuid":"zQo","id":"si:scout","kind":"silicon","display_name":"Scout",
+ "custodian":{"uuid":"aB1","id":"c:ada"},"expires_at":"2026-10-10T10:30:00Z","refresh_expires_at":"2026-11-09T10:00:00Z",
+ "accounts_url":"https://accounts.teamofsilicons.com","api_url":"https://backend.waveform.teamofsilicons.com",
+ "profile":"default","method":"slt","verified":true}
+```
+
+`uuid` is the account's permanent key; `id` (`c:…` or `si:…`) can change. `verified` is true when Waveform accepted
+the sign-in just now. If Waveform cannot be reached, the saved sign-in is reported with `verified: false` and a
+`warning`.
+
+**Sign out:** `waveform logout` ends this sign-in at Silicon Accounts and deletes it from this machine. Other machines
+and the website stay signed in.
+
+**Refresh** is automatic: an access token lasts 30 minutes and is refreshed when less than 60 seconds remain, one
+process at a time under a file lock (a refresh token works once; presenting a used one ends the whole sign-in).
+`waveform refresh` refreshes now.
+
+### Where the sign-in is kept
+
+In `$SILICON_HOME/.waveform/dir/` (or `~/.waveform/dir/` when `SILICON_HOME` is not set), one private file per
+Silicon Accounts origin: `accounts-session-<digest>.json`, mode `0600` in a `0700` directory, written atomically.
+Use `--profile NAME` (or `WAVEFORM_PROFILE`) to keep several accounts on one machine
+(`.waveform/dir/profiles/NAME/`). `waveform config home DIR` moves the state to `DIR/.waveform/dir`.
+
+Sign-ins saved by Waveform 0.5 and earlier cannot be used any more: sign in again. `waveform logout` deletes them.
+
+## Discover
+
+```sh
+waveform accounts --json
+```
+
+```json
+{"app_id":"waveform","accounts_url":"https://accounts.teamofsilicons.com",
+ "api_url":"https://backend.waveform.teamofsilicons.com","docs_url":"https://docs.waveform.teamofsilicons.com",
+ "version":"0.6.0","proof_scopes":["waveform.tts","waveform.stt"],
+ "sign_in":{"carbon":"waveform login","silicon":"silicon-accounts login --app waveform -q | waveform login --slt-stdin",
+ "short_lived_token":"silicon-accounts login --app waveform -q"}}
+```
+
+It is offline and always exits 0. `waveform --help` lists every command; every command accepts `--help`.
+`waveform docs [start|cli|api|client|accounts|testing|configuration]` prints the bundled guides.
+
+## Speak
+
+```sh
+waveform tts 'Hello, Carbons and Silicons.'
+waveform tts --text-file note.txt --voice-profile puck --lang en
+waveform tts 'Welcome home.' --provider elevenlabs
+```
+
+The answer is JSON on stdout. `file_url` is the MP3's permanent URL in your Briefcase files (`apps/waveform`). When
+Waveform cannot store it there (Briefcase down or refusing, no Briefcase access, or the call came from another app),
+the speech still completes: `file_url` is null, `storage` is `{"status":"held","reason":…,"expires_at":…}` and
+`audio_url` points at Waveform's copy, kept for 24 hours. Download it:
+
+```sh
+waveform audio REQUEST_ID --output speech.mp3     # --force replaces a file; --output - writes to a pipe
+```
+
+Before speaking, the CLI prints the request id on stderr. Follow it from another terminal with
+`waveform jobs --job-id REQUEST_ID --wait`. A failed or interrupted request names the exact retry:
+`--idempotency KEY --request-id ID` returns the finished result without running a provider twice.
+
+## Transcribe
+
+```sh
+waveform stt-folder                                   # your Waveform folder in Briefcase
+waveform stt https://…/apps/waveform/note.mp3 --language en
+```
+
+Upload the audio to your Briefcase files (your Waveform folder is the usual place), then pass its permanent URL.
+Providers fall back automatically (Gemini, then gpt-transcribe, then Deepgram).
+
+## Briefcase access
+
+Waveform stores speech and reads transcription sources in your Briefcase files with a proof Silicon Accounts issues
+for you. Your first speech request made while signed in gives it automatically; an app calling Waveform for you with a
+proof can only use access you gave before.
+
+```sh
+waveform storage approve     # give it now (signed in as the account itself)
+waveform storage status      # active, revoked or missing
+waveform storage revoke      # take it back; speech is then held by Waveform
+```
+
+If transcription answers `storage_authorization_required`, run `waveform storage approve` and repeat the command with
+the retry flags it printed.
+
+## History, settings and keys
+
+```sh
+waveform jobs [--operation tts|stt] [--limit 1-100] [--cursor NEXT]   # content-free history, newest first
+waveform jobs --job-id ID [--wait] [--timeout-ms 60000] [--poll-ms 500]
+waveform preferences                                                  # provider orders, default voice
+waveform preferences --voice-profile puck --tts-order elevenlabs,gemini --stt-order deepgram
+waveform voice-profiles                                               # voices and their provider mappings
+waveform provider-keys                                                # providers with a saved key
+waveform provider-keys set gemini --key-file /private/gemini.key      # - reads stdin
+waveform provider-keys delete gemini
+waveform telemetry off                                                # Waveform's diagnostics for your account
+```
+
+Saved provider keys are encrypted and never shown again; Waveform's own keys are used for providers without one.
+
+## The Silicons you look after
+
+A Carbon who is the custodian of a Silicon can read and manage that Silicon's Waveform data:
+
+```sh
+waveform silicons                                  # the Silicons you look after that Waveform knows
+waveform jobs --account si:scout
+waveform preferences --account si:scout --tts-order gemini
+waveform provider-keys set openai --key-file - --account si:scout
+waveform storage status --account si:scout         # and storage revoke
+waveform telemetry off --account si:scout
+```
+
+Nobody speaks as another account: `tts`, `stt` and `storage approve` always act as the signed-in account.
+
+## Apps acting for an account
+
+An app that holds a Silicon Accounts User verification proof for an account (issued for `receiving_app` `waveform`)
+passes it with `--proof-file FILE` (`-` reads stdin) on `tts`, `stt`, `stt-folder` and `audio`. Scopes:
+`waveform.tts` (speech and held audio), `waveform.stt` (transcription and the source folder). No sign-in is needed
+or saved, and Waveform must allow the issuing app for that scope.
+
+## Provider controls
+
+TTS runs one provider by default: `--provider gemini|elevenlabs|openai`, or the first of `--provider-order` or your
+saved order. `--auto-fallback` tries the others after a failure (not with controls). Controls for the selected
+provider go in `--provider-options JSON` or `--provider-options-file FILE`:
 
 - `gemini`: `voice`, `scene`, `audio_profile`, `director_notes`, `sample_context`.
-- `elevenlabs`: `voice_id`, `model_id`, `stability`, `similarity_boost`, `style`,
-  `speed`, `use_speaker_boost`, `seed`, `previous_text`, `next_text`,
-  `apply_text_normalization` (`auto`, `on`, or `off`).
-- `openai`: `voice`, `model`, `instructions`, `speed`. `instructions` requires
-  `model: "gpt-4o-mini-tts"`; the other supported models are `tts-1` and `tts-1-hd`.
+- `elevenlabs`: `voice_id`, `model_id`, `stability`, `similarity_boost`, `style`, `speed`, `use_speaker_boost`, `seed`,
+  `previous_text`, `next_text`, `apply_text_normalization` (`auto`, `on`, `off`).
+- `openai`: `voice`, `model`, `instructions`, `speed` (`instructions` needs `model: "gpt-4o-mini-tts"`).
 
 ```sh
-waveform tts 'Welcome home.' --org bricks --actor ACTOR --provider gemini \
-  --provider-options '{"gemini":{"scene":"A quiet evening at home","director_notes":"Warm, relaxed delivery"}}'
-waveform tts 'Welcome home.' --org bricks --actor ACTOR --provider elevenlabs \
-  --provider-options '{"elevenlabs":{"stability":0.35,"speed":0.9}}'
-waveform tts 'Welcome home.' --org bricks --actor ACTOR --auto-fallback
+waveform tts 'Welcome home.' --provider gemini \
+  --provider-options '{"gemini":{"scene":"A quiet evening at home","director_notes":"Warm, relaxed"}}'
 ```
 
-Omitted controls use the selected voice profile's defaults. Controls for another
-provider, unknown fields, and unsupported values fail validation. If synthesis
-fails, the error identifies the provider and a safe reason so you can choose a
-different provider explicitly.
+A key for one request only: `--provider-key-file PROVIDER=FILE` (repeatable, `PROVIDER=-` reads stdin). It overrides
+saved and Waveform keys for that provider and is never stored. Only one input per command may read stdin.
 
-## Bring your own provider keys
+## Output, errors and exit codes
 
-Use `--provider-key-file PROVIDER=FILE` on TTS or STT for a request-only key.
-Repeat the flag for different providers; `PROVIDER=-` reads a key from stdin.
-The key overrides a saved personal or deployment key for that provider only and
-is never saved by this command. STT fallback and opt-in TTS fallback can still
-use the saved or deployment keys belonging to other providers.
+Results go to stdout; notices, progress and warnings go to stderr. With `--json`, stdout holds exactly one JSON
+document (a line stream for `login`), and errors are `{"error":{"code","message","hint","details"}}`. Without it,
+errors are `error:` and `hint:` lines on stderr. Exit codes: `0` success, `1` failure, `2` invalid arguments or input,
+`3` not signed in or refused, `4` not found, `5` conflict, `6` rate limited.
+
+## Configuration
+
+| Setting | Default | Change |
+| --- | --- | --- |
+| Waveform API | `https://backend.waveform.teamofsilicons.com` | `--url` or `WAVEFORM_URL` |
+| Silicon Accounts | `https://accounts.teamofsilicons.com` | `--accounts-url` or `ACCOUNTS_URL` |
+| Profile | `default` | `--profile` or `WAVEFORM_PROFILE` |
+| State home | `SILICON_HOME`, else `HOME` | `waveform config home DIR` |
+| CLI diagnostics | on | `waveform config telemetry off` or `WAVEFORM_TELEMETRY=0` |
+
+Plain `http://` is accepted only for this machine (`localhost`, `127.0.0.1`, `::1`). `waveform config show` prints
+the effective settings. See [configuration](configuration.md) and [testing](testing.md).
+
+## Report a bug
 
 ```sh
-waveform tts 'Hello.' --org bricks --actor ACTOR --provider gemini \
-  --provider-key-file gemini=/private/path/gemini.key
-waveform stt FILE_URL --org bricks --actor ACTOR \
-  --provider-key-file openai=/private/path/openai.key
-waveform provider-key-set --org bricks --actor ACTOR gemini \
-  --key-file /private/path/gemini.key
+waveform report 'What happened, what you expected, how to reproduce it' --pr https://github.com/teamofsilicons/silicon-waveform/pull/123
 ```
 
-`provider-key-set --key-file -` reads stdin and saves the key for the authenticated
-account and selected environment. The historical positional key argument still
-works, but `--key-file` keeps the secret out of shell history and process arguments.
-Only one input may read stdin in a command. Key files contain only the key, with
-an optional final newline. Provider-key deletion restores normal selection on
-later requests.
-
-### Briefcase approval
-
-If speech reports `storage_authorization_required`, run `waveform storage --org ORG start`. Review the returned `consent_url` in IAM and select the destination account and organization. Save the single-use approval code in a private file, then run `waveform storage --org ORG complete AUTHORIZATION_ID --state STATE --code-file PATH`. `storage --org ORG status AUTHORIZATION_ID` shows its progress. Keep the same `--profile`, server and `--test` selection throughout.
-
-Approval does not submit speech. Retry your original command with the `--idempotency` and `--request-id` values shown by the failed attempt. Ordinary logout does not revoke separate Briefcase approval; manage that permission in IAM.
-
-Incoming application OBO speech can use `--obo-app ting --obo-token-file /private/token` with `tts` or `stt`. Use `-` to read one secret from stdin. Tokens are not command-line values, are never saved as a login, and cannot be used for account-management commands. Keep the same idempotency key and request ID for a logical retry.
-
-## IAM 5 account contexts
-
-Login verifies `/auth/me` against the returned token actor and single organization before saving. An existing profile cannot change account, organization or IAM world; select a new profile for that login. `--organization`/`WAVEFORM_ORG` and the runner's `SILICON_ORG` assert the expected organization. Refresh validates the successor identity before replacing credentials; mismatched or uncertain responses retain the original retry receipt. Every ordinary command captures its profile and state directory before network work. Scoped commands reject `--org` or `--actor` values that differ from that login. OBO speech retains its separately supplied delegated identity.
-
-```sh
-waveform --profile personal login SLT
-waveform --profile work login SLT
-waveform --profile work login status --json
-waveform --profile work tts "Hello" --org tos --actor si:agent
-```
-
-Keep the original profile, server, test selection, request ID and idempotency key when resuming speech after storage approval. Login and approval completion do not send or replay speech automatically.
+The pull request is optional; Waveform is open source. Ten reports per account per hour. Keep the printed retry key
+and repeat with `--idempotency KEY` if you are unsure the report arrived. Never include tokens or keys.

@@ -1,54 +1,55 @@
 # Silicon Waveform
 
-> **Integration preview for Waveform 0.5.0 / IAM 5.0.0 / Briefcase 3.0.0.** These guides precede the coordinated runtime rollout. Upgrade dependent services and clients together; public documentation alone does not indicate the new runtime is live.
-
-
-Turn text into stored speech, or transcribe audio already in Briefcase. Start with the CLI; use the Rust client or HTTP API when building an integration. Waveform authenticates both Carbons and Silicons through IAM.
+Turn text into speech, or transcribe audio in your Briefcase files, as a Carbon or a Silicon. Start with the CLI; use
+the Rust client or the HTTP API when building an integration. Waveform signs you in with
+[Silicon Accounts](https://accounts.teamofsilicons.com).
 
 ## Install
 
 ```sh
-honeycomb install 'waveform'
+silicon-apps install waveform
 ```
 
-Honeycomb installs the native CLI and manages updates. Then sign in with an IAM short-lived token.
+Silicon Apps installs the CLI and keeps it up to date. New to Silicon Apps? Bootstrap it from
+https://apps.teamofsilicons.com/install.sh.
 
-## Sign in and generate speech
+## Sign in and speak
+
+A Carbon approves a code in the browser:
 
 ```sh
-waveform iam --json
-waveform login IAM_SHORT_LIVED_TOKEN
+waveform login
+waveform tts 'Hello, Carbons and Silicons.'
+```
+
+A Silicon hands over a short-lived token instead:
+
+```sh
+silicon-accounts login --app waveform -q | waveform login --slt-stdin
 waveform login status --json
-waveform tts 'Hello, Carbons and Silicons.' --org YOUR_ORG --actor YOUR_PRINCIPAL_UUID
+waveform tts 'Hello, Carbons and Silicons.'
 ```
 
-Use the returned `app_id` to obtain an SLT from IAM. `login status --json` gives your identity and organization. Waveform never needs your IAM password or Silicon credential. The TTS result contains the stored audio URL; STT accepts a Briefcase file URL.
+The answer contains the MP3's permanent URL in your Briefcase files. Transcribe audio already there with
+`waveform stt FILE_URL`. Waveform never needs your password or your Silicon's keys, and everything you do belongs to
+your account: history, settings, provider keys and audio. A Carbon can manage the Silicons it looks after with
+`--account si:<id>`.
 
-## Try an isolated sandbox
-
-```sh
-waveform --app-secret-file /path/to/waveform-test-secret login TEST_PUBLIC_ID
-waveform --test ENVIRONMENT_UUID login status --json
-waveform --test ENVIRONMENT_UUID tts 'Test speech' --org TEST_ORG --actor TEST_PRINCIPAL_UUID
-```
-
-Supply **only Waveform's IAM test `app_secret`**. The sandbox is discovered automatically. No IAM root key or separately paired Briefcase key is required. IAM supplies the downstream Briefcase credential with each OBO exchange. Test speech uses prerecorded audio and fixed transcripts, while the upload, identity and permissions are real sandbox operations.
-
-The public ID shortcut works only for an existing active test identity. Production accepts issued SLTs only. See [testing](testing.md) for isolation and lifecycle details.
+`waveform accounts --json` prints Waveform's app id (`waveform`) and where to sign in, offline.
 
 ## Choose your path
 
-- [CLI guide](cli.md): usage, configuration, jobs, reports and updates.
-- [API guide](api.md): authentication, HTTP headers and speech requests.
+- [CLI guide](cli.md): signing in, speech, transcription, history, settings and the Silicons you look after.
+- [Sign in with Silicon Accounts](accounts.md): sign-in, proofs from other apps, Briefcase access, account events.
+- [API guide](api.md): HTTP authentication, speech requests and storage results.
 - [Rust client](client.md): build Waveform into your app.
-- [IAM integration](iam.md): scopes and delegated Briefcase storage.
-- [Configuration](configuration.md): local state, opt-outs and deployment settings.
-- [API compatibility](api-contracts.md): negotiation, consumer contracts and sunset policy.
-- [Releases](releases.md): build and validate the Honeycomb archive.
-- [Development](development.md): build, validate and extend Waveform.
+- [Testing](testing.md): run a development Waveform with deterministic speech fixtures.
+- [Configuration](configuration.md): CLI settings, service settings and bug reports.
 - [Voice profiles](voice-profiles.md): the available voices and provider mappings.
+- [API compatibility](api-contracts.md): negotiation, consumer contracts and sunset policy.
 
-Need help from an agent? Ask: “Install Waveform using its docs, sign in using the SLT I provide, and generate speech for this text.”
+Want a Silicon to do it? Ask: "Install Waveform with `silicon-apps install waveform`, sign in with
+`silicon-accounts login --app waveform -q | waveform login --slt-stdin`, and generate speech for this text."
 
 Repository: https://github.com/teamofsilicons/silicon-waveform
 

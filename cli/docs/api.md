@@ -1,136 +1,119 @@
 # Waveform API
 
-> **Integration preview for Waveform 0.5.0 / IAM 5.0.0 / Briefcase 3.0.0.** These guides precede the coordinated runtime rollout. Upgrade dependent services and clients together; public documentation alone does not indicate the new runtime is live.
+The base is `https://backend.waveform.teamofsilicons.com/api/v1`. The full operation catalogue is
+[`openapi.yaml`](https://docs.waveform.teamofsilicons.com/openapi.yaml); this guide explains how the pieces fit.
 
+## Authentication
 
-The backend base is `https://backend.waveform.teamofsilicons.com/api/v1`; local runs
-normally use `http://127.0.0.1:8080`. Speech calls use `X-Org-ID`,
-`Idempotency-Key`, and exactly one IAM bearer or OBO credential. `POST /tts`
-accepts `{text,lang?,voice_profile?,provider_order?,auto_fallback?,provider_options?,provider_keys?}`
-and `POST /stt` accepts `{file_url,language?,provider_order?,provider_keys?}`.
-`provider_order` is a preferred provider prefix; omitted providers follow the
-caller's account preference. TTS `auto_fallback` defaults to false, so only the
-first provider is attempted. Set it to true to try the remaining providers. STT
-retains its automatic provider fallback.
-Both routes are synchronous and return normalized provider-independent results.
+Send exactly one credential:
 
-`GET /iam` is public discovery: it returns the configured `app_id`,
-`iam_base_url`, and `testing_environment_id` (the IAM sandbox UUID, or null in
-production). It never exposes application secrets or environment keys, sends
-`Cache-Control: no-store`, and validates any supplied test selector.
+- `Authorization: Bearer <access token>`: a Silicon Accounts access token issued to app `waveform` (EdDSA JWT,
+  `aud` = `waveform`, `iss` = the Silicon Accounts Waveform trusts). Carbons get one with `waveform login`, Silicons
+  with `silicon-accounts login --app waveform -q | waveform login --slt-stdin`; the website's server holds its own.
+- `Authorization: Proof sap_…`: a User verification proof another app holds for an account, issued for
+  `receiving_app` `waveform`. Accepted only on the speech routes, for the scopes in the table below, from apps Waveform
+  allows for that scope.
 
-Control routes include `POST /auth/login` (an IAm SLT only),
-`POST /auth/refresh`, `POST /auth/logout`, `GET /auth/me`, provider preference and
-write-only personal-key routes, and `GET /jobs`. The signed IAM receiver is
-`POST https://backend.waveform.teamofsilicons.com/webhooks/`; it verifies the
-four `X-Silicon-IAM-*` headers over the exact raw bytes, deduplicates by event ID,
-and never persists event payloads or secrets.
+| Scope | Routes |
+| --- | --- |
+| `waveform.tts` | `POST /tts`, `GET /audio/{request_id}` |
+| `waveform.stt` | `POST /stt`, `POST /stt/source-target` |
 
-A test plane is selected with `X-Testing-Environment-Key: <Waveform IAM test app_secret>`.
-IAM validates the secret and discovers the environment; no separately paired IAM or Briefcase key is needed.
-`GET /testing-environment` returns safe environment metadata. A test `POST /auth/login`
-also accepts an existing active sandbox identity public ID. Omission selects production,
-where only issued SLTs are accepted. Failed test validation never falls back to production.
-Manage discovered environment lifecycle through IAM; the old Waveform lifecycle routes apply to legacy environments.
+Refusals answer `401` (or `403` for a proof that is valid but not enough) with an exact `error.reason`; see
+[Sign in with Silicon Accounts](accounts.md) for the reasons, the proof checks and the account events Waveform
+applies. Headers of earlier versions (`X-Org-ID`, delegated-token headers) are not used; delegated-token headers are
+refused.
 
-Bearer TTS and test-plane TTS use the published SDK upload and return a
-permanent `file_url` with `temporary_url: null`. STT reads and replay access
-checks use Briefcase delegated listings and reads. Inbound OBO speech remains
-unavailable; refer to
-`IMPLEMENTATION.md` before treating any route as deployed-ready. `GET /auth/me`
-may omit `X-Org-ID`, in which case the organization comes from IAM.
+## Whose data
 
-The specification spelling `POST /webhook/` is also accepted as an alias for
-`POST /webhooks/`, using the same signature verification.
+Everything belongs to the account that made the request. Account routes (`/jobs`, `/preferences`, `/provider-keys`,
+`GET`/`DELETE /storage-authorizations`) accept `?account=c:…|si:…|<uuid>`: a Carbon may select a Silicon it is the
+custodian of. Anyone else gets `403 not_custodian`; an unknown id is `404 account_not_found`. Speech always runs as
+the credential's own account.
 
-Speech callers may provide a non-nil UUID in `X-Request-ID` to know the initial
-job identifier before the synchronous response. Once authorization succeeds and
-an idempotency lease is acquired, `/jobs/{id}` exposes the running row. A retry
-uses the original canonical job ID even if the transport request ID differs.
-An initial polling 404 can therefore mean that authorization is still pending;
-the client and CLI wait helpers retry it within their configured timeout.
+## Speech
 
-Job state and idempotency completion are committed together. Provider failures
-mark the owned attempt failed; cancellation releases its lease. Crashed attempts
-become `failed` with `request_interrupted` once their database lease expires.
-History reads and scheduled maintenance perform that recovery. Old, unleased
-running rows from previous development builds are recovered after one day.
+`POST /tts` takes `{text, voice_profile?, lang?, provider_order?, auto_fallback?, provider_options?, provider_keys?}`
+and `POST /stt` takes `{file_url, language?, provider_order?, provider_keys?}`. Both are synchronous, need an
+`Idempotency-Key` (8-255 visible characters), and return provider-independent results. `provider_order` is a
+preferred prefix; omitted providers follow the account's saved order. TTS `auto_fallback` defaults to false, so only
+the first provider runs; STT always falls back automatically.
 
-STT measures decoded source duration locally before invoking providers, so job
-history includes `duration_ms` even when the selected provider omits it. Invalid
-audio is rejected before provider work. Test planes use the same audio inspector
-and report the uploaded source duration while returning the fixed transcript.
+TTS returns `{request_id, file_url, audio_url, storage, media_type, provider, duration_ms, voice_profile}`.
+`file_url` is the MP3's permanent URL in the account's Briefcase files (`apps/waveform`). When Waveform cannot store
+it there, the request still completes: `file_url` is `null`, `storage` is
+`{"status":"held","reason":…,"message":…,"expires_at":…}` and `GET /audio/{request_id}` serves the MP3 to the same
+account (or the same app with its proof) until `expires_at` (header `X-Waveform-Audio-Expires-At`). Reasons:
+`delegated_call`, `storage_not_authorized`, `briefcase_refused`, `briefcase_unavailable`, `briefcase_timeout`,
+`briefcase_contract_unavailable`.
 
-Voice profiles: `GET /voice-profiles` lists mappings; `PATCH /preferences` with
-`{"voice_profile":"puck"}` sets the account default. See [voice profiles](voice-profiles.md).
+STT reads `file_url` from the account's own Briefcase files. `POST /stt/source-target` with `{}` makes sure the
+account's Waveform folder exists and returns `{app_id, account, folder_id, folder_path}`; upload sources there with
+Briefcase and transcribe their permanent URLs. Without Briefcase access STT answers
+`403 storage_authorization_required`.
 
-## Reports and telemetry
+### Request ids and retries
 
-`POST /reports` accepts `{message,pr?,client_version?}` with a bearer and `Idempotency-Key`. It returns 202 with the report ID and `notification` (`queued`, `sent`, or `simulated`). Retry identical content with the same key; changed content returns 409. The limit is ten reports per actor per hour. Sandbox delivery is always simulated.
+Send a non-nil UUID in `X-Request-ID` to know the job id before the synchronous answer; `GET /jobs/{id}` shows the
+running row once the request is authorised (an initial 404 can mean it is still being authorised). Retrying with the
+same `Idempotency-Key` returns the original result and job id without running a provider twice; changing the body
+under the same key answers `409`. Job state and idempotency completion are committed together; an interrupted attempt
+becomes `failed` with `request_interrupted` once its lease expires.
 
-`PATCH /preferences` accepts `telemetry_enabled: false` for account opt-out. `GET /preferences` reports the effective boolean, which defaults to true. Backend diagnostics honor it; the CLI also has a local opt-out.
+## Briefcase access
+
+`POST /storage-authorizations` gives Waveform Briefcase access for the calling account (a User verification proof for
+`receiving_app` `briefcase`, made from the caller's own access token and kept encrypted). `GET` shows it (`active`,
+`revoked` or `missing`, never a token) and `DELETE` revokes it. A direct speech request creates the access
+automatically when needed; a proof caller can only use access the account gave before.
+
+## Accounts, history and settings
+
+| Route | What it does |
+| --- | --- |
+| `GET /accounts` | public discovery: `{app_id, accounts_url, api_url, docs_url, proof_scopes, version}` |
+| `GET /me` (alias `/auth/me`) | the signed-in account: `{authenticated, app_id, account{uuid,id,kind,display_name,pfp_url,custodian}, via, expires_at}` |
+| `GET /silicons` | the Silicons the signed-in Carbon looks after that Waveform knows |
+| `GET /jobs`, `GET /jobs/{id}` | content-free history, newest first (`operation`, `limit` 1-100, `cursor`); jobs called by another app carry `issuing_app` |
+| `GET`/`PATCH /preferences` | `tts_order`, `stt_order`, `voice_profile`, `telemetry_enabled`, with Waveform's `defaults` |
+| `GET /voice-profiles` | the voice catalogue and provider mappings ([voice profiles](voice-profiles.md)) |
+| `GET /provider-keys`, `PUT`/`DELETE /provider-keys/{provider}` | write-only saved keys (`{"api_key":…}`) |
+| `POST /reports` | `{message, pr?, client_version?}` with an `Idempotency-Key`; 202 with the report id |
+| `GET /capabilities` | languages, formats and provider controls (public) |
+
+Saving or deleting a key, a custodian changing a Silicon's settings, and giving or revoking Briefcase access are
+checked with Silicon Accounts at that moment. Reports are limited to ten per account per hour; retry identical content
+with the same key (changed content answers `409`).
+
+## Account events
+
+Silicon Accounts posts signed events to `POST https://backend.waveform.teamofsilicons.com/webhooks/accounts`
+(headers `X-Accounts-Timestamp`, `X-Accounts-Signature`, verified over the raw body; repeats of an event id are
+ignored). See [Sign in with Silicon Accounts](accounts.md#account-events).
 
 ## Contract negotiation
 
-See [API compatibility](api-contracts.md) for `GET /api/contracts`, version headers, consumer compatibility and the seven-day sunset policy. Public environment lifecycle mutations return `409 manage_environment_in_honeycomb`; use the [Honeycomb participant](honeycomb-lifecycle.md) from the coordinator.
-## Preparing an uploaded transcription source
+Every request may send `X-Waveform-API-Version: v1` and `X-Waveform-Protocol-Version: 1`; answers carry
+`X-Waveform-Contract-Version`. `GET /api/contracts` lists versions, the compatibility matrix (client and CLI 0.6) and
+the deprecation policy. See [API compatibility](api-contracts.md).
 
-`POST /stt/source-target` with `{}` accepts a bearer, selected `X-Org-ID`,
-`Idempotency-Key`, and the same optional test selector as speech. It requires
-current STT and `self.identity.read` scope, and IAM must approve the exact
-Briefcase `briefcase.entries.list` delegation. It invokes no speech provider.
-The response is `{org_id, app_id, actor_id, folder_id, folder_path,
-testing_environment_id}`; `actor_id` is the IAM public identifier and the
-world is null in production. Only an actual, writable, private folder owned by
-that actor inside Waveform's configured app namespace is returned.
+## Provider controls and request keys
 
-Briefcase intentionally hides files outside `apps/<originating-app>/…` from
-OBO callers, even when the represented actor owns the original. For a normal
-private upload, first read the original using that actor's ordinary Briefcase
-session, prepare the target, and copy the bounded bytes with normal Briefcase
-`POST /uploads` using `parent_id`. Preserve the original and transcribe the
-copy's returned permanent URL. Verify all returned actor, organization, world,
-folder and file identities. Use stable copy name/idempotency key/body across
-uncertain responses and recheck the original access on retries. This endpoint
-neither broadens the namespace fence nor grants another actor access.
-
-This is an additive v1 operation; existing speech schemas and published client
-operations remain unchanged. The authoritative operation catalog is OpenAPI;
-there is no separate Waveform operation-version negotiation endpoint.
-
-
-## Provider-specific controls and request keys
-
-TTS `provider_options` accepts one provider object matching the selected first
-provider, and only when `auto_fallback` is false:
+TTS `provider_options` accepts one provider object matching the selected first provider, and only when
+`auto_fallback` is false:
 
 ```json
 {"text":"Welcome home.","provider_order":["gemini"],"auto_fallback":false,"provider_options":{"gemini":{"scene":"A quiet evening at home","director_notes":"Warm, relaxed delivery"}}}
 ```
 
-Gemini controls are `voice`, `scene`, `audio_profile`, `director_notes`, and
-`sample_context`. ElevenLabs controls are `voice_id`, `model_id`, `stability`,
-`similarity_boost`, `style`, `speed`, `use_speaker_boost`, `seed`, `previous_text`,
-`next_text`, and `apply_text_normalization`. OpenAI controls are `voice`, `model`,
-`instructions`, and `speed`; instructions require `gpt-4o-mini-tts` explicitly.
-The OpenAPI schema describes supported values and ranges. Unknown fields,
-controls for another provider, and controls combined with automatic fallback
-are rejected. Omitted controls use the selected profile defaults.
+Gemini controls are `voice`, `scene`, `audio_profile`, `director_notes` and `sample_context`. ElevenLabs controls are
+`voice_id`, `model_id`, `stability`, `similarity_boost`, `style`, `speed`, `use_speaker_boost`, `seed`,
+`previous_text`, `next_text` and `apply_text_normalization`. OpenAI controls are `voice`, `model`, `instructions` and
+`speed`; `instructions` requires `gpt-4o-mini-tts`. Unknown fields, controls for another provider, and controls
+combined with automatic fallback are refused. Omitted controls use the selected voice profile's defaults.
 
-TTS and STT `provider_keys` accept a map such as
-`{"gemini":"<private-provider-key>"}`. Each request key overrides the saved
-personal key and deployment key for that same provider. Request keys never
-persist to preferences, history, or idempotency results. Without a request key,
-existing saved-key selection remains in effect. Never include provider keys in
-URLs or diagnostic output.
+`provider_keys` (TTS and STT) is a map such as `{"gemini":"<key>"}`. A request key overrides the account's saved key
+and Waveform's key for that provider, and is never stored in preferences, history or idempotency results.
 
-Provider failures return a safe `error.message` plus optional `provider`,
-`reason`, and `provider_status` fields, alongside `code` and `request_id`.
-With TTS automatic fallback disabled, the response explains the selected
-provider's failure so the caller can choose a different provider.
-
-This intentionally changes the omitted TTS fallback setting for existing HTTP
-callers: send `auto_fallback: true` to retain the earlier behavior. Existing saved
-keys/preferences/jobs remain valid. Replaying an older completed TTS operation
-requires explicit `auto_fallback: true` without new controls or credentials;
-changing those inputs requires a new idempotency key.
+Provider failures return a safe `error.message` with `provider`, `reason` and `provider_status`, alongside `code`
+and `request_id`, so the caller can choose another provider.
