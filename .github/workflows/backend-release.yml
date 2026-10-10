@@ -12,6 +12,7 @@ on:
         default: ''
 permissions:
   contents: read
+  actions: read
 jobs:
   backend:
     if: inputs.candidate_run == ''
