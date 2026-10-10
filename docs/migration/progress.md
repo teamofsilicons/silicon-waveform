@@ -667,3 +667,13 @@ The final library run includes all PostgreSQL scenarios: **208/208 passed**, wit
 ### Final cutover fence review
 
 The consumer now refuses incomplete exports, including missing custody, lifecycle or audit references, and rejects cross-export remap chains. Bearer/proof authentication uses the permanent migration ledger so normal seven-day pending-event pruning cannot remove the retired-subject fence. Signed old-subject and old-custodian events are ignored without restoring former custody. The actual SQL partial-export/rollback fixture passes (`.mig/uuid-preflight-test.log`); the API regression removes all temporary fences and still proves old401, new access, ignored stale custody, explicit storage approval and successful speech (`.mig/uuid-permanent-fence-tests.log`). Workspace/all-target clippy passes (`.mig/uuid-final-fence-clippy.log`).
+
+## Coordinated local UUID cutover — verified
+
+Consumed the final immutable 211-row Accounts export (SHA256 `750423f3117e11f5eb42025b457ff0f1bf42bd463c31b7e106d9cd10978ca4d9`) after stopping writers and backing up the database and encryption keys. Dry-run/apply/replay passed. All 13 cached public identities matched the current Accounts namespace before applying.
+
+A restored pre-cutover database comparison confirmed all 51 jobs, 12 held-audio ciphertext rows, four provider-key rows, 51 idempotency records and 13 preferences are exactly unchanged. All 13 account-to-private-storage-key links are preserved. Eleven old Briefcase proofs were explicitly invalidated with `account_uuid_migrated`.
+
+After Accounts restarted, the old JWT returned 401. A real fresh UUID sign-in retained three previous jobs. Speech remained held until the account explicitly approved storage again; a new proof then completed actual Briefcase TTS upload and STT download/transcription against the migrated Briefcase service and preserved S3 emulator. Speech providers remain controlled fixtures; this is not paid-provider compatibility proof. Sanitized evidence: [uuid-cutover.json](evidence/uuid-cutover.json); detailed local evidence `.mig/cutover-verified.json` and shared `.migration/cutover/waveform-storage-integrity.json`.
+
+Rebuilt the current native CLI and packed `.mig/candidate-uuid/waveform-0.6.0-macos-aarch64.tar.gz`; the three Apps discovery commands passed in an empty home. Archive SHA256 `ccd4dddd85595204a2a3e537564b0dc1f288e77bfe3936c7d5691a363af44267`. No production database, release, push or deployment was changed. Final shutdown/restart inventory is in the shared local `.migration/cutover/services-waveform-mcport-apps.md`.
