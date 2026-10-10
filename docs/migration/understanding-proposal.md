@@ -123,7 +123,8 @@ Replace the last two sentences of the first paragraph ("Silicon IDs and applicat
 organisation component. Organisation membership and application ownership are stored separately under `org_id`.")
 with:
 
-> Every account also has a permanent uuid, a short case-sensitive string such as `zQo`. Waveform keys everything on
-> the uuid and shows the id, because an id can change.
+> Every account also has an immutable 128-bit UUIDv4, represented as a canonical lowercase, hyphenated 36-character
+> string such as `a750a68a-1bc2-4b3f-888e-0349c9d7289a`. Waveform keys everything on this permanent UUID and shows the
+> separate public `c:`/`si:` handle, which can change.
 
 Review clarification: a custodian can read the first 512 characters of each Silicon speech text or transcript in job history. Deleted accounts have their stored bug reports removed alongside speech data. The existing report destination `shubhastro2@gmails.com` appears to be a typo; a Carbon must confirm the intended destination before production release.
