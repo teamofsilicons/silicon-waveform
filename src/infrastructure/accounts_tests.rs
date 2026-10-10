@@ -184,7 +184,32 @@ async fn lookups_and_revocations_tolerate_missing_records() -> TestResult {
         )
         .mount(&accounts.server)
         .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/v1/accounts/by-id/si:a-handle-far-too-long-to-be-valid",
+        ))
+        .respond_with(ResponseTemplate::new(422).set_body_json(
+            json!({"error":{"code":"invalid_id","message":"An id is at most 32 characters."}}),
+        ))
+        .mount(&accounts.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/accounts/by-id/si:outage"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&accounts.server)
+        .await;
     let gateway = AccountsGateway::new(&accounts.settings(""))?;
+    // A malformed id names no account; an outage stays an outage.
+    assert!(
+        gateway
+            .lookup_by_id("si:a-handle-far-too-long-to-be-valid")
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        gateway.lookup_by_id("si:outage").await.map(|_| ()),
+        Err(AccountsError::Unavailable)
+    );
     let silicon = gateway.lookup("K1E").await?.ok_or("account")?;
     assert_eq!(
         silicon.custodian.map(|custodian| custodian.uuid),

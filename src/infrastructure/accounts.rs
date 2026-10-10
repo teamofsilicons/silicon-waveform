@@ -402,7 +402,9 @@ fn found(
 ) -> Result<Option<AccountSummary>, AccountsError> {
     match answer {
         Ok(account) => Ok(Some(account)),
-        Err(error) if error.is_not_found() => Ok(None),
+        // A malformed id (`invalid_id`, e.g. too long) can belong to no account: the caller
+        // answers 404 naming it, not "Silicon Accounts is unavailable".
+        Err(error) if error.is_not_found() || error.is_code("invalid_id") => Ok(None),
         Err(error) => {
             tracing::warn!(
                 code = error.code(),
