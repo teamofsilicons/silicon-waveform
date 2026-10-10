@@ -60,9 +60,19 @@ CREATE TEMP TABLE uuid_import(old_uuid text PRIMARY KEY,new_uuid text UNIQUE,kin
 INSERT INTO uuid_import VALUES {values};
 DO $$ BEGIN
  IF EXISTS(SELECT 1 FROM uuid_import m JOIN waveform_account_uuid_migrations l
-   ON m.old_uuid=l.old_uuid OR m.new_uuid=l.new_uuid
+   ON m.old_uuid=l.old_uuid OR m.new_uuid=l.new_uuid OR m.old_uuid=l.new_uuid OR m.new_uuid=l.old_uuid
    WHERE (m.old_uuid,m.new_uuid,m.kind) IS DISTINCT FROM (l.old_uuid,l.new_uuid,l.kind))
  THEN RAISE EXCEPTION 'Mapping conflicts with an already applied immutable mapping'; END IF;
+ IF EXISTS(SELECT 1 FROM (
+   SELECT account_uuid AS uuid FROM waveform_account_keys UNION
+   SELECT custodian_uuid FROM waveform_accounts WHERE custodian_uuid IS NOT NULL UNION
+   SELECT accounts_uuid FROM waveform_identity_links UNION
+   SELECT account_uuid FROM waveform_account_pending_events UNION
+   SELECT account_uuid FROM waveform_accounts_webhook_events WHERE account_uuid IS NOT NULL
+ ) refs WHERE uuid !~ '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[89ab][0-9a-f]{{3}}-[0-9a-f]{{12}}$'
+   AND NOT EXISTS(SELECT 1 FROM uuid_import m WHERE m.old_uuid=refs.uuid)
+   AND NOT EXISTS(SELECT 1 FROM waveform_account_uuid_migrations l WHERE l.old_uuid=refs.uuid))
+ THEN RAISE EXCEPTION 'Existing legacy account reference is absent from the Accounts export'; END IF;
  IF EXISTS(SELECT 1 FROM uuid_import m JOIN waveform_account_keys k ON k.account_uuid=m.old_uuid WHERE k.kind<>m.kind)
  THEN RAISE EXCEPTION 'Mapping kind does not match the existing account'; END IF;
  IF EXISTS(SELECT 1 FROM uuid_import m JOIN waveform_account_keys k ON k.account_uuid=m.new_uuid

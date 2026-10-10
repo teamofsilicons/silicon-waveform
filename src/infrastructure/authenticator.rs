@@ -68,6 +68,7 @@ impl AccountsAuthenticator {
         let claims = self.gateway.verify_access_token(token).await?;
         let uuid = AccountUuid::from_str(&claims.sub)
             .map_err(|_| AccountsError::Rejected(AuthFailure::InvalidToken))?;
+        self.require_current_uuid(&uuid).await?;
         let kind = match claims.kind {
             Some(AccountKind::Carbon) => ActorKind::Carbon,
             Some(AccountKind::Silicon) => ActorKind::Silicon,
@@ -140,6 +141,7 @@ impl AccountsAuthenticator {
             .ok_or(AccountsError::Rejected(AuthFailure::ProofWithoutAccount))?;
         let uuid = AccountUuid::from_str(&user.uuid)
             .map_err(|_| AccountsError::Rejected(AuthFailure::InvalidProof))?;
+        self.require_current_uuid(&uuid).await?;
         let kind = match user.kind {
             Some(AccountKind::Carbon) => ActorKind::Carbon,
             Some(AccountKind::Silicon) => ActorKind::Silicon,
@@ -170,6 +172,18 @@ impl AccountsAuthenticator {
         )?;
         actor.scopes = proof.scopes;
         Ok(actor)
+    }
+
+    async fn require_current_uuid(&self, uuid: &AccountUuid) -> Result<(), AccountsError> {
+        if self
+            .directory
+            .is_retired_uuid(uuid)
+            .await
+            .map_err(|_| AccountsError::Unavailable)?
+        {
+            return Err(AccountsError::Rejected(AuthFailure::SignInEnded));
+        }
+        Ok(())
     }
 }
 

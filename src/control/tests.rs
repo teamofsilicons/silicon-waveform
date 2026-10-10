@@ -2280,6 +2280,10 @@ async fn uuid_backfill_rejects_old_subject_and_requires_storage_reauthorization(
     sqlx::raw_sql(sqlx::AssertSqlSafe(String::from_utf8(output.stdout)?))
         .execute(&harness.pool)
         .await?;
+    // The permanent ledger outlives ordinary pending-event cleanup.
+    sqlx::query("DELETE FROM waveform_account_pending_events")
+        .execute(&harness.pool)
+        .await?;
     let (status, _) = send(
         &harness.app,
         "GET",
@@ -2289,6 +2293,37 @@ async fn uuid_backfill_rejects_old_subject_and_requires_storage_reauthorization(
     )
     .await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = deliver(
+        &harness.app,
+        &event(
+            "membership.signed_out",
+            json!({"uuid":"zQo","membership_id":"waveform:zQo","reason":"signed_out"}),
+        ),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "account_uuid_migrated");
+    assert_eq!(
+        count(
+            &harness.pool,
+            "SELECT count(*) FROM waveform_account_pending_events"
+        )
+        .await?,
+        0
+    );
+    let silicon = "9ab26444-1f74-46bb-a734-235e98cb6f2d";
+    sqlx::query("INSERT INTO waveform_account_keys(account_uuid,storage_actor_id,kind,source) VALUES($1,$2,'silicon','sign_in')")
+        .bind(silicon).bind(Uuid::now_v7()).execute(&harness.pool).await?;
+    sqlx::query("INSERT INTO waveform_accounts(account_uuid,kind,current_id,custodian_uuid) VALUES($1,'silicon','si:uuid-test','f858d0b5-98ba-4a4d-8ce5-114e93136f23')")
+        .bind(silicon).execute(&harness.pool).await?;
+    let (_, body) = deliver(&harness.app, &event("silicon.custodian_changed", json!({"uuid":silicon,"from":{"uuid":"f858d0b5-98ba-4a4d-8ce5-114e93136f23","id":"c:ada"},"to":{"uuid":"zQo","id":"c:ada"}}))).await?;
+    assert_eq!(body["outcome"], "account_uuid_migrated");
+    let custodian: String =
+        sqlx::query_scalar("SELECT custodian_uuid FROM waveform_accounts WHERE account_uuid=$1")
+            .bind(silicon)
+            .fetch_one(&harness.pool)
+            .await?;
+    assert_eq!(custodian, "f858d0b5-98ba-4a4d-8ce5-114e93136f23");
     let fresh_identity = ("f858d0b5-98ba-4a4d-8ce5-114e93136f23", "carbon", "c:ada");
     sign_in(&harness, fresh_identity).await?;
     let fresh = bearer(&harness.token(fresh_identity));

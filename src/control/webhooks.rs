@@ -171,6 +171,20 @@ async fn apply(
         return Ok(applied("ignored"));
     };
     let uuid = account.as_str();
+    let custodian = match &event.payload {
+        WebhookPayload::AccountUpdated(update) => update
+            .account
+            .as_ref()
+            .and_then(|a| a.custodian.as_ref())
+            .map(|c| c.uuid.as_str()),
+        WebhookPayload::CustodianChanged(change) => change.to.as_ref().map(|c| c.uuid.as_str()),
+        _ => None,
+    };
+    let retired: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM waveform_account_uuid_migrations WHERE old_uuid=$1 OR old_uuid=$2)")
+        .bind(uuid).bind(custodian).fetch_one(&mut **transaction).await?;
+    if retired {
+        return Ok(applied("account_uuid_migrated"));
+    }
     let outcome = match &event.payload {
         WebhookPayload::AccountIdChanged(change) => {
             let updated = sqlx::query("UPDATE waveform_accounts SET current_id=$2, id_changed_at=$3, updated_at=now() WHERE account_uuid=$1 AND deleted_at IS NULL AND (id_changed_at IS NULL OR id_changed_at <= $3)")

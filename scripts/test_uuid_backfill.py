@@ -30,6 +30,8 @@ try:
  owner=str(uuid.uuid4());child=str(uuid.uuid4());sk=str(uuid.uuid4());ck=str(uuid.uuid4());req=str(uuid.uuid4())
  q(f"INSERT INTO waveform_account_keys(account_uuid,storage_actor_id,kind,source) VALUES('OldA','{sk}','carbon','sign_in'),('OldS','{ck}','silicon','sign_in'); INSERT INTO waveform_accounts(account_uuid,kind,current_id,custodian_uuid) VALUES('OldA','carbon','c:stable',NULL),('OldS','silicon','si:stable','OldA'); INSERT INTO waveform_held_audio(request_id,storage_actor_id,filename,audio,reason,expires_at) VALUES('{req}','{sk}','voice.mp3','\\x112233','held',now()+interval '1 hour'); INSERT INTO waveform_storage_proofs(storage_actor_id,receiving_app,proof_id,scopes,token_cipher,token_expires_at,refresh_cipher) VALUES('{sk}','briefcase','proof-stable',ARRAY['briefcase.files.read'],'\\xaabb',now()+interval '1 hour','\\xccdd'); INSERT INTO waveform_provider_keys(plane_id,org_id,actor_id,provider,secret_cipher) VALUES('00000000-0000-0000-0000-000000000000','@','{sk}','openai','\\x010203');")
  rows=parse_mapping(f'old_uuid,new_uuid,kind\nOldA,{owner},carbon\nOldS,{child},silicon\n')
+ q(migration_sql(rows[:1],True),ok=False)
+ assert q('SELECT count(*) FROM waveform_account_uuid_migrations')=='0'
  print('dry',q(migration_sql(rows)))
  assert q("SELECT account_uuid FROM waveform_account_keys WHERE kind='carbon'")=='OldA'
  print('apply',q(migration_sql(rows,True)))

@@ -257,6 +257,19 @@ impl AccountDirectory {
         .transpose()
     }
 
+    /// Whether the coordinated cutover permanently retired this account subject.
+    ///
+    /// # Errors
+    /// Returns database errors when the immutable migration ledger cannot be read.
+    pub async fn is_retired_uuid(&self, uuid: &AccountUuid) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM waveform_account_uuid_migrations WHERE old_uuid=$1)",
+        )
+        .bind(uuid.as_str())
+        .fetch_one(&self.pool)
+        .await
+    }
+
     /// Reads the account behind a private storage key.
     ///
     /// # Errors
