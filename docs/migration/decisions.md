@@ -444,3 +444,11 @@ minutes while unknown; a profile version older than the cached one is ignored).
   only while Silicon Accounts confirmed the custodian in the last 10 minutes. (Superseded: this stage first kept a
   former custodian's access by uuid until a webhook or a re-check that never ran on that path; the fix stage closed
   it, see [Fix stage](#fix-stage-review-findings).)
+
+## Final account UUID format (supersedes the earlier short-key decision)
+
+Silicon Accounts now assigns immutable 128-bit UUIDv4 account identifiers, represented as canonical lowercase,
+hyphenated 36-character strings. The earlier Identity section's short, case-sensitive `zQo` example describes the
+legacy format only. The public `c:`/`si:` handles remain separate and mutable. Waveform stores the canonical account
+UUID as text and keeps the existing private storage keys unchanged; the coordinated backfill maps legacy account
+keys to their canonical UUIDs. Legacy keys remain migration and audit references, never authentication aliases.
