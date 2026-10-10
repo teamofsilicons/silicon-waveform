@@ -1597,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn production_requires_webhook_secret_https_and_no_fixtures() {
+    fn production_requires_webhook_secret_https_and_no_fixtures() -> Result<(), SettingsError> {
         let production = || {
             let mut environment = TestEnvironment::valid();
             environment.set("WAVEFORM_ENVIRONMENT", "production");
@@ -1629,7 +1629,7 @@ mod tests {
         );
         let mut environment = production();
         environment.set("WAVEFORM_ACCOUNTS_WEBHOOK_SECRET", "whsec_production");
-        let settings = Settings::from_source(&environment).expect("valid production settings");
+        let settings = Settings::from_source(&environment)?;
         assert_eq!(
             settings.public.base_url.as_str(),
             "https://api.waveform.teamofsilicons.com/"
@@ -1656,6 +1656,7 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
     }
 
     #[test]
