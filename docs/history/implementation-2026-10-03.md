@@ -18,7 +18,7 @@ Live speech storage remains blocked by an upstream IAM/Briefcase contract mismat
 
 The compatibility installer delegates to Honeycomb. Rust client requests never update dependencies. The release workflow builds six native CLIs and validates one Honeycomb archive; local checks do not establish that every cross-platform binary has been built or published.
 
-The September 16 source changes add the [Honeycomb participant](honeycomb-lifecycle.md), remove autonomous environment retirement and public lifecycle mutations, and add [API contracts](api-contracts.md). These changes are included in the September 20 native release. Live lifecycle coordination still requires the corresponding Honeycomb participant registration and credentials; this release did not change them.
+The September 16 source changes add the [Honeycomb participant](honeycomb-lifecycle.md), remove autonomous environment retirement and public lifecycle mutations, and add [API contracts](../api-contracts.md). These changes are included in the September 20 native release. Live lifecycle coordination still requires the corresponding Honeycomb participant registration and credentials; this release did not change them.
 
 Historical [2026-09-08 test evidence](test-report-2026-09-08.md) applies to the older explicitly paired environment protocol. Current deployment evidence is recorded separately. The October source update adds repeatable incoming OBO verification and shared-token downstream chaining; this is a local change pending coordinated deployment.
 

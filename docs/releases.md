@@ -1,115 +1,103 @@
-# Build a Honeycomb release
+# Release Waveform
 
-Install with `honeycomb install 'tos>waveform'`, then `waveform login SLT`.
-Honeycomb owns CLI installation and updates. The Rust library is a normal Cargo
-dependency and never rewrites a project's lockfile at runtime.
+Waveform ships four things: the `waveform` CLI (through Silicon Apps, and as `waveform-cli` on crates.io), the Rust
+client `silicon-waveform-client` (crates.io), the service `waveform-api` (on the Waveform host) and the website (a
+container on the same host). Nothing in this repository publishes or deploys by itself: every upload and deployment
+below is a reviewed step a Carbon runs.
 
-Keep the CLI and root `honeycomb.yaml` release versions equal. Backend and Rust client versions can advance independently. The release
-workflow builds the CLI on Linux, Windows and macOS for x86_64 and aarch64, tests
-each native target, and uploads one archive plus checksums as reviewable artifacts.
-It does not publish or deploy. Run it with a matching `vVERSION` tag or manually.
+## Versions
 
-For local packaging, supply all six prebuilt binaries under directories named
-`linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `windows-aarch64`, `macos-x86_64`
-and `macos-aarch64`. Files are `waveform` or `waveform.exe` on Windows.
-Include the canonical `honeycomb.yaml` beside each binary; packaging rejects
-artifacts with missing or different manifests.
+- The CLI's version (`cli/Cargo.toml`), its `apps.yaml` version and the release tag (`vX.Y.Z`) are always equal; the
+  release workflow refuses a tag that differs.
+- While Waveform is 0.x, a breaking change raises the minor version (0.5 → 0.6). The client and CLI stay on the same
+  minor, because the CLI depends on the client by version.
+- The HTTP path stays `/api/v1`; the contract version (`X-Waveform-Contract-Version`, `GET /api/contracts`) records
+  breaking changes and the compatibility matrix ([API compatibility](api-contracts.md)).
+
+## Build the CLI packages
+
+1. Update the versions and the bundled guides (`python3 scripts/sync-cli-docs.py`), then check them:
+   `python3 scripts/sync-cli-docs.py --check`.
+2. Push the tag `vX.Y.Z` (or run the **Build Silicon Apps release** workflow by hand). For each target it builds the
+   CLI with the pinned toolchain (static musl on Linux), runs the CLI tests, then packs the target on its own runner
+   with `scripts/package-apps.sh`, which runs `waveform --help`, `waveform accounts --json` and
+   `waveform login status --json` in an empty home before `silicon-apps validate` and `silicon-apps pack`.
+3. Download the workflow artifact `waveform-silicon-apps-release`: one archive per target,
+   `waveform-X.Y.Z-<target>.tar.gz`, each with its `.sha256`, and `SHA256SUMS`.
+4. Optionally run **Verify Linux CLI on Amazon Linux 2023** with the release run id and source revision: it runs the
+   three commands from the Linux archives on the oldest Linux the Silicons use.
+
+Each archive holds `apps.yaml`, listing only its own target, and `bin/waveform` (`bin/waveform.exe` on Windows). The
+targets are `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `windows-aarch64`, `macos-x86_64` and `macos-aarch64`.
+
+To package one build on your own machine:
 
 ```sh
-python3 scripts/sync-cli-docs.py --check
-python3 scripts/sync-honeycomb.py --check
-python3 scripts/package-release.py --binaries-dir release-binaries --honeycomb honeycomb
+cargo build --release --locked --manifest-path cli/Cargo.toml
+scripts/package-apps.sh 0.6.0 macos-aarch64 cli/target/release/waveform
 ```
 
-The packager verifies native file formats and CPU architectures, stages only the
-manifest and executables, runs `honeycomb validate` followed by `honeycomb pack`,
-validates the resulting archive, and checks its members and SHA-256 digest.
-`honeycomb.yaml` is at the archive root; platform payloads are below `targets/`.
-All six genuine binaries are required; absent targets fail packaging.
+It needs Python 3.9+ and `silicon-apps` 0.2 (`cargo install --locked silicon-apps-cli --version 0.2.0`), writes
+`dist/apps/waveform-0.6.0-macos-aarch64.tar.gz` and its `.sha256`, and refuses a binary that is not native for the
+target, a dynamically linked Linux binary, or one that answers the three commands wrongly. A binary this machine
+cannot run is packed with a note: the Silicon Apps validation worker for its target runs the commands at upload.
 
-## Manifest in every build
+## Publish
 
-The root `honeycomb.yaml` identifies `tos>waveform` and is the source of truth.
-The release workflow includes it beside each native binary, at the root of the
-combined Honeycomb archive, and beside the final archive and checksums.
+Silicon Apps validates uploads on its Linux workers today (`linux-x86_64`, `linux-i686`, `linux-aarch64`,
+`linux-armv7hf`). Upload the two Linux archives; keep the macOS and Windows archives for when their workers go live
+(a release's packages cannot change afterwards, so those targets join a later release).
 
-Both API and frontend container images carry it at
-`/usr/share/waveform/honeycomb.yaml`. Frontend and documentation builds include
-`dist/honeycomb.yaml`; CI uploads both static build artifacts and checks the
-manifest inside both container images. These copies identify the application;
-the six-platform CLI archive is the installable Honeycomb package.
+```sh
+silicon-apps upload waveform --target linux-x86_64 waveform-0.6.0-linux-x86_64.tar.gz
+silicon-apps upload waveform --target linux-aarch64 waveform-0.6.0-linux-aarch64.tar.gz
+silicon-apps packages waveform
+silicon-apps release waveform --version 0.6.0 --package <linux-x86_64 package id> --package <linux-aarch64 package id>
+silicon-apps install 'waveform>dev'          # check the development release on a Linux machine
+silicon-apps promote waveform <development release id> --version 0.6.0
+```
 
-After changing the root manifest, run `python3 scripts/sync-honeycomb.py` to
-refresh the copy in `frontend/public/` used by its isolated Docker build context.
-CI rejects stale copies. The docs build copies the root manifest directly.
-Builds and artifact uploads do not roll out services or publish an application.
+Then publish the Rust crates, the client first (Cargo resolves the CLI's client dependency from crates.io):
 
-## 0.3.3 — Recover early access rejection
+```sh
+cargo publish --manifest-path client/Cargo.toml
+cargo publish --manifest-path cli/Cargo.toml
+```
 
-CLI and Honeycomb package 0.3.3 validate saved access before authenticated commands
-and renew once if the server rejects it before its advertised expiry. Recovery
-uses the durable session lock and persists the replacement credentials. Temporary
-service failures retain the login, and user commands run once. Backend 0.3.1,
-frontend 0.3.2 and Rust client 0.3.0 are unchanged.
+Installed copies update within about a minute of a production release: Silicon Apps' updater checks every minute, and
+`waveform` never updates itself. A bad release is withdrawn with
+`silicon-apps withdraw waveform <release id> --reason "…"`; installs move to the previous good release.
 
-All six native targets and package validation passed.
-[Release artifacts](https://github.com/teamofsilicons/silicon-waveform/releases/tag/v0.3.3)
-are published through GitHub and Honeycomb; `waveform-cli 0.3.3` is on crates.io.
+## Deploy the service and the website
 
-## 0.3.2 — Durable sessions and refresh recovery
+Build the native bundle with the **Build native backend bundle** workflow and deploy it with
+[`deploy/native`](../deploy/native/README.md): `upgrade.py` for a release, `install-frontend.py` for the website's
+image. The 0.6.0 release moves to Silicon Accounts once, with `accounts_cutover.py`, in the order the
+[cutover runbook](migration/cutover.md) gives.
 
-CLI and Honeycomb package 0.3.2 preserve the original request time when recovering
-a refresh, so a cached response cannot silently extend an old access token's
-lifetime. Backend 0.3.1 keeps sessions during temporary IAM configuration failures.
-The browser gateway stores encrypted sessions on persistent disk and resumes
-rotation safely after a restart. The first upgrade from the previous memory-only
-gateway requires one fresh sign-in. Rust client 0.3.0 is unchanged.
+## 0.6.0: Silicon Accounts and Silicon Apps
 
-All six native CLI targets passed tests, and the source, backend and frontend
-builds passed. [Release artifacts](https://github.com/teamofsilicons/silicon-waveform/releases/tag/v0.3.2)
-include the validated Honeycomb package, checksums and exact native backend bundle.
+Breaking for every consumer. The service, client and CLI are 0.6.0; the API path stays `/api/v1` with contract 2.0.0.
 
-## 0.3.1 — Portable Linux CLI
+- **Sign-in.** Silicon Accounts is the only identity. Carbons sign in to the CLI with `waveform login` (device flow)
+  and to the website with the hosted sign-in pages; Silicons hand over a short-lived token
+  (`silicon-accounts login --app waveform -q | waveform login --slt-stdin`). The service has no sign-in routes: it
+  checks Silicon Accounts access tokens itself. Every machine signs in again once.
+- **Your account.** Everything belongs to the account that made it. A Carbon reads and manages the history, settings,
+  provider keys and Briefcase access of the Silicons it looks after (`--account si:<id>`, `?account=`), and never runs
+  speech as them.
+- **Other apps** call Waveform for an account with Silicon Accounts User verification proofs (`waveform.tts`,
+  `waveform.stt`), from the apps allowed in `WAVEFORM_PROOF_ISSUERS`.
+- **Briefcase.** Waveform reaches each account's Briefcase files with User verification proofs. When Briefcase cannot
+  take the audio, TTS still completes and Waveform holds the MP3 for the idempotency retention (`audio_url`,
+  `storage.reason`).
+- **Account events** arrive signed at `POST /webhooks/accounts`.
+- **Distribution.** Silicon Apps installs and updates the CLI (`silicon-apps install waveform`); the CLI has no updater.
+- **Rust client.** Sign-in moved to `signin::SignIn`; `Auth` is `Anonymous`, `Bearer` or `Proof`; methods take no
+  workspace or actor parameters (`for_account` selects a Silicon you look after); `TtsResponse` adds `audio_url` and
+  `storage`. See [the client guide](client.md#upgrading-from-05).
+- **CLI.** Flags and commands of the earlier sign-in, test-environment and update model fail with exit 2 and name what
+  replaced them; `provider-key-set|delete` became `provider-keys set|delete` and `storage start|complete` became
+  `storage approve`.
 
-CLI and Honeycomb package 0.3.1 use static musl binaries for Linux x86_64 and
-aarch64. The 0.3.0 GNU Linux artifacts require GLIBC 2.39; upgrade those installs
-to 0.3.1. CI rejects a Linux dynamic loader or GLIBC symbol requirement and runs
-each binary on its native architecture. Backend and Rust client remain 0.3.0.
-
-## 0.3.0 — Canonical IAM identities and session refresh
-
-Backend, Rust client, CLI and Honeycomb package versions are 0.3.0. The public
-HTTP path remains `/api/v1`. Identity responses and CLI login status expose only
-`public_id` with the actor type; membership IDs are canonical `actor[org]` strings.
-Rust users should replace `LoginActor.principal_id` with `LoginActor.public_id`.
-The CLI refreshes near-expiry sessions before authenticated commands and retains
-saved sessions across temporary refresh failures.
-
-Publish `silicon-waveform-client` before `waveform-cli`, then build and publish all
-six native CLI targets from `v0.3.0`. Upgrade installed 0.2 clients and CLIs before
-switching the backend: their old IAM SDK requires the removed UUID identity fields.
-Version 0.3 accepts old backend responses too, so clients can upgrade first.
-Backend rollout additionally requires the private actor-key import documented in
-`deploy/iam-3-cutover.md`; it preserves preferences, jobs and encrypted provider keys.
-
-## 0.2.0 — Provider controls and BYOK
-
-Backend, Rust client, CLI and Honeycomb package versions are 0.2.0. The public
-HTTP path remains `/api/v1`; contract discovery includes the 0.2.x clients.
-TTS automatic fallback now defaults off, with explicit opt-in for the provider
-chain. STT fallback is unchanged. Provider-specific synthesis controls and
-request-only keys are available in the API, Rust client, CLI and website; saved
-personal keys remain encrypted and write-only. Provider failures include safe
-provider and reason metadata.
-
-Rust consumers upgrading to 0.2.0 must account for the new TTS/STT request fields
-and the additional `Error::Api` metadata. Prefer `..Default::default()` for TTS
-requests and explicitly set `auto_fallback: true` where the old fallback behavior
-is required. Existing completed legacy TTS jobs can still be replayed by sending
-that flag without new controls or request keys.
-
-Publish `silicon-waveform-client` before `waveform-cli`, because Cargo resolves
-the CLI's versioned client dependency from crates.io when packaging. Tag the
-release `v0.2.0` to build the six native Honeycomb targets. Confirm the combined
-archive, registry versions and public application release after publication;
-local package checks and CI artifacts alone do not establish publication.
+Releases before 0.6.0: [docs/history/releases-0.2-0.5.md](https://github.com/teamofsilicons/silicon-waveform/blob/main/docs/history/releases-0.2-0.5.md).

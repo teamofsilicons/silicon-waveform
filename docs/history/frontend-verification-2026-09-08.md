@@ -12,7 +12,7 @@ IAM's Plex fonts, Silicon mark, gray sidebar/background, thin borders, compact
 blue buttons, typography hierarchy, and production indicator.
 
 The feature-to-screen mapping and exact hosting commands are in
-[`frontend/README.md`](../frontend/README.md). All user-facing backend operations
+[`frontend/README.md`](../../frontend/README.md). All user-facing backend operations
 are represented: speech, history, preferences, provider keys, IAM sessions, and
 the complete testing-environment lifecycle. Backend-only webhook and OBO proof
 operations are not exposed in browser forms.

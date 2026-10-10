@@ -119,9 +119,9 @@ compatibility matrix and deprecation policy (`GET /api/contracts`). Client 0.6 w
 
 ## Upgrading from 0.5
 
-- Sign-in moved to `signin::SignIn` (Silicon Accounts device flow and short-lived tokens). The old `login`,
-  `refresh`, `logout` and `iam()` methods are gone; `accounts()` replaces `iam()`.
-- No organization or actor parameters: every method acts for the credential's account, or for a Silicon selected
+- Sign-in moved to `signin::SignIn` (Silicon Accounts device flow and short-lived tokens). `Client::login`, `refresh`
+  and `logout` are gone, and `accounts()` is the discovery call.
+- Methods no longer take a workspace or an actor: each acts for the credential's account, or for a Silicon selected
   with `for_account`.
 - `Auth` is `Anonymous`, `Bearer` or `Proof`; delegated access tokens are replaced by proofs.
 - `LoginStatus` and `Me` carry an `Account` (`uuid`, `id`, `kind`, …).

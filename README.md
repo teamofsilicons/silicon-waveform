@@ -1,42 +1,49 @@
 # Silicon Waveform
 
-Silicon Waveform is the organization-scoped speech service for Carbons,
-Silicons, and IAM applications. It provides one synchronous, provider-neutral
-API for text-to-speech and speech-to-text, applies explicit TTS and automatic STT fallback
-chains, and stores generated MP3 files in Silicon Briefcase.
+Silicon Waveform is the speech service for Carbons and Silicons. It provides one synchronous, provider-neutral API for
+text-to-speech and speech-to-text, applies explicit TTS and automatic STT fallback chains, and stores generated MP3s in
+the requesting account's Briefcase files. Waveform signs everyone in with
+[Silicon Accounts](https://accounts.teamofsilicons.com), and the `waveform` CLI is installed and updated by
+[Silicon Apps](https://apps.teamofsilicons.com).
 
-The product contract lives in [`UNDERSTANDING.md`](./UNDERSTANDING.md),
-[`API_DOCS.md`](./API_DOCS.md), and [`openapi.yaml`](./openapi.yaml). Material
-implementation choices and contract interpretations are recorded in the
-append-only [`decisions.md`](./decisions.md).
+## Use it
 
-Read the [usage and development documentation](https://docs.waveform.teamofsilicons.com/). Test environments now use only the Waveform test `app_secret`; IAM discovers the sandbox and supplies downstream storage credentials. See [testing](docs/testing.md).
+```sh
+silicon-apps install waveform
+waveform login                                                   # a Carbon: approve a code in the browser
+silicon-accounts login --app waveform -q | waveform login --slt-stdin   # a Silicon: hand over a short-lived token
+waveform tts 'Hello, Carbons and Silicons.'
+waveform stt https://briefcase.teamofsilicons.com/…/voice-note.m4a
+```
 
-## Current implementation status
+Carbons can also use the website at https://waveform.teamofsilicons.com. Everything belongs to the account that made
+it (speech history, settings, provider keys and audio); a Carbon can manage the Waveform settings and history of the
+Silicons it looks after, and never speaks as them. Read the
+[usage and development documentation](https://docs.waveform.teamofsilicons.com/): start with the
+[CLI guide](docs/cli.md), then [Sign in with Silicon Accounts](docs/accounts.md), the [API guide](docs/api.md) and
+the [Rust client](docs/client.md).
 
-Direct and testing speech use explicit Briefcase feature consent, encrypted rotating grants and reserve/transfer/commit uploads. Incoming OBO is verified on every request and forwards the same approved chain token downstream with the provider-selected account and organization. CLI and web storage approval remain separate from login. These October changes are locally implemented and require a coordinated IAM/Briefcase/Waveform release; see [IAM integration](docs/iam.md).
+The product contract lives in [`UNDERSTANDING.md`](./UNDERSTANDING.md) (Carbon-owned), [`API_DOCS.md`](./API_DOCS.md)
+and [`openapi.yaml`](./openapi.yaml). Implementation choices are recorded in the append-only
+[`decisions.md`](./decisions.md); the move to Silicon Accounts and Silicon Apps is in [`docs/migration/`](docs/migration/),
+and records of earlier releases are in [`docs/history/`](docs/history/).
 
 ## Public API
 
-The production base URL is
-`https://waveform.teamofsilicons.com/api/v1`.
+The base URL is `https://backend.waveform.teamofsilicons.com/api/v1`.
 
-- `POST /tts` accepts text and an optional BCP 47 language hint, synthesizes
-  speech, normalizes it to MP3, stores it in Briefcase, and returns a permanent
-  URL. `temporary_url` is nullable.
-- `POST /stt` accepts a permanent Briefcase file URL and optional BCP 47
-  language hint, re-authorizes the file read, and returns a normalized
-  transcript.
-- `GET /capabilities` returns stable Waveform-level language and media
-  capabilities without authentication.
+- `POST /tts` synthesizes text (with an optional BCP 47 language hint and voice profile), normalizes it to MP3, stores
+  it in the account's Briefcase files and returns its permanent URL. When Briefcase cannot take it, the request still
+  completes and Waveform holds the MP3 for the idempotency retention (`GET /audio/{request_id}`), saying why.
+- `POST /stt` transcribes a permanent Briefcase file URL (optional language hint), reading the file as the account.
+- `GET /capabilities` returns the languages, media types and provider controls, without authentication.
+- History, preferences, saved provider keys, voice profiles, Briefcase access, bug reports and the signed-in account
+  are described in the [API guide](docs/api.md).
 
-Both speech routes require `X-Org-ID` and `Idempotency-Key`, plus exactly one of
-an IAM Bearer token or the `X-IAM-OBO-Access-Proof`/`X-App-ID` pair.
-
-Operational probes are outside the product API:
-
-- `GET /health/live`
-- `GET /health/ready`
+Every route except discovery takes exactly one credential: `Authorization: Bearer <access token>`, a Silicon Accounts
+access token issued to `waveform`, or, on the speech routes, `Authorization: Proof sap_…`, a User verification proof
+another app holds for an account. Speech also needs an `Idempotency-Key`. Operational probes are outside the product
+API: `GET /health/live` and `GET /health/ready`. Silicon Accounts posts signed account events to `POST /webhooks/accounts`.
 
 ## Provider order
 
@@ -52,20 +59,19 @@ STT:
 2. OpenAI `gpt-transcribe`
 3. Deepgram `nova-3` multilingual
 
-Provider adapters are isolated and bounded. TTS supports per-provider performance
-controls with fallback off, and reports a safe reason when the selected provider
-fails. Saved encrypted keys and request-only BYOK override shared credentials.
-See [the API guide](docs/api.md) and [full reference](API_DOCS.md).
+Provider adapters are isolated and bounded. TTS supports per-provider performance controls with fallback off, and
+reports a safe reason when the selected provider fails. Saved encrypted keys and request-only keys override
+Waveform's own credentials. See [the API guide](docs/api.md) and [the full reference](API_DOCS.md).
 
 ## Architecture
 
 ```text
 HTTP API
-  -> authentication and organization authorization
+  -> Silicon Accounts authentication (local JWT check, or proof verification) and the custodian rule
   -> durable idempotency lease/replay
-  -> purpose-bound downstream delegation
-  -> TTS: ordered provider ports -> MP3 normalization -> Briefcase storage
-  -> STT: authorized Briefcase read -> ordered provider ports
+  -> TTS: ordered provider ports -> MP3 normalization -> Briefcase storage with a User verification proof
+          (or Waveform-held audio when Briefcase cannot take it)
+  -> STT: Briefcase read with a User verification proof -> ordered provider ports
   -> normalized response
 ```
 
@@ -73,78 +79,64 @@ The crate is a modular monolith:
 
 - `src/domain` contains validated values and provider-independent models.
 - `src/application` contains use cases and object-safe ports.
-- `src/api` owns Axum extraction, routing, deadlines, and public errors.
-- `src/infrastructure` owns PostgreSQL, IAM, Briefcase, provider, and FFmpeg
-  adapters.
-- `migrations` contains forward-only PostgreSQL migrations.
+- `src/api` owns Axum extraction, routing, deadlines and public errors.
+- `src/control` owns accounts, history, settings, provider keys, Briefcase access, the Accounts webhook, reports and
+  API contracts.
+- `src/infrastructure` owns PostgreSQL, Silicon Accounts, Briefcase, provider and FFmpeg adapters.
+- `migrations` contains forward-only PostgreSQL migrations; `waveform-api link-identities` links data from before
+  Silicon Accounts to the accounts it belongs to, at cutover.
 
-PostgreSQL is required for production idempotency. During the configured
-retention window (24 hours by default and never less), it retains scoped
-lifecycle state, completed STT results, and only the durable fields of a
-completed TTS result. It never persists an expiring TTS delivery URL. Every
-completed replay still performs online IAM authorization: STT rechecks current
-read access to the exact source before releasing the cached transcript, while
-TTS rechecks access to the generated file and returns its permanent URL with
-`temporary_url: null`.
-Speech providers, audio normalization, and content mutations are not repeated.
-Content-free provider-attempt outcomes and latency are emitted as structured
-telemetry rather than transactional data. Waveform never persists request text,
-source media, generated audio, credentials, raw provider responses, or provider
-error bodies. Database access, encryption, backups, and retention must use the
-speech-data classification.
-Canonical request digests are HMAC-SHA-256 values under the dedicated
-`WAVEFORM_IDEMPOTENCY_DIGEST_KEY`; this prevents a database reader from testing
-likely text or URLs offline. Generate this key independently from every other
-credential. Rotate it only after records made with the prior value have aged
-out during a planned drain; changing it sooner fails safely as idempotency-key
-conflicts for still-retained records.
+PostgreSQL is required for production idempotency. During the configured retention window (24 hours by default and
+never less) it keeps scoped lifecycle state, completed STT results, and only the durable fields of a completed TTS
+result. Speech providers, audio normalization and content mutations are not repeated on replay. Content-free
+provider-attempt outcomes and latency are emitted as structured telemetry rather than transactional data. Waveform
+never persists request text, source media, credentials, raw provider responses or provider error bodies; generated
+audio is kept only while it is held for an account that Briefcase could not serve. Database access, encryption,
+backups and retention must use the speech-data classification.
+
+Canonical request digests are HMAC-SHA-256 values under the dedicated `WAVEFORM_IDEMPOTENCY_DIGEST_KEY`, so a database
+reader cannot test likely text or URLs offline. Generate this key independently from every other credential. Rotate
+it only after records made with the prior value have aged out during a planned drain; changing it sooner fails safely
+as idempotency-key conflicts for still-retained records.
 
 ## Local development
 
-Prerequisites:
-
-- Rust 1.98 (installed automatically by `rust-toolchain.toml`)
-- PostgreSQL 16 or newer
-- FFmpeg with the `libmp3lame` encoder
-
-Create local configuration and start PostgreSQL:
+Prerequisites: Rust 1.98 (installed by `rust-toolchain.toml`), PostgreSQL 16 or newer, FFmpeg with `libmp3lame`, and
+a development Silicon Accounts (the [testing guide](docs/testing.md) shows how to run Waveform against one with
+deterministic speech fixtures).
 
 ```bash
 cp .env.example .env
 docker compose up -d postgres
-```
-
-Development allows individual provider keys to be empty. Production validates
-the complete fallback chain and requires secure dependency URLs, secrets, and
-JSON telemetry. Never commit `.env`.
-
-Run the service:
-
-```bash
 cargo run --bin waveform-api
 ```
 
-Run the complete local quality gate:
+Development allows individual provider keys to be empty. Production validates the complete fallback chain and
+requires secure dependency URLs, secrets and JSON logs. Never commit `.env`.
+
+The complete local quality gate:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 WAVEFORM_TEST_DATABASE_URL=postgres://silicon_waveform:silicon_waveform@127.0.0.1:5432/silicon_waveform \
-  cargo test --test postgres_idempotency -- --ignored --test-threads=1
-cargo build --manifest-path cli/Cargo.toml --locked
+  cargo test --lib -- --ignored --test-threads=1
 WAVEFORM_TEST_DATABASE_URL=postgres://silicon_waveform:silicon_waveform@127.0.0.1:5432/silicon_waveform \
-  cargo test --lib control::tests::speech_tests -- --ignored --test-threads=1
+  cargo test --test postgres_idempotency -- --ignored --test-threads=1
+cargo test --manifest-path client/Cargo.toml
+cargo test --manifest-path cli/Cargo.toml
+python3 scripts/sync-cli-docs.py --check
+python3 scripts/test_package_apps.py
+python3 deploy/native/test_upgrade.py
+python3 deploy/native/test_accounts_cutover.py
 cargo deny check
 ```
 
-The speech regressions use the real CLI against local mock services and PostgreSQL.
-Build and test with the same `CARGO_TARGET_DIR`, or set `WAVEFORM_TEST_CLI` to the
-built executable. Without either override they use `cli/target/debug/waveform`.
-A missing binary fails before creating database state or mock expectations.
+## Releases and deployment
 
-## Coordinated deployment boundary
-
-The new OBO flow replaces the retired exact-request proof protocol. Deploy IAM's shared-token runtime and selected-provider delegation metadata, the matching Briefcase receiver, migration `0015_storage_consent.sql`, and Waveform's backend/client/web together. Configure `WAVEFORM_ENCRYPTION_KEY`, use `/api/v1/obo-access/token-verifications`, and remove storage `obo:` scopes from ordinary login. Register TTS dependencies on Briefcase reserve/commit/list and STT dependencies on list/read before users approve the separate feature grant.
-
-Local mock and PostgreSQL tests establish authorization, isolation, retry and storage protocol behavior. A release must still verify real IAM consent, repeated receiver calls, refresh, revocation and a complete upload/read in both production and testing contexts. No caller-provided media URL is fetched directly. See [IAM integration](docs/iam.md) and [the implementation checklist](docs/IMPLEMENTATION.md).
+- The CLI ships through Silicon Apps: `scripts/package-apps.sh` builds one `apps.yaml` archive per target, and the
+  release workflow builds all six. See [releases](docs/releases.md).
+- The service runs natively on the Waveform host: [`deploy/native`](deploy/native/README.md). The one-time move to
+  Silicon Accounts is the [cutover runbook](docs/migration/cutover.md).
+- Configuration: [`docs/configuration.md`](docs/configuration.md) and [`.env.example`](.env.example).

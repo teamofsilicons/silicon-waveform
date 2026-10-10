@@ -46,7 +46,8 @@ Both Accounts URLs are origins without a path. Plain `http` is accepted only for
 
 Waveform's app at Silicon Accounts needs:
 
-- a webhook at `https://backend.waveform.teamofsilicons.com/webhooks/accounts` with every update event (the default);
+- a webhook at `https://backend.waveform.teamofsilicons.com/webhooks/accounts` that picks every update
+  (`"events": null`): Waveform needs custodian changes, which the recommended picks leave out;
 - the Waveform website's redirect URI (`https://waveform.teamofsilicons.com/auth/callback`) and origin;
 - `device_flow` and `public_client` turned on, for the CLI's sign-in (the device flow for Carbons, short-lived
   token exchange without a secret for Silicons);

@@ -33,7 +33,7 @@ Host verification established:
 
 The receipt is `/etc/waveform/native-release.json`; the recoverable backup is
 `/var/backups/waveform/native-20260917T062901Z`. See
-[the native deployment guide](../deploy/native/README.md) for runtime and rollback
+[the native deployment guide](../../deploy/native/README.md) for runtime and rollback
 details.
 
 The application credential preflight succeeded, but the reported `testsi` login
