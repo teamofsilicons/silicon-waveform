@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build ARM64 frontend image
-        run: docker build --label org.opencontainers.image.revision="$GITHUB_SHA" --tag waveform-frontend:release frontend
+        run: docker build --label org.opencontainers.image.revision="$GITHUB_SHA" --tag waveform-frontend:release web
       - name: Verify image and save deployment artifact
         run: |
           mkdir -p dist/frontend

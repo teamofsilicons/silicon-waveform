@@ -300,7 +300,7 @@ paths:
     get:
       tags: [Jobs]
       operationId: listJobs
-      summary: List the account's speech history (content-free)
+      summary: List the account's speech history (first 512 characters retained)
       parameters:
         - $ref: '#/components/parameters/Account'
         - in: query

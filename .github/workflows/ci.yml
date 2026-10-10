@@ -102,7 +102,7 @@ jobs:
       - name: Verify API image runs
         run: docker run --rm si:silicon-waveform --help
       - name: Build frontend image
-        run: docker build --tag si:silicon-waveform-frontend frontend
+        run: docker build --tag si:silicon-waveform-frontend web
 
   web-builds:
     runs-on: ubuntu-latest
@@ -112,11 +112,14 @@ jobs:
         with:
           node-version: '24'
       - name: Build and check frontend
-        working-directory: frontend
+        working-directory: web
         run: |
-          npm ci
-          npm test
-          npm run build
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm lint
+          pnpm test
+          NEXT_OUTPUT=standalone pnpm build
       - name: Build and check docs
         working-directory: docs-site
         run: |
@@ -126,7 +129,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: waveform-frontend
-          path: frontend/dist/
+          path: web/.next/standalone/
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:

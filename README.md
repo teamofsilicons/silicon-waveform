@@ -28,6 +28,10 @@ and [`openapi.yaml`](./openapi.yaml). Implementation choices are recorded in the
 [`decisions.md`](./decisions.md); the move to Silicon Accounts and Silicon Apps is in [`docs/migration/`](docs/migration/),
 and records of earlier releases are in [`docs/history/`](docs/history/).
 
+## Website development
+
+The Next.js/Arc UI website lives in [`web/`](web/README.md). It uses hosted Silicon Accounts sign-in and the real API through a same-origin server proxy. See its README for local setup, browser tests and deployment.
+
 ## Public API
 
 The base URL is `https://backend.waveform.teamofsilicons.com/api/v1`.
