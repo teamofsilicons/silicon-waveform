@@ -82,7 +82,7 @@ approves again with `POST`. A proof caller can only use access the account gave 
 | `GET /accounts` | public discovery: `{app_id, accounts_url, api_url, docs_url, proof_scopes, version}` |
 | `GET /me` (alias `/auth/me`) | the signed-in account: `{authenticated, app_id, account{uuid,id,kind,display_name,pfp_url,custodian}, via, expires_at}`; the name and photo come from Silicon Accounts (read once with the account's own token, then kept current by `account.updated`) |
 | `GET /silicons` | the Silicons the signed-in Carbon looks after that Waveform knows |
-| `GET /jobs`, `GET /jobs/{id}` | content-free history, newest first (`operation`, `limit` 1-100, `cursor`); jobs called by another app carry `issuing_app` |
+| `GET /jobs`, `GET /jobs/{id}` | history with the first 512 characters of each speech text or transcript, newest first (`operation`, `limit` 1-100, `cursor`); jobs called by another app carry `issuing_app` |
 | `GET`/`PATCH /preferences` | `tts_order`, `stt_order`, `voice_profile`, `telemetry_enabled`, with Waveform's `defaults` |
 | `GET /voice-profiles` | the voice catalogue and provider mappings ([voice profiles](voice-profiles.md)) |
 | `GET /provider-keys`, `PUT`/`DELETE /provider-keys/{provider}` | write-only saved keys (`{"api_key":…}`) |
