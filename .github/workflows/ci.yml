@@ -37,9 +37,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Check bundled documentation
         run: python3 scripts/sync-cli-docs.py --check
-      - name: Check the packaging and deployment tooling
+      - name: Check the packaging, deployment and development tooling
         run: |
           python3 scripts/test_package_apps.py
+          python3 scripts/test_dev_tools.py
           python3 deploy/native/test_upgrade.py
           python3 deploy/native/test_accounts_cutover.py
       - name: Check formatting
