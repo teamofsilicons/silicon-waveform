@@ -48,12 +48,16 @@ use crate::{
     infrastructure::{
         authenticator::AccountsAuthenticator,
         briefcase::BriefcaseHttp,
-        directory::{AccountDirectory, AccountRecord, Confirm, Selection},
+        directory::{AccountDirectory, AccountRecord, Confirm, Selection, SweepReport},
         held_audio::PostgresHeldAudio,
         storage_proofs::StorageProofs,
         vault::Vault,
     },
 };
+
+/// Accounts asked about per run of the background account check (one run a
+/// minute, the lookup budget's share for it).
+const SWEEP_BATCH: i64 = 50;
 
 /// Shared infrastructure for the control APIs.
 pub struct ControlState {
@@ -132,6 +136,16 @@ impl ControlState {
 
     fn directory(&self) -> &AccountDirectory {
         self.authenticator.directory()
+    }
+
+    /// One batch of the background account check: refreshes the accounts
+    /// Silicon Accounts was not asked about for a day and deletes Waveform's
+    /// data for the ones it reports deleted (see `AccountDirectory::sweep`).
+    ///
+    /// # Errors
+    /// Database failures.
+    pub(crate) async fn sweep_accounts(&self) -> Result<SweepReport, ControlError> {
+        Ok(self.directory().sweep(SWEEP_BATCH).await?)
     }
 
     /// Authenticates the caller for one action.

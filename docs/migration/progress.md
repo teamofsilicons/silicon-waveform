@@ -621,3 +621,11 @@ the stack points at `http://127.0.0.1:9593/waveform/webhooks` again.
   (`membership_inactive`), and a replay resets a delivery's `attempt_count` (count the `attempts` list instead).
 - Idempotency keys shorter than 8 characters are refused (`invalid_request`).
 - `psql -At` prints a concatenated boolean as `true`, not `t`.
+
+## 2026-10-10 — Resumed review: account freshness and deletion
+
+Completed and verified the inherited account-cache change. Webhook sign-outs and deletions arriving before the first API request now persist until that account is seen. Accounts reported deleted by a lookup run the same purge as a webhook, including held audio and bug reports. A bounded background sweep discovers deleted proof-only accounts and backfills linked Silicons' custodians; unknown accounts and outages do not delete data. The lookup budget reserves capacity for authorization checks.
+
+Validation against the restarted local PostgreSQL instance (`waveform_fix_test`): `cargo fmt --all --check`; `cargo clippy --all-targets --all-features --locked -- -D warnings`; `WAVEFORM_TEST_DATABASE_URL=… cargo test --lib account_tests -- --ignored --test-threads=1` (9 passed). These tests include stale custodians, out-of-order identity evidence, deletion without a webhook, first-use tombstones and bounded selector lookup. Rust builds used 2 jobs, no debug symbols or incremental compilation.
+
+Remaining review work includes identity-mapping ambiguity and relink safety, proof contract negative tests, documentation corrections, and the Next.js frontend.

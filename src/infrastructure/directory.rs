@@ -27,6 +27,10 @@ use crate::{
     domain::identity::{AccountUuid, ActorKind, public_id_kind},
 };
 
+#[path = "directory_sweep.rs"]
+mod sweep;
+pub use sweep::{Purge, SweepReport, lock_account, purge_account, record_pending_event};
+
 /// A cached custodian stands for reads this long after Silicon Accounts confirmed
 /// it; a Silicon's own requests also re-check it in the background this often.
 pub const CUSTODIAN_RECHECK: Duration = Duration::from_secs(600);
@@ -170,7 +174,9 @@ pub struct AccountDirectory {
     missing: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
-const SELECT_RECORD: &str = "SELECT k.account_uuid, k.storage_actor_id, k.kind, a.current_id, a.display_name, a.pfp_url, a.custodian_uuid, a.custodian_id, a.custodian_checked_at, a.revoked_before, a.revoked_reason, a.deleted_at FROM waveform_account_keys k LEFT JOIN waveform_accounts a ON a.account_uuid = k.account_uuid";
+/// One account with what was recorded for it before it was first seen folded in
+/// (a sign-out or deletion that arrived first is honoured from the first read).
+const SELECT_RECORD: &str = "SELECT k.account_uuid, k.storage_actor_id, k.kind, a.current_id, a.display_name, a.pfp_url, a.custodian_uuid, a.custodian_id, a.custodian_checked_at, GREATEST(a.revoked_before, p.revoked_before) AS revoked_before, CASE WHEN p.revoked_before > COALESCE(a.revoked_before, '-infinity'::timestamptz) THEN p.revoked_reason ELSE a.revoked_reason END AS revoked_reason, COALESCE(a.deleted_at, p.deleted_at) AS deleted_at FROM waveform_account_keys k LEFT JOIN waveform_accounts a ON a.account_uuid = k.account_uuid LEFT JOIN waveform_account_pending_events p ON p.account_uuid = k.account_uuid";
 
 impl AccountDirectory {
     /// Wraps the pool and the Accounts gateway.
@@ -310,7 +316,11 @@ impl AccountDirectory {
             }
             match tokio::time::timeout(FIRST_LOOKUP_WAIT, self.refresh_from_accounts(uuid)).await {
                 Ok(Ok(Refreshed::Account(fresh))) => return Ok(*fresh),
-                Ok(Ok(Refreshed::Deleted | Refreshed::Unknown)) => {}
+                // The lookup purged the account: answer its tombstone, not the record read before.
+                Ok(Ok(Refreshed::Deleted)) => {
+                    return self.load(uuid).await?.ok_or(sqlx::Error::RowNotFound);
+                }
+                Ok(Ok(Refreshed::Unknown)) => {}
                 Ok(Err(_)) | Err(_) => {
                     tracing::debug!(
                         "custodian lookup failed; later requests look it up in the background"
@@ -398,6 +408,9 @@ impl AccountDirectory {
         let id_hint = id_hint.filter(|id| public_id_kind(id) == Some(kind));
         let as_of = as_of.filter(|_| id_hint.is_some());
         let mut transaction = self.pool.begin().await?;
+        // Serialised with webhooks about the same account, so an event that arrives
+        // while the account is first seen is either folded in here or applied to it.
+        sweep::lock_account(&mut transaction, uuid.as_str()).await?;
         sqlx::query("INSERT INTO waveform_account_keys(account_uuid, storage_actor_id, kind, source) VALUES($1, $2, $3, $4) ON CONFLICT (account_uuid) DO NOTHING")
             .bind(uuid.as_str())
             .bind(Uuid::now_v7())
@@ -411,6 +424,7 @@ impl AccountDirectory {
             .bind(as_of)
             .execute(&mut *transaction)
             .await?;
+        sweep::fold_pending_events(&mut transaction, uuid.as_str()).await?;
         transaction.commit().await?;
         self.load(uuid).await?.ok_or(sqlx::Error::RowNotFound)
     }
@@ -434,11 +448,19 @@ impl AccountDirectory {
                 .store_summary(&summary, started)
                 .await
                 .map(|record| Refreshed::Account(Box::new(record))),
-            Lookup::Deleted => Ok(Refreshed::Deleted),
+            Lookup::Deleted => {
+                self.purge_deleted(uuid)
+                    .await
+                    .map_err(|_| AccountsError::Unavailable)?;
+                Ok(Refreshed::Deleted)
+            }
             Lookup::NotFound => {
                 tracing::warn!(
                     "Silicon Accounts does not know an account Waveform has cached; check that ACCOUNTS_API_URL is the deployment that issues Waveform's tokens"
                 );
+                self.note_unknown(uuid)
+                    .await
+                    .map_err(|_| AccountsError::Unavailable)?;
                 Ok(Refreshed::Unknown)
             }
         }
@@ -466,7 +488,7 @@ impl AccountDirectory {
             .as_ref()
             .filter(|_| kind == ActorKind::Silicon)
             .filter(|custodian| AccountUuid::from_str(&custodian.uuid).is_ok());
-        sqlx::query("UPDATE waveform_accounts a SET current_id = CASE WHEN a.id_changed_at >= $7 THEN a.current_id ELSE COALESCE($2, a.current_id) END, id_changed_at = CASE WHEN a.id_changed_at >= $7 OR $2::text IS NULL THEN a.id_changed_at ELSE $8 END, display_name = COALESCE(NULLIF($3, ''), a.display_name), pfp_url = COALESCE(NULLIF($4, ''), a.pfp_url), custodian_uuid = CASE WHEN a.kind <> 'silicon' THEN NULL WHEN a.custodian_changed_at >= $7 THEN a.custodian_uuid ELSE COALESCE($5, a.custodian_uuid) END, custodian_id = CASE WHEN a.kind <> 'silicon' THEN NULL WHEN a.custodian_changed_at >= $7 THEN a.custodian_id ELSE COALESCE((SELECT c.current_id FROM waveform_accounts c WHERE c.account_uuid = $5 AND c.id_changed_at >= $7), $6, a.custodian_id) END, custodian_checked_at = CASE WHEN a.kind = 'silicon' THEN now() ELSE a.custodian_checked_at END, updated_at = now() WHERE a.account_uuid = $1 AND a.deleted_at IS NULL")
+        sqlx::query("UPDATE waveform_accounts a SET current_id = CASE WHEN a.id_changed_at >= $7 THEN a.current_id ELSE COALESCE($2, a.current_id) END, id_changed_at = CASE WHEN a.id_changed_at >= $7 OR $2::text IS NULL THEN a.id_changed_at ELSE $8 END, display_name = COALESCE(NULLIF($3, ''), a.display_name), pfp_url = COALESCE(NULLIF($4, ''), a.pfp_url), custodian_uuid = CASE WHEN a.kind <> 'silicon' THEN NULL WHEN a.custodian_changed_at >= $7 THEN a.custodian_uuid ELSE COALESCE($5, a.custodian_uuid) END, custodian_id = CASE WHEN a.kind <> 'silicon' THEN NULL WHEN a.custodian_changed_at >= $7 THEN a.custodian_id ELSE COALESCE((SELECT c.current_id FROM waveform_accounts c WHERE c.account_uuid = $5 AND c.id_changed_at >= $7), $6, a.custodian_id) END, custodian_checked_at = CASE WHEN a.kind = 'silicon' THEN now() ELSE a.custodian_checked_at END, looked_up_at = now(), updated_at = now() WHERE a.account_uuid = $1 AND a.deleted_at IS NULL")
             .bind(uuid.as_str())
             .bind(id)
             .bind(&summary.display_name)

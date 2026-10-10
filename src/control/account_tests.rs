@@ -18,6 +18,14 @@ use super::tests::{
     wait_for_custodian,
 };
 
+/// Accounts that use Waveform only through another app (Interface).
+const HAVEN: (&str, &str, &str) = ("Hv5", "silicon", "si:haven");
+const VERA: (&str, &str, &str) = ("V9x", "carbon", "c:vera");
+/// Carbons Silicon Accounts has events about before they ever call Waveform.
+const BEA: (&str, &str, &str) = ("KYh", "carbon", "c:bea");
+const CAL: (&str, &str, &str) = ("nh0", "carbon", "c:cal");
+const DOT: (&str, &str, &str) = ("D0t", "carbon", "c:dot");
+
 /// A Waveform token for `account` carrying `id`, issued `age` ago.
 fn token_with(harness: &Harness, account: (&str, &str, &str), id: &str, age: i64) -> String {
     let mut claims = harness.accounts.claims(account.0, account.1, id);
@@ -457,5 +465,349 @@ async fn a_stored_record_of_the_other_kind_shows_no_data() -> TestResult {
         ("silicon".to_owned(), Some("si:scout-earlier".to_owned())),
         "the record is left for the operator to correct"
     );
+    harness.finish().await
+}
+
+/// Silicon Accounts answers that `uuid` was deleted.
+async fn deleted_at_accounts(harness: &Harness, uuid: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/accounts/{uuid}")))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error":{
+            "code":"account_deleted","message":format!("The account {uuid} was deleted at 2026-10-10T00:00:00.000Z.")}})))
+        .mount(&harness.accounts.server)
+        .await;
+}
+
+/// Rows Waveform holds for an account, table by table.
+async fn holdings(harness: &Harness, uuid: &str) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let key = super::tests::storage_key(harness, uuid).await?;
+    let mut counts = Vec::new();
+    for sql in [
+        "SELECT count(*) FROM waveform_jobs WHERE actor_id=$1",
+        "SELECT count(*) FROM waveform_idempotency_records WHERE actor_id=$1",
+        "SELECT count(*) FROM waveform_held_audio WHERE storage_actor_id=$1",
+        "SELECT count(*) FROM waveform_account_preferences WHERE actor_id=$1",
+    ] {
+        counts.push(
+            sqlx::query_scalar(sql)
+                .bind(key)
+                .fetch_one(&harness.pool)
+                .await?,
+        );
+    }
+    Ok(counts)
+}
+
+async fn speak_with_proof(
+    harness: &Harness,
+    proof: &str,
+    key: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/tts",
+        &[("authorization", proof), ("idempotency-key", key)],
+        Some(json!({"text": "A private line spoken through another app."})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(body)
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn accounts_no_webhook_reaches_are_checked_daily_and_purged_once_deleted() -> TestResult {
+    let harness = Harness::new("waveform.tts=interface").await?;
+    harness
+        .accounts
+        .account(HAVEN.0, HAVEN.1, HAVEN.2, Some((ADA.0, ADA.2)))
+        .await;
+    harness.accounts.account(VERA.0, VERA.1, VERA.2, None).await;
+    harness.accounts.account(ADA.0, ADA.1, ADA.2, None).await;
+    harness.accounts.introspection(true).await;
+    // Haven and Vera use Waveform only through Interface; Ada looks after Haven.
+    for (who, proof) in [(HAVEN, "sap_for-haven"), (VERA, "sap_for-vera")] {
+        harness
+            .accounts
+            .valid_proof(proof, who, "interface", &["waveform.tts"])
+            .await;
+        let held = speak_with_proof(
+            &harness,
+            &format!("Proof {proof}"),
+            &format!("proof-only-{}", who.0),
+        )
+        .await?;
+        assert_eq!(held["storage"]["reason"], "delegated_call");
+    }
+    wait_for_custodian(&harness, HAVEN.0).await?;
+    sign_in(&harness, ADA).await?;
+    let (status, _) = send(
+        &harness.app,
+        "PATCH",
+        "/api/v1/preferences?account=Hv5",
+        &[("authorization", &bearer(&harness.token(ADA)))],
+        Some(json!({"voice_profile":"puck"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(holdings(&harness, HAVEN.0).await?, vec![1, 1, 1, 1]);
+    assert_eq!(holdings(&harness, VERA.0).await?, vec![1, 1, 1, 1]);
+
+    // Both delete their accounts; Silicon Accounts sends Waveform no webhook (they
+    // were never members), and later says so when asked. Ada still exists.
+    harness.accounts.server.reset().await;
+    remount_keys(&harness).await;
+    deleted_at_accounts(&harness, HAVEN.0).await;
+    deleted_at_accounts(&harness, VERA.0).await;
+    harness.accounts.account(ADA.0, ADA.1, ADA.2, None).await;
+    // Haven was looked up minutes ago (its custodian's check), so it is not due
+    // before tomorrow; the accounts never looked up are due at once.
+    let report = harness.state.sweep_accounts().await.map_err(|_| "sweep")?;
+    assert_eq!((report.checked, report.purged), (1, 1), "Ada and Vera");
+    assert_eq!(holdings(&harness, HAVEN.0).await?, vec![1, 1, 1, 1]);
+    // A day later Haven is due too.
+    sqlx::query("UPDATE waveform_accounts SET looked_up_at = looked_up_at - interval '25 hours' WHERE account_uuid = 'Hv5'")
+        .execute(&harness.pool)
+        .await?;
+    let report = harness.state.sweep_accounts().await.map_err(|_| "sweep")?;
+    assert_eq!(
+        (
+            report.checked,
+            report.purged,
+            report.unknown,
+            report.stopped
+        ),
+        (0, 1, 0, false)
+    );
+    for uuid in [HAVEN.0, VERA.0] {
+        assert_eq!(holdings(&harness, uuid).await?, vec![0, 0, 0, 0], "{uuid}");
+        let (id, deleted): (Option<String>, Option<time::OffsetDateTime>) = sqlx::query_as(
+            "SELECT current_id, deleted_at FROM waveform_accounts WHERE account_uuid=$1",
+        )
+        .bind(uuid)
+        .fetch_one(&harness.pool)
+        .await?;
+        assert!(
+            id.is_none() && deleted.is_some(),
+            "{uuid} keeps only a tombstone"
+        );
+    }
+    // Everything was asked about today, so the next run has nothing to do.
+    assert_eq!(
+        harness.state.sweep_accounts().await.map_err(|_| "sweep")?,
+        crate::infrastructure::directory::SweepReport::default()
+    );
+
+    // "No such account" deletes nothing: it means Waveform asks the wrong deployment.
+    sign_in(&harness, BOB).await?;
+    sqlx::query("INSERT INTO waveform_account_preferences(plane_id, org_id, actor_id, voice_profile) VALUES($1, '@', $2, 'kore')")
+        .bind(uuid::Uuid::nil())
+        .bind(super::tests::storage_key(&harness, BOB.0).await?)
+        .execute(&harness.pool)
+        .await?;
+    Mock::given(method("GET"))
+        .and(path("/v1/accounts/B0b"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(
+            json!({"error":{"code":"account_not_found","message":"No account has the uuid 'B0b'."}}),
+        ))
+        .mount(&harness.accounts.server)
+        .await;
+    let report = harness.state.sweep_accounts().await.map_err(|_| "sweep")?;
+    assert_eq!((report.purged, report.unknown), (0, 1));
+    assert_eq!(holdings(&harness, BOB.0).await?[3], 1);
+
+    // When Silicon Accounts cannot be asked, the batch stops and is retried later.
+    sqlx::query("UPDATE waveform_accounts SET looked_up_at = now() - interval '2 days' WHERE account_uuid = 'zQo'")
+        .execute(&harness.pool)
+        .await?;
+    harness.accounts.server.reset().await;
+    remount_keys(&harness).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/accounts/zQo"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&harness.accounts.server)
+        .await;
+    let report = harness.state.sweep_accounts().await.map_err(|_| "sweep")?;
+    assert!(report.stopped && report.purged == 0);
+    let retry_in: f64 = sqlx::query_scalar("SELECT extract(epoch FROM looked_up_at + interval '24 hours' - now())::float8 FROM waveform_accounts WHERE account_uuid = 'zQo'")
+        .fetch_one(&harness.pool)
+        .await?;
+    assert!(
+        (3_000.0..=3_700.0).contains(&retry_in),
+        "retried in about an hour, not {retry_in} s"
+    );
+    harness.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn a_custodian_check_that_finds_the_silicon_deleted_purges_it() -> TestResult {
+    let harness = Harness::new("waveform.tts=interface").await?;
+    harness
+        .accounts
+        .account(SCOUT.0, SCOUT.1, SCOUT.2, Some((ADA.0, ADA.2)))
+        .await;
+    harness
+        .accounts
+        .valid_proof("sap_for-scout", SCOUT, "interface", &["waveform.tts"])
+        .await;
+    speak_with_proof(&harness, "Proof sap_for-scout", "scout-before-deletion").await?;
+    wait_for_custodian(&harness, SCOUT.0).await?;
+    sign_in(&harness, ADA).await?;
+    harness.accounts.server.reset().await;
+    remount_keys(&harness).await;
+    deleted_at_accounts(&harness, SCOUT.0).await;
+    sqlx::query("UPDATE waveform_accounts SET custodian_checked_at = now() - interval '1 hour' WHERE account_uuid = 'K1E'")
+        .execute(&harness.pool)
+        .await?;
+    let (status, body) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/jobs?account=K1E",
+        &[("authorization", &bearer(&harness.token(ADA)))],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "account_not_found");
+    assert_eq!(holdings(&harness, SCOUT.0).await?, vec![0, 0, 0, 0]);
+    harness.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn sign_outs_and_deletions_before_the_first_request_are_honoured() -> TestResult {
+    let harness = Harness::new("").await?;
+    // Tokens Silicon Accounts issued before the events; Waveform has seen none of them.
+    let bea_before = token_with(&harness, BEA, BEA.2, 5);
+    let cal_before = token_with(&harness, CAL, CAL.2, 5);
+    let dot_before = token_with(&harness, DOT, DOT.2, 5);
+    for (kind, data, outcome) in [
+        (
+            "membership.signed_out",
+            json!({"uuid":"KYh","membership_id":"waveform:KYh","reason":"refresh_token_reuse"}),
+            "sign_ins_ended_before_first_use",
+        ),
+        (
+            "account.deleted",
+            json!({"uuid":"nh0","membership_id":"waveform:nh0"}),
+            "deleted_before_first_use",
+        ),
+        (
+            "membership.signed_out",
+            json!({"uuid":"D0t","membership_id":"waveform:D0t","reason":"app_revoked"}),
+            "ignored_app_revoked",
+        ),
+    ] {
+        let (status, body) = deliver(&harness.app, &event(kind, data)).await?;
+        assert_eq!(
+            (status, body["outcome"].as_str()),
+            (StatusCode::OK, Some(outcome))
+        );
+    }
+    for (token, reason) in [
+        (&bea_before, "sign_in_ended"),
+        (&cal_before, "account_deleted"),
+    ] {
+        let (status, body) = send(
+            &harness.app,
+            "GET",
+            "/api/v1/me",
+            &[("authorization", token)],
+            None,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["error"]["reason"], reason);
+    }
+    let (status, _) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/tts",
+        &[
+            ("authorization", &cal_before),
+            ("idempotency-key", "after-deletion-1"),
+        ],
+        Some(json!({"text": "Nothing after deletion."})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let tombstone: (Option<time::OffsetDateTime>, i64) = sqlx::query_as("SELECT a.deleted_at, (SELECT count(*) FROM waveform_jobs j WHERE j.actor_id = k.storage_actor_id) FROM waveform_accounts a JOIN waveform_account_keys k USING (account_uuid) WHERE a.account_uuid = 'nh0'")
+        .fetch_one(&harness.pool)
+        .await?;
+    assert!(tombstone.0.is_some() && tombstone.1 == 0);
+    // Waveform's own sign-out of one machine ends nothing else.
+    me(&harness, &dot_before).await?;
+    // A token issued after the sign-out works.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    me(&harness, &token_with(&harness, BEA, BEA.2, 0)).await?;
+    harness.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn a_silicon_found_deleted_on_its_first_request_is_refused() -> TestResult {
+    let harness = Harness::new("").await?;
+    deleted_at_accounts(&harness, SCOUT.0).await;
+    let (status, body) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/me",
+        &[("authorization", &bearer(&harness.token(SCOUT)))],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["reason"], "account_deleted");
+    let deleted: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("SELECT deleted_at FROM waveform_accounts WHERE account_uuid='K1E'")
+            .fetch_one(&harness.pool)
+            .await?;
+    assert!(deleted.is_some(), "the lookup left a tombstone");
+    harness.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn the_background_check_fills_a_linked_silicons_custodian() -> TestResult {
+    let harness = Harness::new("").await?;
+    // A Silicon linked at cutover: Waveform knows its kind, not its custodian.
+    sqlx::query("INSERT INTO waveform_account_keys(account_uuid, storage_actor_id, kind, source) VALUES('K1E', $1, 'silicon', 'link_identities')")
+        .bind(uuid::Uuid::now_v7())
+        .execute(&harness.pool)
+        .await?;
+    sqlx::query("INSERT INTO waveform_accounts(account_uuid, kind) VALUES('K1E', 'silicon')")
+        .execute(&harness.pool)
+        .await?;
+    harness
+        .accounts
+        .account(SCOUT.0, SCOUT.1, SCOUT.2, Some((ADA.0, ADA.2)))
+        .await;
+    harness.accounts.account(ADA.0, ADA.1, ADA.2, None).await;
+    sign_in(&harness, ADA).await?;
+    let ada = bearer(&harness.token(ADA));
+    let (_, listed) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/silicons",
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(listed["items"], json!([]), "not known to be Ada's yet");
+    let report = harness.state.sweep_accounts().await.map_err(|_| "sweep")?;
+    assert_eq!((report.checked, report.purged), (2, 0));
+    let (_, listed) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/silicons",
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(listed["items"][0]["uuid"], "K1E", "{listed}");
+    assert_eq!(listed["items"][0]["id"], "si:scout");
+    assert_eq!(listed["complete"], true);
     harness.finish().await
 }

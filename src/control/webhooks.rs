@@ -21,7 +21,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{ControlError, ControlState};
-use crate::domain::identity::AccountUuid;
+use crate::{
+    domain::identity::AccountUuid,
+    infrastructure::directory::{Purge, lock_account, purge_account, record_pending_event},
+};
 
 pub(crate) async fn receive(
     State(state): State<Arc<ControlState>>,
@@ -232,18 +235,22 @@ async fn apply(
     Ok(applied(outcome))
 }
 
-/// Refuses tokens issued before `at` and ends Waveform's Briefcase access.
+/// Refuses tokens issued before `at` and ends Waveform's Briefcase access. For an
+/// account Waveform has not seen yet (it signed in but never called Waveform),
+/// the sign-out is kept for its first sighting, so its earlier tokens stay refused.
 async fn end_sign_ins(
     transaction: &mut Transaction<'_, Postgres>,
     uuid: &str,
     at: OffsetDateTime,
     reason: &str,
 ) -> Result<Applied, ControlError> {
+    lock_account(transaction, uuid).await?;
     let storage_key: Option<Uuid> = sqlx::query_scalar("UPDATE waveform_accounts a SET revoked_before=GREATEST(COALESCE(a.revoked_before, $2), $2), revoked_reason=$3, updated_at=now() FROM waveform_account_keys k WHERE a.account_uuid=$1 AND k.account_uuid=a.account_uuid RETURNING k.storage_actor_id")
         .bind(uuid).bind(at).bind(reason)
         .fetch_optional(&mut **transaction).await?;
     let Some(storage_key) = storage_key else {
-        return Ok(applied("unknown_account"));
+        record_pending_event(transaction, uuid, at, reason, false).await?;
+        return Ok(applied("sign_ins_ended_before_first_use"));
     };
     let revoked_proof = invalidate_storage_proof(transaction, storage_key, reason).await?;
     Ok(Applied {
@@ -263,44 +270,18 @@ async fn invalidate_storage_proof(
 }
 
 /// Deletes the account's data held by Waveform and keeps a tombstone so its
-/// tokens stay refused. Briefcase copies are the account's files and Briefcase
-/// handles them.
+/// tokens stay refused (see [`purge_account`]); an account Waveform has not
+/// seen yet is recorded as deleted for its first sighting.
 async fn delete_account(
     transaction: &mut Transaction<'_, Postgres>,
     uuid: &str,
     at: OffsetDateTime,
 ) -> Result<Applied, ControlError> {
-    let storage_key: Option<Uuid> = sqlx::query_scalar(
-        "SELECT storage_actor_id FROM waveform_account_keys WHERE account_uuid=$1",
-    )
-    .bind(uuid)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    let Some(storage_key) = storage_key else {
-        return Ok(applied("unknown_account"));
-    };
-    let revoked_proof =
-        invalidate_storage_proof(transaction, storage_key, "account_deleted").await?;
-    for statement in [
-        "DELETE FROM waveform_provider_keys WHERE actor_id=$1",
-        "DELETE FROM waveform_storage_proofs WHERE storage_actor_id=$1",
-        "DELETE FROM waveform_account_preferences WHERE actor_id=$1",
-        "DELETE FROM waveform_jobs WHERE actor_id=$1",
-        "DELETE FROM waveform_idempotency_records WHERE actor_id=$1",
-        "DELETE FROM waveform_held_audio WHERE storage_actor_id=$1",
-        "DELETE FROM waveform_actor_keys WHERE storage_actor_id=$1",
-        "DELETE FROM waveform_identity_links WHERE storage_actor_id=$1",
-    ] {
-        sqlx::query(statement)
-            .bind(storage_key)
-            .execute(&mut **transaction)
-            .await?;
-    }
-    sqlx::query("UPDATE waveform_accounts SET deleted_at=COALESCE(deleted_at, $2), revoked_before=GREATEST(COALESCE(revoked_before, $2), $2), revoked_reason='account_deleted', current_id=NULL, display_name=NULL, pfp_url=NULL, custodian_uuid=NULL, custodian_id=NULL, updated_at=now() WHERE account_uuid=$1")
-        .bind(uuid).bind(at)
-        .execute(&mut **transaction).await?;
-    Ok(Applied {
-        outcome: "account_deleted",
-        revoked_proof,
+    Ok(match purge_account(transaction, uuid, at).await? {
+        Purge::Purged { revoked_proof } => Applied {
+            outcome: "account_deleted",
+            revoked_proof,
+        },
+        Purge::Recorded => applied("deleted_before_first_use"),
     })
 }

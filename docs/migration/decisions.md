@@ -16,7 +16,9 @@ file had to make them concrete. Root `decisions.md` is append-only; its new entr
 - **Account cache.** `waveform_accounts` caches, per account uuid: kind, current public id, display name, photo URL,
   the custodian `{uuid, id}` of a Silicon, a profile version, and the revocation marker (`revoked_before`). It is
   filled from token claims, proof verifications, `GET /v1/accounts/{uuid}` lookups (cached; Accounts allows 600 per
-  minute per app) and webhooks.
+  minute per app) and webhooks, and every account is looked up again at least once a day (the background account
+  check, see [Fix stage](#fix-stage-review-findings)). The cache never outranks Silicon Accounts: a public id
+  follows the newest verified evidence, and a cached custodian is trusted only while it is recent.
 - **Public ids given by callers** (`?account=si:scout`) are resolved to a uuid through the cache and then
   `GET /v1/accounts/by-id/{id}`. An unknown id is refused with `404 account_not_found` and a message naming the id.
 
@@ -74,9 +76,13 @@ outside a Silicon's circle can reach it through Waveform. Nothing to add.
   tokens, the token family (`fid`, one sign-in). Speech requests log the account uuid, the issuing app and the
   token family (never a token).
 - **A Silicon's custodian** is learned from `GET /v1/accounts/{uuid}` the first time Waveform sees the Silicon
-  (in the background, re-checked every 10 minutes and on `silicon.custodian_changed`); `GET /api/v1/me` waits for
-  that first lookup so a Silicon's first answer already names its custodian. A Carbon selecting a Silicon whose
-  cached custodian differs is re-checked with Accounts at most once a minute before being refused.
+  (`GET /api/v1/me` waits for that first lookup, at most 2 s, so a Silicon's first answer already names its
+  custodian) and kept up to date by `silicon.custodian_changed`, by the Silicon's own requests (a background re-check
+  once the cached answer is older than 10 minutes) and by the daily account check. A cached custodian stands for a
+  Carbon's reads only while Silicon Accounts confirmed it in the last 10 minutes; past that Waveform asks again
+  before answering, and every custodian write (preferences, provider keys, Briefcase revoke) asks Silicon Accounts
+  first and is refused when it cannot be asked. A Carbon selecting a Silicon whose cached custodian is someone else
+  is re-checked at most once a minute before being refused.
 - **Removing Waveform's access** (`membership.access_removed`) ends Waveform's own sign-ins and its Briefcase proof
   for the account. A proof another app presents for that account still works while Accounts verifies it: it
   stands on that app's own grant, and Accounts is the authority on it.
@@ -137,9 +143,12 @@ that is not an Accounts event, 503 when no secret is configured. Dedupe on `even
 
 **`account.deleted`:** delete the account's provider keys, Briefcase proofs (revoked at Accounts first), preferences,
 job history, idempotency records and held audio; delete its legacy `waveform_actor_keys` rows and its `waveform_identity_links` rows; clear the cached id,
-name and photo; keep the uuid ↔ storage-key row as a tombstone so the deleted account's tokens stay refused. Bug
-reports already delivered to the bug-report inbox are not Waveform product data; they stay, but their storage key no longer
-maps to any id. Briefcase copies are the account's files and Briefcase handles them.
+name and photo; keep the uuid ↔ storage-key row as a tombstone so the deleted account's tokens stay refused. The
+account's bug reports are deleted too (superseding the earlier "they stay": a queued report would otherwise still be
+mailed after the deletion, and a delivered one is the inbox's copy, not Waveform's). Briefcase copies are the
+account's files and Briefcase handles them. Silicon Accounts announces a deletion only to apps the account is a live
+member of, so the daily account check finds the others (see [Fix stage](#fix-stage-review-findings)), and a
+sign-out or deletion that arrives before the account's first request is kept for it.
 
 ## Linking earlier accounts (`link-identities`)
 
@@ -431,7 +440,7 @@ minutes while unknown; a profile version older than the cached one is ignored).
 - Revocation markers compare a token's whole-second `iat` with the event's millisecond time, so a sign-in made within
   the same second after an end is refused once (signing in again a second later works, as the run shows). This is
   the safe side; kept.
-- Selecting a Silicon by `si:` id always asks Silicon Accounts; by uuid it uses the cache. A former custodian selecting
-  by uuid keeps access until `silicon.custodian_changed` arrives (seconds in the run) or the 10-minute re-check;
-  selecting by id is refused at once. Kept: a missed webhook must not lock a new custodian out, and the old one's
-  window is short.
+- Selecting a Silicon by `si:` id always asks Silicon Accounts; by uuid it uses the cache, but only for reads and
+  only while Silicon Accounts confirmed the custodian in the last 10 minutes. (Superseded: this stage first kept a
+  former custodian's access by uuid until a webhook or a re-check that never ran on that path; the fix stage closed
+  it, see [Fix stage](#fix-stage-review-findings).)

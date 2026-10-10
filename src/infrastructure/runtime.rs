@@ -66,6 +66,8 @@ const CLEANUP_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const DATABASE_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 const DATABASE_MAX_LIFETIME: Duration = Duration::from_mins(30);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_hours(1);
+/// The background account check asks about one batch of accounts this often.
+const ACCOUNT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const DEPENDENCY_CONTRACTS_AVAILABLE: bool = true;
 
 /// Redacted process bootstrap or lifecycle failure.
@@ -458,12 +460,15 @@ async fn serve_until_shutdown(
 }
 
 /// Delivers queued bug reports every few seconds and retires deprecated API
-/// contracts hourly.
+/// contracts hourly. The background account check runs beside it in its own
+/// task (a slow Silicon Accounts never delays report delivery); both stop on
+/// shutdown.
 fn spawn_maintenance(
     control: Arc<crate::control::ControlState>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let account_check = tokio::spawn(run_account_check(control.clone(), shutdown.clone()));
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         let mut last_sunset_check = tokio::time::Instant::now() - MAINTENANCE_INTERVAL;
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -483,7 +488,47 @@ fn spawn_maintenance(
                 },
             }
         }
+        if account_check.await.is_err() {
+            tracing::error!("the background account check stopped unexpectedly");
+        }
     })
+}
+
+/// Asks Silicon Accounts about one batch of accounts every minute (the first a
+/// minute after start), until shutdown. A batch cut short by shutdown leaves its
+/// accounts to be asked about again an hour later.
+async fn run_account_check(
+    control: Arc<crate::control::ControlState>,
+    shutdown: CancellationToken,
+) {
+    let start = tokio::time::Instant::now() + ACCOUNT_SWEEP_INTERVAL;
+    let mut ticker = tokio::time::interval_at(start, ACCOUNT_SWEEP_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            _ = ticker.tick() => {}
+        }
+        let report = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            report = control.sweep_accounts() => report,
+        };
+        match report {
+            Ok(report) if report.purged > 0 || report.unknown > 0 || report.stopped => {
+                tracing::info!(
+                    checked = report.checked,
+                    purged = report.purged,
+                    unknown = report.unknown,
+                    stopped = report.stopped,
+                    "account check ran"
+                );
+            }
+            Ok(report) => tracing::debug!(checked = report.checked, "account check ran"),
+            Err(_) => tracing::warn!("account check failed; it runs again in a minute"),
+        }
+    }
 }
 
 /// Storage authority used when no encryption key is configured: Waveform can
