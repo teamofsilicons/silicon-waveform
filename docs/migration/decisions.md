@@ -259,3 +259,99 @@ client/CLI `>=0.6.0, <0.7.0`.
 - **Service fix found by the live run.** An `?account=` id that Silicon Accounts rejects as malformed
   (`422 invalid_id`, e.g. too long) answered `503 dependency_unavailable`; it now answers `404 account_not_found`
   naming the id (real outages stay 503).
+
+## Ship stage (packaging, CI, deployment, docs)
+
+### Packaging
+
+- **One archive per target**, as the brief's convention says: `dist/apps/waveform-<version>-<target>.tar.gz` with
+  `apps.yaml` listing only that target and the binary at `bin/waveform` (`bin/waveform.exe` on Windows), plus a
+  `.sha256`. The survey's per-target-set layout (`bin/<target>/waveform`, one archive for several targets) was not
+  used: uploads are per target and each archive must validate on its own.
+- **`scripts/package-apps.sh` is a thin entry point** that finds Python 3.9+ and runs `scripts/package_apps.py`, so the
+  logic (manifest rendering, native-format checks, discovery, archive checks) has unit tests
+  (`scripts/test_package_apps.py`, run in CI). The template is `packaging/apps.yaml.in` (comments stripped when
+  rendered).
+- **What the packager refuses:** a version that is not strict `x.y.z` or differs from `cli/Cargo.toml`; a binary that
+  is not a native executable for the target (ELF/Mach-O/PE class and machine checked); a Linux binary with a dynamic
+  loader (the fleet runs many distributions, so Linux packages must be the static musl build, as the release workflow
+  makes them); and, when the binary can run on the packing machine, wrong answers to `--help`, `accounts --json`
+  (`app_id` exactly `waveform`), `login status --json` (`authenticated` false in an empty home) or a `--version` that
+  differs from the manifest. "Can run" is decided by trying: another operating system, or `Exec format error`/`Bad
+  CPU type`, means it cannot. `PACKAGE_DISCOVERY=require` (the release workflow) turns "cannot run here" into an
+  error; `auto` (local default) packs with a note. There is no option to skip the check for a runnable binary.
+- **The discovery commands run in a clean environment** (empty `HOME`/`SILICON_HOME`/`USERPROFILE`, minimal `PATH`,
+  nothing else inherited), like a validation worker.
+- **The packer is hermetic:** `silicon-apps validate`/`pack` run with `--home` set to an empty temporary directory,
+  `SILICON_APPS_NO_DAEMON=1`, and without `APPS_TOKEN`/telemetry keys, so packing on a machine that is signed in to
+  production Silicon Apps (like the Carbon's) reads no session and starts no updater. After packing, the archive's
+  members and bytes are compared with the staged files and the extracted archive is validated again.
+
+### CI
+
+- **`release.yml` packs each target on its own runner** (after building and testing there) instead of packing all
+  targets in one Linux job, so every archive's discovery commands really ran on its target, and Linux/macOS archives
+  keep their executable mode (`silicon-apps pack` on Windows writes 0644). Each runner installs
+  `silicon-apps-cli` 0.2.0 with `cargo install --locked` (cached by `rust-cache`). A final job checks every archive's
+  checksum and members and writes `SHA256SUMS`; the artifact is `waveform-silicon-apps-release`. A first job checks the
+  tag against `cli/Cargo.toml` before anything builds.
+- **Toolchains are the ones the repository already used:** Rust 1.98.0 and static musl for Linux (`musl-gcc`), MSVC
+  for Windows, Apple targets on macOS runners. The brief's "zigbuild glibc baseline" example did not apply: Waveform
+  ships static musl Linux binaries since 0.3.1.
+- **`ci.yml` gains a `silicon-apps-package` job** that builds the static Linux CLI, installs the packer and packs
+  `linux-x86_64` with discovery required, so a broken manifest or discovery command fails on every change, and runs
+  the packaging and deploy-tool tests. The old website's jobs stay (minus the manifest-copy checks) until the web
+  stage replaces `frontend/` with `web/`; `backend-release.yml`'s website job likewise still builds `frontend/`.
+- **The Amazon Linux smoke** now downloads `waveform-apps-<target>`, checks the archive's checksum and runs the three
+  discovery commands from it in a read-only container.
+
+### Deployment
+
+- **A dedicated one-time tool, `deploy/native/accounts_cutover.py`,** moves the native API, as the IAM 3 cutover had
+  its own tool. `upgrade.py` stays the tool for later releases and now refuses an IAM-era `native.env` (pointing to
+  the cutover tool) and checks Waveform's app credentials with Silicon Accounts before stopping anything
+  (`--skip-accounts-check` for an Accounts outage).
+- **The cutover's rollback restores the database.** The previous binary runs `sqlx::migrate!()` with default settings
+  and refuses to start on a database that has migrations it does not know (`0015`–`0017`), so restoring files alone
+  cannot bring it back. On failure the tool renames the migrated database to `waveform_cutover_<stamp>` (kept, never
+  dropped: no data is deleted) and restores the pre-cutover dump into a new `waveform` database owned by `waveform`.
+  This was exercised against PostgreSQL with a real migrated Waveform database (progress.md).
+- **Migrate and link before the new API starts.** The tool runs `waveform-api migrate` and, given a mapping,
+  `waveform-api link-identities` (dry run first, any conflict aborts and rolls back) with the API stopped, through
+  `systemd-run` as the service user with the service's environment and private resolver, so no account can sign in
+  before its data is linked and `--merge` is only needed for principals linked later.
+- **Secrets never pass through arguments.** The new settings come from a root-only `0600` file with an allow-list of
+  keys; the runbook writes it on the host from Secrets Manager with a script that holds no secret.
+- **The webhook picks every update (`"events": null`).** Silicon Apps' `PUT /v1/apps/{app}/webhook` and
+  `silicon-apps webhook APP set` without `--event` pick five recommended updates that leave out `custodian_change`,
+  which Waveform needs for its custodian cache; Silicon Accounts' own `PUT` keeps earlier picks when `events` is
+  omitted. The runbook therefore generates the secret first (`generate-secret`) and sets the URL with
+  `"events": null` during the window, after which the tool asks for a test delivery (exit 3 if it does not arrive;
+  the API stays up).
+- **The website container** follows the web kit's contract: the Next.js standalone server on port 4325 (so Caddy's
+  route stays), `APP_ID`, `ACCOUNTS_URL`, `APP_API_URL`, `PUBLIC_URL` as plain values, and `APP_SECRET` (copied from
+  `native.env`'s `WAVEFORM_APP_SECRET`: the website and the API are the same app) and `SESSION_SECRET` (generated
+  once, kept) in `/etc/waveform/web.env` through `--env-file`. No session directory is mounted (sealed cookies); the
+  earlier one is left on the host. Read-only with tmpfs `/tmp` and `/app/.next/cache`, 256 MiB, ready when
+  `/auth/session` answers. The web stage's image must meet this.
+- **Retired tooling deleted** (it stays in git history): the IAM 3 cutover (`canonical_upgrade.py`, its test, the IAM
+  identity importer and its checks), `scripts/verify-identifier-migration.py`, the mock-IAM e2e harness
+  (`scripts/e2e-local-stack.py`, which already read a deleted fixture) and `scripts/e2e-provider-controls-http.py`
+  (drove the earlier website's gateway), the Honeycomb packager, manifest sync and install shim. The e2e stage writes
+  the Accounts-era scripts.
+
+### Documentation
+
+- **History moves, nothing is rewritten in it.** Dated reports, the IAM and Honeycomb guides, the 0.5 implementation
+  record, the earlier release notes and the dated deploy records are in `docs/history/` (with links repointed). The
+  docs site publishes neither `docs/history/` nor `docs/migration/`; the CLI bundles neither.
+- **`docs/IMPLEMENTATION.md` is not recreated.** The current implementation and verification state is in
+  `docs/migration/progress.md` until the release and in the release notes after it; a separate status page went stale
+  before.
+- **The `X-Org-ID` header is still named** in the API docs, once, to tell old integrations it is ignored. The client's
+  upgrade notes say `accounts()` is the discovery call without naming the removed method.
+- **The mapping comes from the most exact source first:** the identity import's own record, then Waveform's user base
+  (`external_id` of imported Carbons), and only then `by-id` lookups checked by hand, because an import may give an
+  account another id than its earlier handle and `by-id` matches current ids only.
+- **macOS and Windows archives** are built and checked but not uploaded: Silicon Apps has only Linux validation
+  workers today and a release's packages cannot change, so those targets join a later release.

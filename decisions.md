@@ -891,3 +891,17 @@ a file lock; sign-ins saved by earlier versions are never used. Organization, te
 updater flags and commands are gone and fail with what replaced them; Silicon Apps installs and updates the CLI.
 The client drops every organization and actor parameter, adds `signin::SignIn` and proof credentials, and keeps the
 API-version handshake. Details: [`docs/migration/decisions.md`](docs/migration/decisions.md#client-and-cli-stage-2).
+
+## 2026-10-10 — Silicon Apps ships the CLI; the host moves to Silicon Accounts with a restoring cutover
+
+**Status:** Accepted. Supersedes the Honeycomb packaging, lifecycle and installation records above and in
+`docs/history/`.
+
+Each release packs one Silicon Apps archive per target (`apps.yaml` listing that target, `bin/waveform[.exe]`) on that
+target's own runner, after the three discovery commands answer correctly in an empty home; Linux binaries stay static
+musl builds. Nothing is published by the workflow. The production host moves once with
+`deploy/native/accounts_cutover.py`, which migrates and links earlier data before the new API starts and, on failure,
+restores the pre-cutover database (keeping the migrated one under another name) because the previous binary cannot
+start on the new schema. Account events are subscribed with every update picked, since Waveform needs custodian
+changes. Details: [`docs/migration/decisions.md`](docs/migration/decisions.md#ship-stage-packaging-ci-deployment-docs)
+and the runbook [`docs/migration/cutover.md`](docs/migration/cutover.md).
