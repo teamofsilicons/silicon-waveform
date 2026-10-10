@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, RawQuery, State, rejection::JsonRejection},
     middleware as axum_middleware,
     response::{IntoResponse as _, Response},
     routing::{get, post},
@@ -174,10 +174,14 @@ pub fn router(state: ApiState, server: &ServerSettings) -> Router {
 
 async fn synthesize(
     State(state): State<ApiState>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: Result<Json<TtsRequestBody>, JsonRejection>,
 ) -> Response {
     let candidate_request_id = headers::request_id(&headers);
+    if headers::names_an_account(query.as_deref()) {
+        return ApiError::speech_runs_as_yourself(candidate_request_id).into_response();
+    }
     let headers = match SpeechHeaders::parse(&headers) {
         Ok(headers) => headers,
         Err(error) => return header_error(&error, candidate_request_id).into_response(),
@@ -216,10 +220,14 @@ async fn synthesize(
 
 async fn transcribe(
     State(state): State<ApiState>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: Result<Json<SttRequestBody>, JsonRejection>,
 ) -> Response {
     let candidate_request_id = headers::request_id(&headers);
+    if headers::names_an_account(query.as_deref()) {
+        return ApiError::speech_runs_as_yourself(candidate_request_id).into_response();
+    }
     let headers = match SpeechHeaders::parse(&headers) {
         Ok(headers) => headers,
         Err(error) => return header_error(&error, candidate_request_id).into_response(),

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{RawQuery, State},
     response::{IntoResponse as _, Response},
 };
 use http::{HeaderMap, StatusCode, header};
@@ -23,9 +23,13 @@ pub(super) struct Prepare {}
 
 pub(super) async fn prepare(
     State(state): State<Arc<ControlState>>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     Json(_body): Json<Prepare>,
 ) -> Result<Response, ControlError> {
+    if crate::api::headers::names_an_account(query.as_deref()) {
+        return Err(ControlError::speech_runs_as_yourself());
+    }
     let caller = state
         .caller(&headers, WaveformAction::TranscribeSpeech)
         .await?;

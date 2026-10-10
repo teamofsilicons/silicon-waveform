@@ -101,6 +101,14 @@ fn parse_idempotency_key(value: &str) -> Result<IdempotencyKey, HeaderError> {
         .map_err(|_| HeaderError::InvalidIdempotencyKey)
 }
 
+/// Whether a query string names an `account` (speech routes refuse it: speech
+/// always runs as the caller).
+pub(crate) fn names_an_account(query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name == "account")
+    })
+}
+
 pub(crate) fn request_id(headers: &HeaderMap) -> RequestId {
     optional_header(headers, REQUEST_ID)
         .ok()
@@ -169,8 +177,28 @@ pub enum HeaderError {
 mod tests {
     use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 
-    use super::{HeaderError, IDEMPOTENCY_KEY, SpeechHeaders};
+    use super::{HeaderError, IDEMPOTENCY_KEY, SpeechHeaders, names_an_account};
     use crate::domain::auth::{AuthFailure, InboundCredentials};
+
+    #[test]
+    fn an_account_selector_is_found_in_any_spelling_of_the_query() {
+        for query in [
+            "account=si:scout",
+            "a=1&account=",
+            "account",
+            "x=1&%61ccount=si:scout",
+        ] {
+            assert!(names_an_account(Some(query)), "{query}");
+        }
+        for query in [
+            None,
+            Some(""),
+            Some("accounts=1"),
+            Some("my_account=si:scout"),
+        ] {
+            assert!(!names_an_account(query), "{query:?}");
+        }
+    }
 
     fn base_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();

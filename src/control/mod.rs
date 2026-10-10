@@ -359,6 +359,15 @@ impl ControlError {
         Self::new(StatusCode::BAD_REQUEST, code, message)
     }
 
+    /// `?account=` on a speech route: speech always runs as the caller.
+    fn speech_runs_as_yourself() -> Self {
+        Self::bad_request(
+            "speech_runs_as_yourself",
+            "Speech always runs as the account that calls Waveform, so `account` cannot be given here: a custodian manages a Silicon's history, settings, keys and Briefcase access, but never speaks as it or fetches its audio.",
+        )
+        .with_hint("Remove ?account= and call as the account itself (a Silicon signs in with `silicon-accounts login --app waveform -q | waveform login --slt-stdin`).")
+    }
+
     fn forbidden(code: &'static str, message: impl Into<Cow<'static, str>>) -> Self {
         Self::new(StatusCode::FORBIDDEN, code, message)
     }

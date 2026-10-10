@@ -182,6 +182,22 @@ impl ApiError {
         Self::from_waveform(WaveformError::AuthenticationFailed(failure), request_id)
     }
 
+    /// Refuses `?account=` on a speech route: speech always runs as the caller,
+    /// and a custodian never speaks as the Silicon it looks after.
+    #[must_use]
+    pub fn speech_runs_as_yourself(request_id: RequestId) -> Self {
+        let mut error = Self::new(
+            StatusCode::BAD_REQUEST,
+            "speech_runs_as_yourself",
+            "Speech always runs as the account that calls Waveform, so `account` cannot be given here: a custodian manages a Silicon's history, settings, keys and Briefcase access, but never speaks as it.",
+            request_id,
+        );
+        error.hint = Some(
+            "Remove ?account= and call as the account itself (a Silicon signs in with `silicon-accounts login --app waveform -q | waveform login --slt-stdin`).",
+        );
+        error
+    }
+
     /// Constructs a bounded-body or domain-limit response.
     #[must_use]
     pub const fn payload_too_large(request_id: RequestId) -> Self {

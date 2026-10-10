@@ -2261,3 +2261,50 @@ async fn a_proof_briefcase_refuses_is_replaced_when_it_ended_but_an_account_revo
     );
     harness.finish().await
 }
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn speech_never_takes_an_account_selector() -> TestResult {
+    let harness = Harness::new("").await?;
+    let ada = bearer(&harness.token(ADA));
+    let audio = format!("/api/v1/audio/{}?account=si:scout", Uuid::new_v4());
+    for (verb, route, body) in [
+        (
+            "POST",
+            "/api/v1/tts?account=si:scout",
+            Some(json!({"text": "Not as the Silicon."})),
+        ),
+        (
+            "POST",
+            "/api/v1/stt?account=si:scout",
+            Some(
+                json!({"file_url": format!("{}/zQo/apps/waveform/a.mp3", harness.briefcase.uri())}),
+            ),
+        ),
+        (
+            "POST",
+            "/api/v1/stt/source-target?account=si:scout",
+            Some(json!({})),
+        ),
+        ("GET", audio.as_str(), None),
+    ] {
+        let (status, answer) = send(
+            &harness.app,
+            verb,
+            route,
+            &[
+                ("authorization", &ada),
+                ("idempotency-key", "selector-key-1"),
+            ],
+            body,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {answer}");
+        assert_eq!(
+            answer["error"]["code"], "speech_runs_as_yourself",
+            "{route}"
+        );
+        assert!(answer["error"]["hint"].is_string(), "{route}");
+    }
+    harness.finish().await
+}

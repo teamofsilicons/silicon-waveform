@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     response::Response,
 };
 use http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -17,9 +17,13 @@ use crate::domain::auth::WaveformAction;
 
 pub(super) async fn download(
     State(state): State<Arc<ControlState>>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     Path(request_id): Path<Uuid>,
 ) -> Result<Response, ControlError> {
+    if crate::api::headers::names_an_account(query.as_deref()) {
+        return Err(ControlError::speech_runs_as_yourself());
+    }
     let caller = state
         .caller(&headers, WaveformAction::SynthesizeSpeech)
         .await?;
