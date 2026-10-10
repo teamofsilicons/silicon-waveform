@@ -1,0 +1,69 @@
+{
+  "date": "2026-10-10",
+  "parallel_accounts_service": {
+    "app": "waveform",
+    "source_revision": "6457752f1774b0f9cd031dd0b7eae15d4f3b3b91",
+    "archive_sha256": "236ff8dc7345e91fc415c27a6bee5c44b05b81099365bc85c4972d620e6bcd64",
+    "binary_sha256": "9b6221bc2482f741bfe1dd0fe9bef0298da01da94505637ffdd846132afc6b21",
+    "new_api_ready": true,
+    "app_credential_preflight": true,
+    "legacy_pid_unchanged": true,
+    "legacy_proxy_prefix_preserved": true,
+    "public_url": "https://api.waveform.teamofsilicons.com",
+    "isolated_data": "/var/lib/waveform-accounts",
+    "health": {
+      "status": "ready"
+    }
+  },
+  "public_checks": [
+    {
+      "url": "https://api.waveform.teamofsilicons.com/health/ready",
+      "status": 200,
+      "expected_status": 200,
+      "matches": true
+    },
+    {
+      "url": "https://api.waveform.teamofsilicons.com/api/v1/me",
+      "status": 401,
+      "expected_status": 401,
+      "matches": true
+    },
+    {
+      "url": "https://waveform.teamofsilicons.com/auth/session",
+      "status": 200,
+      "expected_status": 200,
+      "matches": true,
+      "body": {
+        "signed_in": false
+      }
+    },
+    {
+      "url": "https://waveform.teamofsilicons.com/api/v1/me",
+      "status": 401,
+      "expected_status": 401,
+      "matches": true
+    },
+    {
+      "url": "https://waveform.teamofsilicons.com/auth/sign-in?return_to=%2Fsettings",
+      "status": 303,
+      "expected_status": 303,
+      "matches": true,
+      "authorize_origin": "https://accounts.teamofsilicons.com",
+      "app_id": [
+        "waveform"
+      ],
+      "redirect_uri": [
+        "https://waveform.teamofsilicons.com/auth/callback"
+      ],
+      "pkce": [
+        "S256"
+      ],
+      "http_only_cookie": true
+    }
+  ],
+  "screenshots": "/Users/codanium/Documents/silicon/.migration/live/waveform-production-home.png",
+  "legacy_iam_preserved": true,
+  "existing_silicons_reenrolled": false,
+  "authenticated_production_journey": "pending genuine account sign-in; no impersonation",
+  "notes": "Production uses fresh Accounts storage. Prior controlled local speech providers do not prove paid providers."
+}
