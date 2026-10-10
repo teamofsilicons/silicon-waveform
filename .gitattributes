@@ -1,2 +1,3 @@
-# Keep release identity byte-for-byte identical across native build hosts.
-honeycomb.yaml text eol=lf
+# Keep the release manifest template byte-for-byte identical across native build hosts.
+packaging/apps.yaml.in text eol=lf
+scripts/*.sh text eol=lf
