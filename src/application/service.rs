@@ -6,16 +6,18 @@ use std::{
 };
 
 use thiserror::Error;
+use url::Url;
 
 use super::ports::{
-    AudioNormalizationError, AudioNormalizer, BriefcaseError, BriefcaseFileAccessRequest,
-    BriefcasePort, IamError, IamPort, IdempotencyStore, IdempotencyStoreError, LeaseIdGenerator,
-    ReadSourceMediaRequest, SpeechToTextProvider, StoreGeneratedAudioRequest, TextToSpeechProvider,
+    AccountsError, AccountsPort, AudioNormalizationError, AudioNormalizer, BriefcaseError,
+    BriefcaseFileAccessRequest, BriefcasePort, HeldAudio, HeldAudioStore, IdempotencyStore,
+    IdempotencyStoreError, LeaseIdGenerator, ReadSourceMediaRequest, SpeechToTextProvider,
+    StorageAuthorityError, StorageAuthorityPort, StoreGeneratedAudioRequest, TextToSpeechProvider,
 };
 use crate::domain::{
     auth::{
-        AuthorizationRequest, AuthorizedActor, DelegationPurpose, DelegationRequest,
-        InboundCredentials, WaveformAction,
+        AccessToken, AuthorizationRequest, AuthorizedActor, BriefcaseProof, InboundCredentials,
+        WaveformAction,
     },
     error::{Dependency, WaveformError},
     idempotency::{
@@ -23,8 +25,11 @@ use crate::domain::{
         IdempotencyDecision, IdempotencyKey, IdempotencyRelease, IdempotencyScope, RequestDigest,
         RequestDigestKey, SpeechOperation,
     },
-    identity::{Actor, OrganizationId, RequestId},
-    media::{BriefcaseFileUrl, BriefcaseOrigin, GeneratedAudioFileName, MediaSizeLimit},
+    identity::{Actor, ApplicationId, RequestId},
+    media::{
+        AudioStorage, BriefcaseOrigin, GeneratedAudioFileName, HeldReason, MediaSizeLimit,
+        NormalizedAudio,
+    },
     provider::{ProviderName, STT_PROVIDER_CHAIN, TTS_PROVIDER_CHAIN},
     speech::{
         MAX_TTS_TEXT_CHARACTERS, SttProviderRequest, SttRequest, SttResult, TtsProviderRequest,
@@ -38,11 +43,7 @@ pub struct SpeechRequestContext {
     /// Candidate request ID. A reclaimed idempotency record may replace it with
     /// the canonical ID retained by the first attempt.
     pub request_id: RequestId,
-    /// Isolated Waveform plane; nil identifies production.
-    pub plane_id: uuid::Uuid,
-    /// Caller-selected organization, verified online by IAM.
-    pub organization_id: OrganizationId,
-    /// Exactly one inbound credential mode.
+    /// Exactly one inbound credential.
     pub credentials: InboundCredentials,
     /// Caller-provided idempotency key.
     pub idempotency_key: IdempotencyKey,
@@ -55,8 +56,7 @@ pub struct ServiceResponse<T> {
     pub result: T,
     /// True only when the authoritative store supplied a completed response.
     pub replayed: bool,
-    /// IAM-authorized actor for a fresh operation, when the caller needs to
-    /// write an auxiliary content-free history projection.
+    /// Account a fresh operation ran for.
     pub authorized_actor: Option<Actor>,
 }
 
@@ -92,23 +92,27 @@ pub struct ServicePolicy {
     briefcase_origin: BriefcaseOrigin,
     max_text_chars: usize,
     request_digest_key: RequestDigestKey,
+    public_base_url: Url,
 }
 
 impl ServicePolicy {
     /// Constructs policy with a finite, representable lease period.
     ///
+    /// `public_base_url` is Waveform's own public origin; held audio is served at
+    /// `{public_base_url}/api/v1/audio/{request_id}`.
+    ///
     /// # Errors
     ///
-    /// Returns [`ServiceConstructionError::InvalidDuration`] when the lease
-    /// duration is zero or cannot be represented by the persistence time model,
-    /// or [`ServiceConstructionError::InvalidTextLimit`] when the configured
-    /// text limit is outside the domain ceiling.
+    /// Returns [`ServiceConstructionError`] when the lease duration is zero or
+    /// unrepresentable, the text limit is outside the domain ceiling, or the
+    /// public URL is not an absolute http(s) origin.
     pub fn new(
         lease_duration: Duration,
         source_media_size_limit: MediaSizeLimit,
         briefcase_origin: BriefcaseOrigin,
         max_text_chars: usize,
         request_digest_key: RequestDigestKey,
+        public_base_url: Url,
     ) -> Result<Self, ServiceConstructionError> {
         if lease_duration.is_zero() {
             return Err(ServiceConstructionError::InvalidDuration);
@@ -118,12 +122,19 @@ impl ServicePolicy {
         if !(1..=MAX_TTS_TEXT_CHARACTERS).contains(&max_text_chars) {
             return Err(ServiceConstructionError::InvalidTextLimit);
         }
+        if !matches!(public_base_url.scheme(), "http" | "https")
+            || public_base_url.host_str().is_none()
+            || public_base_url.query().is_some()
+        {
+            return Err(ServiceConstructionError::InvalidPublicUrl);
+        }
         Ok(Self {
             lease_duration,
             source_media_size_limit,
             briefcase_origin,
             max_text_chars,
             request_digest_key,
+            public_base_url,
         })
     }
 
@@ -144,13 +155,33 @@ impl ServicePolicy {
     pub const fn max_text_chars(&self) -> usize {
         self.max_text_chars
     }
+
+    /// Absolute URL serving audio Waveform holds for one request.
+    #[must_use]
+    pub fn held_audio_url(&self, request_id: RequestId) -> Url {
+        let mut url = self.public_base_url.clone();
+        let base = url.path().trim_end_matches('/').to_owned();
+        url.set_path(&format!("{base}/api/v1/audio/{request_id}"));
+        url
+    }
+}
+
+/// Where generated speech can go: Briefcase (through a proof), or Waveform's own store.
+#[derive(Clone)]
+pub struct StorageBoundary {
+    /// Briefcase proofs Waveform holds for accounts.
+    pub authority: Arc<dyn StorageAuthorityPort>,
+    /// Briefcase itself.
+    pub briefcase: Arc<dyn BriefcasePort>,
+    /// Retention-limited store used when Briefcase cannot take the audio.
+    pub held_audio: Arc<dyn HeldAudioStore>,
 }
 
 /// Complete application service with dependencies supplied through object-safe ports.
 #[derive(Clone)]
 pub struct WaveformService {
-    iam: Arc<dyn IamPort>,
-    briefcase: Arc<dyn BriefcasePort>,
+    accounts: Arc<dyn AccountsPort>,
+    storage: StorageBoundary,
     idempotency: Arc<dyn IdempotencyStore>,
     audio_normalizer: Arc<dyn AudioNormalizer>,
     lease_id_generator: Arc<dyn LeaseIdGenerator>,
@@ -159,6 +190,7 @@ pub struct WaveformService {
     policy: ServicePolicy,
     provider_keys: Option<Arc<dyn crate::application::ports::ProviderKeyStore>>,
     voice_profiles: Option<Arc<dyn crate::application::ports::VoiceProfileStore>>,
+    provider_orders: Option<Arc<dyn crate::application::ports::ProviderOrderStore>>,
 }
 
 impl WaveformService {
@@ -170,8 +202,8 @@ impl WaveformService {
     /// from the documented fallback order.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        iam: Arc<dyn IamPort>,
-        briefcase: Arc<dyn BriefcasePort>,
+        accounts: Arc<dyn AccountsPort>,
+        storage: StorageBoundary,
         idempotency: Arc<dyn IdempotencyStore>,
         audio_normalizer: Arc<dyn AudioNormalizer>,
         lease_id_generator: Arc<dyn LeaseIdGenerator>,
@@ -196,8 +228,8 @@ impl WaveformService {
         }
 
         Ok(Self {
-            iam,
-            briefcase,
+            accounts,
+            storage,
             idempotency,
             audio_normalizer,
             lease_id_generator,
@@ -206,23 +238,11 @@ impl WaveformService {
             policy,
             provider_keys: None,
             voice_profiles: None,
+            provider_orders: None,
         })
     }
 
-    /// Selects real, paired test storage after the outer router authenticates
-    /// the caller in that test IAM plane. Speech providers remain deterministic.
-    pub(crate) fn with_storage_ports(
-        &self,
-        iam: Arc<dyn IamPort>,
-        briefcase: Arc<dyn BriefcasePort>,
-    ) -> Self {
-        let mut service = self.clone();
-        service.iam = iam;
-        service.briefcase = briefcase;
-        service
-    }
-
-    /// Enables personal provider keys for authenticated production requests.
+    /// Enables personal provider keys.
     #[must_use]
     pub fn with_provider_keys(
         mut self,
@@ -232,7 +252,7 @@ impl WaveformService {
         self
     }
 
-    /// Enables account voice profiles for both bearer and OBO synthesis.
+    /// Enables account voice profiles for bearer and proof callers.
     #[must_use]
     pub fn with_voice_profiles(
         mut self,
@@ -242,20 +262,25 @@ impl WaveformService {
         self
     }
 
+    /// Enables saved per-account provider orders (and the database defaults).
+    #[must_use]
+    pub fn with_provider_orders(
+        mut self,
+        store: Arc<dyn crate::application::ports::ProviderOrderStore>,
+    ) -> Self {
+        self.provider_orders = Some(store);
+        self
+    }
+
     async fn for_actor(
         &self,
-        plane_id: uuid::Uuid,
         actor: &AuthorizedActor,
         request_keys: &crate::domain::provider_keys::ProviderApiKeys,
     ) -> Result<Self, WaveformError> {
         let mut service = self.clone();
-        // Sandbox requests always use deterministic fixtures, even with BYOK.
-        if !plane_id.is_nil() {
-            return Ok(service);
-        }
         let mut keys = if let Some(store) = &self.provider_keys {
             store
-                .load(plane_id, actor)
+                .load(actor)
                 .await
                 .map_err(|_| WaveformError::DependencyUnavailable {
                     dependency: Dependency::ProviderKeys,
@@ -283,12 +308,39 @@ impl WaveformService {
         Ok(service)
     }
 
+    /// Completes the caller's optional provider prefix against the account's
+    /// saved order (or the database defaults). An empty explicit list is invalid.
+    async fn complete_provider_order(
+        &self,
+        actor: &AuthorizedActor,
+        operation: SpeechOperation,
+        requested: Option<Vec<ProviderName>>,
+    ) -> Result<Vec<ProviderName>, WaveformError> {
+        let chain = match operation {
+            SpeechOperation::Tts => TTS_PROVIDER_CHAIN.as_slice(),
+            SpeechOperation::Stt => STT_PROVIDER_CHAIN.as_slice(),
+        };
+        let base = match &self.provider_orders {
+            Some(store) => store.provider_order(actor, operation).await?,
+            None => chain.to_vec(),
+        };
+        let requested = match requested {
+            Some(order) if order.is_empty() => return Err(WaveformError::InvalidRequest),
+            Some(order) => order,
+            None => Vec::new(),
+        };
+        crate::domain::provider::resolve_order(&requested, &base)
+            .filter(|order| order.len() == chain.len())
+            .ok_or(WaveformError::InvalidRequest)
+    }
+
     /// Runs the synchronous text-to-speech workflow.
     ///
     /// # Errors
     ///
-    /// Returns a stable [`WaveformError`] after authorization, idempotency,
-    /// provider, normalization, or Briefcase work fails terminally.
+    /// Returns a stable [`WaveformError`] after authentication, idempotency,
+    /// provider or normalization work fails terminally. Briefcase failures do
+    /// not fail the request: the audio is held by Waveform instead.
     pub async fn synthesize(
         &self,
         context: SpeechRequestContext,
@@ -300,21 +352,18 @@ impl WaveformService {
         let authorization = self
             .authorize(&context, WaveformAction::SynthesizeSpeech)
             .await?;
-        self.synthesize_pre_authorized(context, request, authorization)
+        self.synthesize_authorized(context, request, authorization)
             .await
     }
 
-    /// Runs TTS after an outer control plane has authenticated a test-plane
-    /// request. The caller must obtain this actor from the selected IAM plane;
-    /// this method exists so deterministic test adapters can be selected
-    /// without ever treating a test root key as an actor credential.
+    /// Runs TTS for an already authenticated account.
     ///
     /// # Errors
     ///
-    /// Returns a stable [`WaveformError`] when idempotency, provider,
-    /// normalization, or Briefcase work fails.
+    /// Returns a stable [`WaveformError`] when idempotency, provider or
+    /// normalization work fails.
     #[allow(clippy::too_many_lines)]
-    pub async fn synthesize_pre_authorized(
+    pub async fn synthesize_authorized(
         &self,
         context: SpeechRequestContext,
         mut request: TtsRequest,
@@ -323,11 +372,11 @@ impl WaveformService {
         if request.text.character_count() > self.policy.max_text_chars {
             return Err(WaveformError::PayloadTooLarge);
         }
-        let provider_order = crate::domain::provider::resolve_order(
-            request.provider_order.as_deref().unwrap_or(&[]),
-            &TTS_PROVIDER_CHAIN,
-        )
-        .ok_or(WaveformError::InvalidRequest)?;
+        let requested = request.provider_order.take();
+        let provider_order = self
+            .complete_provider_order(&authorization, SpeechOperation::Tts, requested)
+            .await?;
+        request = request.with_provider_order(provider_order.clone());
         if request.auto_fallback && !request.provider_options.is_empty() {
             return Err(WaveformError::InvalidProviderOptions(
                 "Provider-specific controls require auto_fallback=false.",
@@ -341,14 +390,13 @@ impl WaveformService {
             return Err(WaveformError::InvalidRequest);
         }
         let service = self
-            .for_actor(context.plane_id, &authorization, &request.provider_keys)
+            .for_actor(&authorization, &request.provider_keys)
             .await?;
         let scope = IdempotencyScope {
-            plane_id: context.plane_id,
+            plane_id: uuid::Uuid::nil(),
             actor: authorization.actor,
-            organization_id: authorization.organization_id.clone(),
             operation: SpeechOperation::Tts,
-            key: context.idempotency_key,
+            key: context.idempotency_key.clone(),
         };
         let decision = self
             .claim(
@@ -368,8 +416,8 @@ impl WaveformService {
                 let result = self
                     .replay_tts(
                         context.request_id,
-                        authorization,
-                        subject_token(&context.credentials),
+                        &authorization,
+                        context.credentials.subject_token(),
                         completed,
                     )
                     .await?;
@@ -387,11 +435,7 @@ impl WaveformService {
         let mut guard = OperationLeaseGuard::new(self.idempotency.clone(), scope.clone(), lease.id);
         if let Some(store) = &self.voice_profiles {
             match store
-                .resolve(
-                    context.plane_id,
-                    &authorization,
-                    request.voice_profile.as_deref(),
-                )
+                .resolve(&authorization, request.voice_profile.as_deref())
                 .await
             {
                 Ok(profile) => request.resolved_voice = Some(profile),
@@ -410,6 +454,7 @@ impl WaveformService {
             .start_job(crate::domain::idempotency::SpeechJobStart {
                 voice_profile: request.resolved_voice.as_ref().map(Into::into),
                 scope: scope.clone(),
+                issuing_app: authorization.originating_application.clone(),
                 lease_id: lease.id,
                 first_line: request
                     .text
@@ -428,16 +473,8 @@ impl WaveformService {
             .execute_tts(
                 canonical_request_id,
                 operation_started_at,
-                authorization,
-                match &context.credentials {
-                    InboundCredentials::Bearer(token) => Some(token.clone()),
-                    InboundCredentials::OnBehalfOf(credentials) => {
-                        crate::domain::auth::AccessToken::new(
-                            credentials.proof.expose_secret().to_owned(),
-                        )
-                        .ok()
-                    }
-                },
+                &authorization,
+                context.credentials.subject_token(),
                 request,
             )
             .await;
@@ -474,7 +511,7 @@ impl WaveformService {
     ///
     /// # Errors
     ///
-    /// Returns a stable [`WaveformError`] after authorization, idempotency,
+    /// Returns a stable [`WaveformError`] after authentication, idempotency,
     /// Briefcase, or provider work fails terminally.
     pub async fn transcribe(
         &self,
@@ -484,39 +521,42 @@ impl WaveformService {
         let authorization = self
             .authorize(&context, WaveformAction::TranscribeSpeech)
             .await?;
-        self.transcribe_pre_authorized(context, request, authorization)
+        self.transcribe_authorized(context, request, authorization)
             .await
     }
 
-    /// Runs STT after an outer control plane has authenticated a test-plane
-    /// request. See [`Self::synthesize_pre_authorized`].
+    /// Runs STT for an already authenticated account.
     ///
     /// # Errors
     ///
     /// Returns a stable [`WaveformError`] when idempotency, Briefcase, or
     /// provider work fails.
-    pub async fn transcribe_pre_authorized(
+    #[allow(clippy::too_many_lines)]
+    pub async fn transcribe_authorized(
         &self,
         context: SpeechRequestContext,
-        request: SttRequest,
+        mut request: SttRequest,
         authorization: AuthorizedActor,
     ) -> Result<ServiceResponse<SttResult>, WaveformError> {
         if !self.policy.briefcase_origin.contains(&request.source_url) {
             return Err(WaveformError::InvalidRequest);
         }
-
         if !request.provider_keys.supports_only(&STT_PROVIDER_CHAIN) {
             return Err(WaveformError::InvalidRequest);
         }
+        let requested = request.provider_order.take();
+        let provider_order = self
+            .complete_provider_order(&authorization, SpeechOperation::Stt, requested)
+            .await?;
+        request = request.with_provider_order(provider_order);
         let service = self
-            .for_actor(context.plane_id, &authorization, &request.provider_keys)
+            .for_actor(&authorization, &request.provider_keys)
             .await?;
         let scope = IdempotencyScope {
-            plane_id: context.plane_id,
+            plane_id: uuid::Uuid::nil(),
             actor: authorization.actor,
-            organization_id: authorization.organization_id.clone(),
             operation: SpeechOperation::Stt,
-            key: context.idempotency_key,
+            key: context.idempotency_key.clone(),
         };
         let decision = self
             .claim(
@@ -531,13 +571,19 @@ impl WaveformService {
                 lease, request_id, ..
             } => (lease, request_id),
             IdempotencyDecision::Replay(CompletedSpeechOperation::Stt(result)) => {
-                self.reauthorize_stt_replay(
-                    context.request_id,
-                    authorization,
-                    request.source_url.clone(),
-                    subject_token(&context.credentials),
-                )
-                .await?;
+                // A cached transcript is content: re-check current read access first.
+                let proof = self
+                    .briefcase_authority(&authorization, context.credentials.subject_token())
+                    .await?;
+                self.storage
+                    .briefcase
+                    .verify_file_read_access(BriefcaseFileAccessRequest {
+                        proof,
+                        file_url: request.source_url.clone(),
+                        request_id: context.request_id,
+                    })
+                    .await
+                    .map_err(map_briefcase_error)?;
                 return Ok(ServiceResponse::replayed(result));
             }
             IdempotencyDecision::Replay(CompletedSpeechOperation::Tts(_)) => {
@@ -554,6 +600,7 @@ impl WaveformService {
             .start_job(crate::domain::idempotency::SpeechJobStart {
                 voice_profile: None,
                 scope: scope.clone(),
+                issuing_app: authorization.originating_application.clone(),
                 lease_id: lease.id,
                 first_line: String::new(),
             })
@@ -563,16 +610,8 @@ impl WaveformService {
         let result = service
             .execute_stt(
                 canonical_request_id,
-                authorization,
-                match &context.credentials {
-                    InboundCredentials::Bearer(token) => Some(token.clone()),
-                    InboundCredentials::OnBehalfOf(credentials) => {
-                        crate::domain::auth::AccessToken::new(
-                            credentials.proof.expose_secret().to_owned(),
-                        )
-                        .ok()
-                    }
-                },
+                &authorization,
+                context.credentials.subject_token(),
                 request,
             )
             .await;
@@ -610,22 +649,23 @@ impl WaveformService {
         context: &SpeechRequestContext,
         action: WaveformAction,
     ) -> Result<AuthorizedActor, WaveformError> {
-        let expected_organization = context.organization_id.clone();
-        let authorization = self
-            .iam
+        let actor = self
+            .accounts
             .authorize(AuthorizationRequest {
                 credentials: context.credentials.clone(),
-                organization_id: expected_organization.clone(),
                 action,
                 request_id: context.request_id,
             })
             .await
-            .map_err(map_iam_error)?;
-
-        if authorization.organization_id != expected_organization {
-            return Err(WaveformError::Forbidden);
-        }
-        Ok(authorization)
+            .map_err(map_accounts_error)?;
+        tracing::info!(
+            request_id = %context.request_id,
+            account = actor.account.uuid.as_str(),
+            issuing_app = actor.originating_application.as_ref().map(ApplicationId::as_str),
+            token_family = actor.token_family.as_deref(),
+            "speech request authenticated"
+        );
+        Ok(actor)
     }
 
     async fn claim(
@@ -646,80 +686,124 @@ impl WaveformService {
             .map_err(map_idempotency_error)
     }
 
+    /// Briefcase access for reading on the account's behalf. A direct caller's
+    /// own token can create it; a delegated call can only use a stored proof.
+    async fn briefcase_authority(
+        &self,
+        authorization: &AuthorizedActor,
+        subject_token: Option<&AccessToken>,
+    ) -> Result<BriefcaseProof, WaveformError> {
+        let subject_token = if authorization.is_delegated() {
+            None
+        } else {
+            subject_token
+        };
+        self.storage
+            .authority
+            .briefcase_proof(authorization, subject_token)
+            .await
+            .map_err(|error| match error {
+                StorageAuthorityError::NotAuthorized | StorageAuthorityError::Refused => {
+                    WaveformError::StorageAuthorizationRequired
+                }
+                StorageAuthorityError::Unavailable => WaveformError::DependencyUnavailable {
+                    dependency: Dependency::Accounts,
+                },
+                StorageAuthorityError::Timeout => WaveformError::DependencyTimeout {
+                    dependency: Dependency::Accounts,
+                },
+            })
+    }
+
+    /// Runs one Briefcase operation with `proof`. When Briefcase refuses the
+    /// proof (401: it ended with the sign-in it stood on, or was revoked), asks
+    /// for it to be renewed and runs the operation once more with the new one.
+    async fn with_renewal<T, F, Fut>(
+        &self,
+        authorization: &AuthorizedActor,
+        subject_token: Option<&AccessToken>,
+        proof: BriefcaseProof,
+        operation: F,
+    ) -> Result<T, Renewal>
+    where
+        F: Fn(BriefcaseProof) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<T, BriefcaseError>> + Send,
+    {
+        match operation(proof.clone()).await {
+            Err(BriefcaseError::Unauthorized) => {
+                let subject_token = if authorization.is_delegated() {
+                    None
+                } else {
+                    subject_token
+                };
+                let renewed = self
+                    .storage
+                    .authority
+                    .renew_refused_proof(authorization, subject_token, &proof)
+                    .await
+                    .map_err(Renewal::Authority)?;
+                tracing::info!(
+                    "Briefcase refused a stored proof; retrying once with a renewed one"
+                );
+                operation(renewed).await.map_err(Renewal::Briefcase)
+            }
+            other => other.map_err(Renewal::Briefcase),
+        }
+    }
+
     async fn replay_tts(
         &self,
         attempt_request_id: RequestId,
-        authorization: AuthorizedActor,
-        subject_token: Option<crate::domain::auth::AccessToken>,
+        authorization: &AuthorizedActor,
+        subject_token: Option<&AccessToken>,
         completed: CompletedTtsOperation,
     ) -> Result<TtsResult, WaveformError> {
-        self.briefcase
-            .verify_file_read_access(BriefcaseFileAccessRequest {
-                authorization,
-                subject_token,
-                file_url: completed.permanent_url.clone(),
-                request_id: attempt_request_id,
-            })
-            .await
-            .map_err(map_briefcase_error)?;
-        let mut result = TtsResult::new(
-            completed.request_id,
-            crate::domain::media::StoredAudio {
-                permanent_url: completed.permanent_url,
-                temporary_url: None,
-            },
-            completed.provider,
-            completed.duration,
-        );
-        result.voice_profile = completed.voice_profile;
-        Ok(result)
-    }
-
-    async fn reauthorize_stt_replay(
-        &self,
-        attempt_request_id: RequestId,
-        authorization: AuthorizedActor,
-        source_url: BriefcaseFileUrl,
-        subject_token: Option<crate::domain::auth::AccessToken>,
-    ) -> Result<(), WaveformError> {
-        self.briefcase
-            .verify_file_read_access(BriefcaseFileAccessRequest {
-                authorization,
-                subject_token,
-                file_url: source_url,
-                request_id: attempt_request_id,
-            })
-            .await
-            .map_err(map_briefcase_error)
+        match &completed.storage {
+            AudioStorage::Briefcase { permanent_url } => {
+                let proof = self
+                    .briefcase_authority(authorization, subject_token)
+                    .await?;
+                self.with_renewal(authorization, subject_token, proof, |proof| {
+                    self.storage
+                        .briefcase
+                        .verify_file_read_access(BriefcaseFileAccessRequest {
+                            proof,
+                            file_url: permanent_url.clone(),
+                            request_id: attempt_request_id,
+                        })
+                })
+                .await
+                .map_err(map_renewal_error)?;
+            }
+            AudioStorage::Held { .. } => {
+                let held = self
+                    .storage
+                    .held_audio
+                    .is_held(completed.request_id, authorization.actor.id)
+                    .await
+                    .map_err(|_| WaveformError::DependencyUnavailable {
+                        dependency: Dependency::AudioStore,
+                    })?;
+                if !held {
+                    return Err(WaveformError::SourceNotFound);
+                }
+            }
+        }
+        Ok(completed.into_result())
     }
 
     #[allow(
         clippy::too_many_lines,
-        reason = "ordered synthesis, normalization, and exact-byte upload form one bounded pipeline"
+        reason = "ordered synthesis, normalization, and storage form one bounded pipeline"
     )]
     async fn execute_tts(
         &self,
         request_id: RequestId,
         operation_started_at: time::OffsetDateTime,
-        authorization: AuthorizedActor,
-        subject_token: Option<crate::domain::auth::AccessToken>,
+        authorization: &AuthorizedActor,
+        subject_token: Option<&AccessToken>,
         request: TtsRequest,
     ) -> Result<TtsResult, WaveformError> {
-        // Establish storage consent before any billable generation. Exact bytes
-        // are bound by the downstream reservation manifest.
-        let delegated_authorization = self
-            .iam
-            .delegate(DelegationRequest {
-                authorization: authorization.clone(),
-                purpose: DelegationPurpose::StoreGeneratedAudio,
-                request_id,
-                subject_token,
-                manifest: None,
-                upload: None,
-            })
-            .await
-            .map_err(map_iam_error)?;
-
         let requested_order = request.provider_order.as_deref().unwrap_or(&[]);
         let mut provider_order =
             crate::domain::provider::resolve_order(requested_order, &TTS_PROVIDER_CHAIN)
@@ -817,42 +901,157 @@ impl WaveformService {
         let (provider, audio) = successful_audio.ok_or(WaveformError::ProvidersExhausted)?;
         let duration = audio.duration();
         let filename = GeneratedAudioFileName::for_request(operation_started_at, request_id);
-        let stored = self
-            .briefcase
-            .store_generated_audio(StoreGeneratedAudioRequest {
-                authorization,
-                delegated_authorization,
-                filename,
-                audio,
-                idempotency_key: IdempotencyKey::for_briefcase_upload(request_id),
-                request_id,
-            })
-            .await
-            .map_err(map_briefcase_error)?;
+        let storage = self
+            .store_audio(authorization, subject_token, filename, audio, request_id)
+            .await?;
 
-        let mut result = TtsResult::new(request_id, stored, provider, duration);
+        let mut result = TtsResult::new(request_id, storage, provider, duration);
         result.voice_profile = request.resolved_voice.as_ref().map(Into::into);
         Ok(result)
+    }
+
+    /// Stores the MP3 in the account's Briefcase files when Waveform can act
+    /// there for the account; otherwise holds it and says why. Only a failure
+    /// of Waveform's own audio store fails the request.
+    async fn store_audio(
+        &self,
+        authorization: &AuthorizedActor,
+        subject_token: Option<&AccessToken>,
+        filename: GeneratedAudioFileName,
+        audio: NormalizedAudio,
+        request_id: RequestId,
+    ) -> Result<AudioStorage, WaveformError> {
+        if authorization.is_delegated() {
+            return self
+                .hold(
+                    authorization,
+                    filename,
+                    audio,
+                    request_id,
+                    HeldReason::DelegatedCall,
+                )
+                .await;
+        }
+        let proof = match self
+            .storage
+            .authority
+            .briefcase_proof(authorization, subject_token)
+            .await
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                tracing::warn!(request_id = %request_id, reason = %error, "Briefcase access unavailable; holding audio");
+                return self
+                    .hold(
+                        authorization,
+                        filename,
+                        audio,
+                        request_id,
+                        HeldReason::StorageNotAuthorized,
+                    )
+                    .await;
+            }
+        };
+        match self
+            .with_renewal(authorization, subject_token, proof, |proof| {
+                self.storage
+                    .briefcase
+                    .store_generated_audio(StoreGeneratedAudioRequest {
+                        proof,
+                        filename: filename.clone(),
+                        audio: audio.clone(),
+                        request_id,
+                    })
+            })
+            .await
+        {
+            Ok(permanent_url) => Ok(AudioStorage::Briefcase { permanent_url }),
+            Err(Renewal::Authority(error)) => {
+                let reason = match error {
+                    StorageAuthorityError::NotAuthorized | StorageAuthorityError::Refused => {
+                        HeldReason::StorageNotAuthorized
+                    }
+                    // The refusal stands when the proof could not be renewed now.
+                    StorageAuthorityError::Unavailable | StorageAuthorityError::Timeout => {
+                        HeldReason::BriefcaseRefused
+                    }
+                };
+                tracing::warn!(request_id = %request_id, reason = reason.as_str(), "Briefcase refused the proof and it could not be renewed; holding audio");
+                self.hold(authorization, filename, audio, request_id, reason)
+                    .await
+            }
+            Err(Renewal::Briefcase(error)) => {
+                let reason = match error {
+                    BriefcaseError::Unauthorized | BriefcaseError::Forbidden => {
+                        HeldReason::BriefcaseRefused
+                    }
+                    BriefcaseError::ContractUnavailable => HeldReason::BriefcaseContractUnavailable,
+                    BriefcaseError::Timeout => HeldReason::BriefcaseTimeout,
+                    BriefcaseError::NotFound
+                    | BriefcaseError::MediaTooLarge
+                    | BriefcaseError::UnsupportedMediaType
+                    | BriefcaseError::Unavailable
+                    | BriefcaseError::InvalidResponse => HeldReason::BriefcaseUnavailable,
+                };
+                tracing::warn!(request_id = %request_id, reason = reason.as_str(), "Briefcase upload failed; holding audio");
+                self.hold(authorization, filename, audio, request_id, reason)
+                    .await
+            }
+        }
+    }
+
+    async fn hold(
+        &self,
+        authorization: &AuthorizedActor,
+        filename: GeneratedAudioFileName,
+        audio: NormalizedAudio,
+        request_id: RequestId,
+        reason: HeldReason,
+    ) -> Result<AudioStorage, WaveformError> {
+        let expires_at = self
+            .storage
+            .held_audio
+            .hold(HeldAudio {
+                request_id,
+                owner: authorization.actor.id,
+                filename,
+                audio,
+                reason,
+            })
+            .await
+            .map_err(|_| WaveformError::DependencyUnavailable {
+                dependency: Dependency::AudioStore,
+            })?;
+        Ok(AudioStorage::Held {
+            reason,
+            audio_url: self.policy.held_audio_url(request_id),
+            expires_at,
+        })
     }
 
     async fn execute_stt(
         &self,
         request_id: RequestId,
-        authorization: AuthorizedActor,
-        subject_token: Option<crate::domain::auth::AccessToken>,
+        authorization: &AuthorizedActor,
+        subject_token: Option<&AccessToken>,
         request: SttRequest,
     ) -> Result<SttResult, WaveformError> {
+        let proof = self
+            .briefcase_authority(authorization, subject_token)
+            .await?;
         let media = self
-            .briefcase
-            .read_source_media(ReadSourceMediaRequest {
-                authorization,
-                source_url: request.source_url,
-                subject_token,
-                size_limit: self.policy.source_media_size_limit,
-                request_id,
+            .with_renewal(authorization, subject_token, proof, |proof| {
+                self.storage
+                    .briefcase
+                    .read_source_media(ReadSourceMediaRequest {
+                        proof,
+                        source_url: request.source_url.clone(),
+                        size_limit: self.policy.source_media_size_limit,
+                        request_id,
+                    })
             })
             .await
-            .map_err(map_briefcase_error)?;
+            .map_err(map_renewal_error)?;
 
         let source_duration = self
             .audio_normalizer
@@ -1013,6 +1212,9 @@ pub enum ServiceConstructionError {
     /// Configured TTS text limit is zero or exceeds the domain ceiling.
     #[error("invalid TTS text-character limit")]
     InvalidTextLimit,
+    /// Waveform's public URL is not an absolute http(s) origin.
+    #[error("invalid Waveform public URL")]
+    InvalidPublicUrl,
     /// TTS adapters do not exactly match the documented order.
     #[error("invalid TTS provider chain: {actual:?}")]
     InvalidTtsProviderChain {
@@ -1027,34 +1229,44 @@ pub enum ServiceConstructionError {
     },
 }
 
-fn subject_token(credentials: &InboundCredentials) -> Option<crate::domain::auth::AccessToken> {
-    match credentials {
-        InboundCredentials::Bearer(token) => Some(token.clone()),
-        InboundCredentials::OnBehalfOf(credentials) => {
-            crate::domain::auth::AccessToken::new(credentials.proof.expose_secret().to_owned()).ok()
-        }
-    }
-}
-
-fn map_iam_error(error: IamError) -> WaveformError {
+const fn map_accounts_error(error: AccountsError) -> WaveformError {
     match error {
-        IamError::StorageAuthorizationRequired => WaveformError::StorageAuthorizationRequired,
-        IamError::InvalidCredential => WaveformError::Unauthenticated,
-        IamError::Forbidden | IamError::OrganizationMismatch => WaveformError::Forbidden,
-        IamError::ContractUnavailable => WaveformError::DependencyContractUnavailable {
-            dependency: Dependency::Iam,
+        AccountsError::Rejected(failure) => WaveformError::AuthenticationFailed(failure),
+        AccountsError::Unavailable => WaveformError::DependencyUnavailable {
+            dependency: Dependency::Accounts,
         },
-        IamError::Unavailable => WaveformError::DependencyUnavailable {
-            dependency: Dependency::Iam,
+        AccountsError::Timeout => WaveformError::DependencyTimeout {
+            dependency: Dependency::Accounts,
         },
-        IamError::Timeout => WaveformError::DependencyTimeout {
-            dependency: Dependency::Iam,
-        },
-        IamError::InvalidResponse => WaveformError::Internal,
     }
 }
 
-fn map_briefcase_error(error: BriefcaseError) -> WaveformError {
+/// A Briefcase operation that failed at Briefcase, or whose refused proof could
+/// not be renewed.
+#[derive(Clone, Copy, Debug)]
+enum Renewal {
+    Briefcase(BriefcaseError),
+    Authority(StorageAuthorityError),
+}
+
+const fn map_renewal_error(error: Renewal) -> WaveformError {
+    match error {
+        Renewal::Briefcase(error) => map_briefcase_error(error),
+        Renewal::Authority(
+            StorageAuthorityError::NotAuthorized | StorageAuthorityError::Refused,
+        ) => WaveformError::StorageAuthorizationRequired,
+        Renewal::Authority(StorageAuthorityError::Unavailable) => {
+            WaveformError::DependencyUnavailable {
+                dependency: Dependency::Accounts,
+            }
+        }
+        Renewal::Authority(StorageAuthorityError::Timeout) => WaveformError::DependencyTimeout {
+            dependency: Dependency::Accounts,
+        },
+    }
+}
+
+const fn map_briefcase_error(error: BriefcaseError) -> WaveformError {
     match error {
         BriefcaseError::InvalidResponse => WaveformError::Internal,
         BriefcaseError::Forbidden => WaveformError::Forbidden,
@@ -1064,9 +1276,7 @@ fn map_briefcase_error(error: BriefcaseError) -> WaveformError {
         BriefcaseError::ContractUnavailable => WaveformError::DependencyContractUnavailable {
             dependency: Dependency::Briefcase,
         },
-        BriefcaseError::Unauthorized | BriefcaseError::StorageAuthorizationRequired => {
-            WaveformError::StorageAuthorizationRequired
-        }
+        BriefcaseError::Unauthorized => WaveformError::StorageAuthorizationRequired,
         BriefcaseError::Unavailable => WaveformError::DependencyUnavailable {
             dependency: Dependency::Briefcase,
         },
@@ -1076,7 +1286,7 @@ fn map_briefcase_error(error: BriefcaseError) -> WaveformError {
     }
 }
 
-fn map_idempotency_error(error: IdempotencyStoreError) -> WaveformError {
+const fn map_idempotency_error(error: IdempotencyStoreError) -> WaveformError {
     match error {
         IdempotencyStoreError::Unavailable => WaveformError::DependencyUnavailable {
             dependency: Dependency::IdempotencyStore,
@@ -1090,7 +1300,7 @@ fn map_idempotency_error(error: IdempotencyStoreError) -> WaveformError {
     }
 }
 
-fn map_audio_error(error: AudioNormalizationError) -> WaveformError {
+const fn map_audio_error(error: AudioNormalizationError) -> WaveformError {
     match error {
         AudioNormalizationError::Saturated | AudioNormalizationError::Unavailable => {
             WaveformError::DependencyUnavailable {
@@ -1107,1455 +1317,5 @@ fn map_audio_error(error: AudioNormalizationError) -> WaveformError {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        collections::VecDeque,
-        str::FromStr as _,
-        sync::{Arc, Mutex, MutexGuard},
-        time::Duration,
-    };
-
-    use async_trait::async_trait;
-    use bytes::Bytes;
-    use time::macros::datetime;
-    use url::Url;
-    use uuid::Uuid;
-
-    use super::{ServicePolicy, ServiceResponse, SpeechRequestContext, WaveformService};
-    use crate::{
-        application::ports::{
-            AudioNormalizationError, AudioNormalizer, BriefcaseError, BriefcaseFileAccessRequest,
-            BriefcasePort, IamError, IamPort, IdempotencyStore, IdempotencyStoreError,
-            LeaseIdGenerator, ReadSourceMediaRequest, SpeechToTextProvider,
-            StoreGeneratedAudioRequest, TextToSpeechProvider,
-        },
-        domain::{
-            auth::{
-                AccessToken, AuthorizationRequest, AuthorizedActor, DelegatedAuthorization,
-                DelegationRequest, InboundCredentials, OboCredentials, OboProof,
-            },
-            error::WaveformError,
-            idempotency::{
-                CompletedSpeechOperation, CompletedTtsOperation, IdempotencyClaim,
-                IdempotencyCompletion, IdempotencyDecision, IdempotencyKey, IdempotencyLease,
-                IdempotencyLeaseId, IdempotencyRelease, RequestDigestKey,
-            },
-            identity::{Actor, ActorId, ActorKind, ApplicationId, OrganizationId, RequestId},
-            media::{
-                AudioArtifact, BriefcaseFileUrl, BriefcaseOrigin, MediaDuration, MediaSizeLimit,
-                NormalizedAudio, ProviderAudioFormat, SourceMedia, SourceMediaType, StoredAudio,
-                TemporaryMediaUrl,
-            },
-            provider::{ProviderError, ProviderFailureKind, ProviderName},
-            speech::{
-                MAX_TTS_TEXT_CHARACTERS, SpeechText, SttProviderRequest, SttProviderResult,
-                SttRequest, SttResult, Transcript, TtsProviderRequest, TtsRequest,
-            },
-        },
-    };
-
-    struct FakeLeaseIds {
-        lease_id: IdempotencyLeaseId,
-    }
-
-    impl LeaseIdGenerator for FakeLeaseIds {
-        fn new_idempotency_lease_id(&self) -> IdempotencyLeaseId {
-            self.lease_id
-        }
-    }
-
-    struct FakeIam {
-        authorized: AuthorizedActor,
-        authorize_count: Mutex<usize>,
-        delegated_request_ids: Mutex<Vec<RequestId>>,
-        delegation_error: Mutex<Option<IamError>>,
-    }
-
-    #[async_trait]
-    impl IamPort for FakeIam {
-        async fn authorize(
-            &self,
-            request: AuthorizationRequest,
-        ) -> Result<AuthorizedActor, IamError> {
-            *lock(&self.authorize_count) += 1;
-            let mut authorized = self.authorized.clone();
-            authorized.originating_application = match request.credentials {
-                InboundCredentials::Bearer(_) => None,
-                InboundCredentials::OnBehalfOf(credentials) => Some(credentials.application_id),
-            };
-            Ok(authorized)
-        }
-
-        async fn delegate(
-            &self,
-            request: DelegationRequest,
-        ) -> Result<DelegatedAuthorization, IamError> {
-            lock(&self.delegated_request_ids).push(request.request_id);
-            if let Some(error) = *lock(&self.delegation_error) {
-                return Err(error);
-            }
-            Ok(DelegatedAuthorization {
-                organization_id: request.authorization.organization_id.clone(),
-                commit_proof: None,
-                list_proof: None,
-                actor_id: None,
-                testing_secret: None,
-                application_id: application_id("silicon-waveform"),
-                proof: secret_proof(),
-                purpose: request.purpose,
-                expires_at: datetime!(2026-08-31 07:05:56 UTC),
-            })
-        }
-    }
-
-    struct FakeIdempotency {
-        decisions: Mutex<VecDeque<Result<IdempotencyDecision, IdempotencyStoreError>>>,
-        claims: Mutex<Vec<IdempotencyClaim>>,
-        completions: Mutex<Vec<IdempotencyCompletion>>,
-        completion_result: Mutex<Result<(), IdempotencyStoreError>>,
-        job_start_result: Mutex<Result<(), IdempotencyStoreError>>,
-        releases: Mutex<Vec<IdempotencyRelease>>,
-    }
-
-    #[async_trait]
-    impl IdempotencyStore for FakeIdempotency {
-        async fn claim(
-            &self,
-            claim: IdempotencyClaim,
-        ) -> Result<IdempotencyDecision, IdempotencyStoreError> {
-            lock(&self.claims).push(claim);
-            lock(&self.decisions)
-                .pop_front()
-                .unwrap_or(Err(IdempotencyStoreError::InvalidRecord))
-        }
-
-        async fn start_job(
-            &self,
-            _job: crate::domain::idempotency::SpeechJobStart,
-        ) -> Result<(), IdempotencyStoreError> {
-            *lock(&self.job_start_result)
-        }
-
-        async fn complete(
-            &self,
-            completion: IdempotencyCompletion,
-        ) -> Result<(), IdempotencyStoreError> {
-            lock(&self.completions).push(completion);
-            *lock(&self.completion_result)
-        }
-
-        async fn release(&self, release: IdempotencyRelease) -> Result<(), IdempotencyStoreError> {
-            lock(&self.releases).push(release);
-            Ok(())
-        }
-
-        async fn check_ready(&self) -> Result<(), IdempotencyStoreError> {
-            Ok(())
-        }
-    }
-
-    struct FakeBriefcase {
-        source: Result<SourceMedia, BriefcaseError>,
-        stored: Result<StoredAudio, BriefcaseError>,
-        access_result: Mutex<Result<(), BriefcaseError>>,
-        temporary_url_result: Mutex<Result<TemporaryMediaUrl, BriefcaseError>>,
-        verified_accesses: Mutex<Vec<(RequestId, String)>>,
-        temporary_url_requests: Mutex<Vec<(RequestId, String)>>,
-        read_request_ids: Mutex<Vec<RequestId>>,
-        store_requests: Mutex<Vec<(RequestId, String, String)>>,
-    }
-
-    #[async_trait]
-    impl BriefcasePort for FakeBriefcase {
-        async fn verify_file_read_access(
-            &self,
-            request: BriefcaseFileAccessRequest,
-        ) -> Result<(), BriefcaseError> {
-            lock(&self.verified_accesses).push((request.request_id, request.file_url.to_string()));
-            *lock(&self.access_result)
-        }
-
-        async fn issue_temporary_url(
-            &self,
-            request: BriefcaseFileAccessRequest,
-        ) -> Result<TemporaryMediaUrl, BriefcaseError> {
-            lock(&self.temporary_url_requests)
-                .push((request.request_id, request.file_url.to_string()));
-            lock(&self.temporary_url_result).clone()
-        }
-
-        async fn read_source_media(
-            &self,
-            request: ReadSourceMediaRequest,
-        ) -> Result<SourceMedia, BriefcaseError> {
-            lock(&self.read_request_ids).push(request.request_id);
-            self.source.clone()
-        }
-
-        async fn store_generated_audio(
-            &self,
-            request: StoreGeneratedAudioRequest,
-        ) -> Result<StoredAudio, BriefcaseError> {
-            lock(&self.store_requests).push((
-                request.request_id,
-                request.filename.to_string(),
-                request.idempotency_key.as_str().to_owned(),
-            ));
-            self.stored.clone()
-        }
-    }
-
-    struct FakeNormalizer {
-        result: Result<NormalizedAudio, AudioNormalizationError>,
-    }
-
-    #[async_trait]
-    impl AudioNormalizer for FakeNormalizer {
-        async fn source_duration(
-            &self,
-            _media: &SourceMedia,
-            _request_id: RequestId,
-        ) -> Result<MediaDuration, AudioNormalizationError> {
-            Ok(MediaDuration::from_millis(125))
-        }
-
-        async fn normalize_to_mp3(
-            &self,
-            _artifact: AudioArtifact,
-            _request_id: RequestId,
-        ) -> Result<NormalizedAudio, AudioNormalizationError> {
-            self.result.clone()
-        }
-
-        async fn check_ready(&self) -> Result<(), AudioNormalizationError> {
-            Ok(())
-        }
-    }
-
-    struct FakeTtsProvider {
-        requests: Mutex<Vec<TtsProviderRequest>>,
-        name: ProviderName,
-        result: Result<AudioArtifact, ProviderError>,
-        request_ids: Mutex<Vec<RequestId>>,
-    }
-
-    #[async_trait]
-    impl TextToSpeechProvider for FakeTtsProvider {
-        fn name(&self) -> ProviderName {
-            self.name
-        }
-
-        async fn synthesize(
-            &self,
-            request: TtsProviderRequest,
-            request_id: RequestId,
-        ) -> Result<AudioArtifact, ProviderError> {
-            lock(&self.requests).push(request);
-            lock(&self.request_ids).push(request_id);
-            self.result.clone()
-        }
-    }
-
-    struct FakeSttProvider {
-        name: ProviderName,
-        result: Result<SttProviderResult, ProviderError>,
-        request_ids: Mutex<Vec<RequestId>>,
-    }
-
-    #[async_trait]
-    impl SpeechToTextProvider for FakeSttProvider {
-        fn name(&self) -> ProviderName {
-            self.name
-        }
-
-        async fn transcribe(
-            &self,
-            _request: SttProviderRequest,
-            request_id: RequestId,
-        ) -> Result<SttProviderResult, ProviderError> {
-            lock(&self.request_ids).push(request_id);
-            self.result.clone()
-        }
-    }
-
-    struct Profiles {
-        calls: Mutex<Vec<(Uuid, Actor, Option<String>)>>,
-    }
-    #[async_trait]
-    impl crate::application::ports::VoiceProfileStore for Profiles {
-        async fn resolve(
-            &self,
-            plane: Uuid,
-            actor: &AuthorizedActor,
-            requested: Option<&str>,
-        ) -> Result<crate::domain::voice::VoiceProfile, WaveformError> {
-            lock(&self.calls).push((plane, actor.actor, requested.map(str::to_owned)));
-            let profiles: Vec<crate::domain::voice::VoiceProfile> =
-                serde_json::from_str(include_str!("../domain/voice_profiles.json"))
-                    .map_err(|_| WaveformError::Internal)?;
-            profiles
-                .into_iter()
-                .find(|p| p.id == requested.unwrap_or("kore"))
-                .ok_or(WaveformError::InvalidRequest)
-        }
-    }
-
-    #[tokio::test]
-    async fn profile_follows_default_override_fallback_and_obo_actor()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for (selected, winner, obo) in [
-            (None, 0, false),
-            (Some("puck"), 1, false),
-            (Some("sulafat"), 2, true),
-        ] {
-            let mut outcomes = provider_failures_for_tts();
-            outcomes[winner] = Ok(audio_artifact());
-            let fixture = fixture(
-                IdempotencyDecision::Acquired {
-                    lease: lease(),
-                    request_id: request_id(77),
-                    operation_started_at: original_operation_start(),
-                },
-                outcomes,
-                provider_failures_for_stt(),
-            );
-            let store = Arc::new(Profiles {
-                calls: Mutex::new(Vec::new()),
-            });
-            let service = fixture.service.with_voice_profiles(store.clone());
-            let mut request = tts_request();
-            request.voice_profile = selected.map(str::to_owned);
-            let context = if obo {
-                obo_context(request_id(78), "voice-profile", "caller")
-            } else {
-                context(request_id(78), "voice-profile")
-            };
-            let result = service.synthesize(context, request).await?.result;
-            let profile: Vec<crate::domain::voice::VoiceProfile> =
-                serde_json::from_str(include_str!("../domain/voice_profiles.json"))?;
-            let expected = profile
-                .iter()
-                .find(|p| p.id == selected.unwrap_or("kore"))
-                .ok_or("profile")?;
-            assert_eq!(result.voice_profile, Some(expected.into()));
-            let calls = lock(&store.calls);
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].1, fixture.iam.authorized.actor);
-            for (index, provider) in fixture.tts.iter().enumerate() {
-                let requests = lock(&provider.requests);
-                if index <= winner {
-                    assert_eq!(requests.len(), 1);
-                    assert_eq!(requests[0].voice, expected.for_provider(provider.name));
-                } else {
-                    assert!(requests.is_empty());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn completed_profile_replay_ignores_new_defaults_and_invalid_profiles_never_call_providers()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut completed = replayed_tts_result(request_id(77));
-        completed.voice_profile = Some(crate::domain::voice::VoiceProfileRef {
-            id: "puck".into(),
-            revision: 1,
-        });
-        let fixture = fixture(
-            IdempotencyDecision::Replay(CompletedSpeechOperation::Tts(completed.clone())),
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-        let store = Arc::new(Profiles {
-            calls: Mutex::new(Vec::new()),
-        });
-        let service = fixture.service.with_voice_profiles(store.clone());
-        let result = service
-            .synthesize(context(request_id(78), "profile-replay"), tts_request())
-            .await?
-            .result;
-        assert_eq!(result.voice_profile, completed.voice_profile);
-        assert!(lock(&store.calls).is_empty());
-        assert!(fixture.tts.iter().all(|p| lock(&p.requests).is_empty()));
-        let fixture = self::fixture(
-            IdempotencyDecision::Acquired {
-                lease: lease(),
-                request_id: request_id(77),
-                operation_started_at: original_operation_start(),
-            },
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-        let service = fixture.service.with_voice_profiles(store);
-        let mut request = tts_request();
-        request.voice_profile = Some("missing".into());
-        assert_eq!(
-            service
-                .synthesize(context(request_id(78), "bad-profile"), request)
-                .await,
-            Err(WaveformError::InvalidRequest)
-        );
-        assert!(fixture.tts.iter().all(|p| lock(&p.requests).is_empty()));
-        assert_eq!(lock(&fixture.idempotency.releases).len(), 1);
-        Ok(())
-    }
-    struct Fixture {
-        service: WaveformService,
-        iam: Arc<FakeIam>,
-        idempotency: Arc<FakeIdempotency>,
-        briefcase: Arc<FakeBriefcase>,
-        tts: Vec<Arc<FakeTtsProvider>>,
-        stt: Vec<Arc<FakeSttProvider>>,
-    }
-
-    #[tokio::test]
-    async fn request_provider_order_overrides_default_fallback_chain() {
-        let fixture = fixture(
-            IdempotencyDecision::Acquired {
-                lease: lease(),
-                request_id: request_id(77),
-                operation_started_at: original_operation_start(),
-            },
-            [
-                provider_failure(ProviderName::Gemini),
-                provider_failure(ProviderName::ElevenLabs),
-                Ok(audio_artifact()),
-            ],
-            provider_failures_for_stt(),
-        );
-        let request = tts_request().with_provider_order(vec![
-            ProviderName::OpenAi,
-            ProviderName::Gemini,
-            ProviderName::ElevenLabs,
-        ]);
-
-        let response = fixture
-            .service
-            .synthesize(context(request_id(78), "order-override-key"), request)
-            .await
-            .unwrap_or_else(|error| panic!("request should complete: {error}"));
-
-        assert_eq!(response.result.provider, ProviderName::OpenAi);
-        assert!(lock(&fixture.tts[0].request_ids).is_empty());
-        assert!(lock(&fixture.tts[1].request_ids).is_empty());
-        assert_eq!(lock(&fixture.tts[2].request_ids).len(), 1);
-    }
-
-    #[tokio::test]
-    async fn tts_default_failure_never_attempts_another_provider() {
-        let fixture = fixture(
-            IdempotencyDecision::Acquired {
-                lease: lease(),
-                request_id: request_id(77),
-                operation_started_at: original_operation_start(),
-            },
-            [
-                provider_failure(ProviderName::Gemini),
-                Ok(audio_artifact()),
-                Ok(audio_artifact()),
-            ],
-            provider_failures_for_stt(),
-        );
-        let request = TtsRequest::new(
-            SpeechText::new("hello".to_owned()).unwrap_or_else(|_| unreachable!()),
-            None,
-        )
-        .unwrap_or_else(|_| unreachable!());
-        assert!(!request.auto_fallback);
-        let result = fixture
-            .service
-            .synthesize(context(request_id(78), "no-fallback-key"), request)
-            .await;
-        assert!(
-            matches!(result, Err(WaveformError::ProviderFailed { failure }) if failure.provider == ProviderName::Gemini)
-        );
-        assert_eq!(lock(&fixture.tts[0].request_ids).len(), 1);
-        assert!(lock(&fixture.tts[1].request_ids).is_empty());
-        assert!(lock(&fixture.tts[2].request_ids).is_empty());
-        assert!(lock(&fixture.briefcase.store_requests).is_empty());
-        assert_eq!(
-            lock(&fixture.idempotency.releases)[0].failure_code,
-            Some(crate::domain::error::ErrorCode::ProviderFailed)
-        );
-    }
-
-    #[tokio::test]
-    async fn tts_rejects_controls_that_would_be_lost_by_fallback()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = fixture(
-            IdempotencyDecision::Acquired {
-                lease: lease(),
-                request_id: request_id(77),
-                operation_started_at: original_operation_start(),
-            },
-            [
-                Ok(audio_artifact()),
-                Ok(audio_artifact()),
-                Ok(audio_artifact()),
-            ],
-            provider_failures_for_stt(),
-        );
-        let mut request = tts_request();
-        request.provider_options =
-            serde_json::from_value(serde_json::json!({"gemini":{"scene":"Quiet room"}}))?;
-        assert!(matches!(
-            fixture
-                .service
-                .synthesize(context(request_id(78), "controls-fallback"), request)
-                .await,
-            Err(WaveformError::InvalidProviderOptions(_))
-        ));
-        assert!(
-            fixture
-                .tts
-                .iter()
-                .all(|provider| lock(&provider.request_ids).is_empty())
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reclaimed_tts_uses_the_original_request_id_for_every_side_effect() {
-        let candidate_id = request_id(100);
-        let canonical_id = request_id(7);
-        let fixture = fixture(
-            IdempotencyDecision::Acquired {
-                lease: lease(),
-                request_id: canonical_id,
-                operation_started_at: original_operation_start(),
-            },
-            [
-                provider_failure(ProviderName::Gemini),
-                Ok(audio_artifact()),
-                provider_failure(ProviderName::OpenAi),
-            ],
-            [
-                provider_failure(ProviderName::Gemini),
-                provider_failure(ProviderName::OpenAi),
-                provider_failure(ProviderName::Deepgram),
-            ],
-        );
-
-        let result = fixture
-            .service
-            .synthesize(context(candidate_id, "reclaim-key"), tts_request())
-            .await;
-
-        assert!(matches!(
-            &result,
-            Ok(response) if response.result.request_id == canonical_id && !response.replayed
-        ));
-        assert_eq!(&*lock(&fixture.tts[0].request_ids), &[canonical_id]);
-        assert_eq!(&*lock(&fixture.tts[1].request_ids), &[canonical_id]);
-        assert!(lock(&fixture.tts[2].request_ids).is_empty());
-        let stores = lock(&fixture.briefcase.store_requests);
-        assert!(matches!(
-            stores.as_slice(),
-            [(request_id, filename, key)]
-                if *request_id == canonical_id
-                    && filename.starts_with("tts_20260830_010203_")
-                    && filename.contains(&canonical_id.to_string())
-                    && key == &format!("waveform:briefcase:tts:{canonical_id}")
-        ));
-        assert!(lock(&fixture.idempotency.releases).is_empty());
-        assert!(matches!(
-            lock(&fixture.idempotency.completions).as_slice(),
-            [completion]
-                if matches!(
-                    &completion.response,
-                    CompletedSpeechOperation::Tts(result) if result.request_id == canonical_id
-                )
-        ));
-    }
-
-    #[tokio::test]
-    async fn configured_text_limit_rejects_before_authorization_and_claim() {
-        let mut fixture = fixture(
-            IdempotencyDecision::InProgress {
-                retry_after: Duration::from_secs(2),
-            },
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-        fixture.service.policy.max_text_chars = 3;
-
-        let result = fixture
-            .service
-            .synthesize(context(request_id(8), "text-limit"), tts_request())
-            .await;
-
-        assert_eq!(result, Err(WaveformError::PayloadTooLarge));
-        assert_eq!(*lock(&fixture.iam.authorize_count), 0);
-        assert!(lock(&fixture.idempotency.claims).is_empty());
-    }
-
-    #[tokio::test]
-    async fn tts_replay_reauthorizes_the_file_and_returns_the_permanent_url() {
-        let completed = replayed_tts_result(request_id(11));
-        let expected = crate::domain::speech::TtsResult::new(
-            completed.request_id,
-            StoredAudio {
-                permanent_url: completed.permanent_url.clone(),
-                temporary_url: None,
-            },
-            completed.provider,
-            completed.duration,
-        );
-        let fixture = fixture(
-            IdempotencyDecision::Replay(CompletedSpeechOperation::Tts(completed.clone())),
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-        let attempt_request_id = request_id(99);
-
-        let result = fixture
-            .service
-            .synthesize(context(attempt_request_id, "replay-key"), tts_request())
-            .await;
-
-        assert_eq!(result, Ok(ServiceResponse::replayed(expected)));
-        assert_eq!(*lock(&fixture.iam.authorize_count), 1);
-        assert!(lock(&fixture.iam.delegated_request_ids).is_empty());
-        assert_eq!(
-            &*lock(&fixture.briefcase.verified_accesses),
-            &[(attempt_request_id, completed.permanent_url.to_string())]
-        );
-        assert!(lock(&fixture.briefcase.temporary_url_requests).is_empty());
-        assert!(lock(&fixture.briefcase.store_requests).is_empty());
-        assert!(
-            fixture
-                .tts
-                .iter()
-                .all(|provider| lock(&provider.request_ids).is_empty())
-        );
-        assert!(lock(&fixture.idempotency.completions).is_empty());
-        assert!(lock(&fixture.idempotency.releases).is_empty());
-    }
-
-    #[tokio::test]
-    async fn tts_replay_denial_never_reruns_a_provider_or_changes_the_record() {
-        let completed = replayed_tts_result(request_id(12));
-        let fixture = fixture(
-            IdempotencyDecision::Replay(CompletedSpeechOperation::Tts(completed)),
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-        *lock(&fixture.briefcase.access_result) = Err(BriefcaseError::Forbidden);
-
-        let result = fixture
-            .service
-            .synthesize(context(request_id(98), "replay-denied"), tts_request())
-            .await;
-
-        assert_eq!(result, Err(WaveformError::Forbidden));
-        assert!(
-            fixture
-                .tts
-                .iter()
-                .all(|provider| lock(&provider.request_ids).is_empty())
-        );
-        assert!(lock(&fixture.briefcase.store_requests).is_empty());
-        assert!(lock(&fixture.idempotency.completions).is_empty());
-        assert!(lock(&fixture.idempotency.releases).is_empty());
-    }
-
-    #[tokio::test]
-    async fn stt_replay_verifies_current_source_access_without_downloading_media() {
-        let replayed = replayed_stt_result(request_id(13));
-        let fixture = fixture(
-            IdempotencyDecision::Replay(CompletedSpeechOperation::Stt(replayed.clone())),
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-        let attempt_request_id = request_id(97);
-
-        let result = fixture
-            .service
-            .transcribe(context(attempt_request_id, "stt-replay"), stt_request())
-            .await;
-
-        assert_eq!(result, Ok(ServiceResponse::replayed(replayed)));
-        assert_eq!(
-            &*lock(&fixture.briefcase.verified_accesses),
-            &[(attempt_request_id, briefcase_file_url().to_string())]
-        );
-        assert!(lock(&fixture.briefcase.read_request_ids).is_empty());
-        assert!(
-            fixture
-                .stt
-                .iter()
-                .all(|provider| lock(&provider.request_ids).is_empty())
-        );
-        assert!(lock(&fixture.idempotency.completions).is_empty());
-        assert!(lock(&fixture.idempotency.releases).is_empty());
-    }
-
-    #[tokio::test]
-    async fn stt_replay_denial_never_exposes_the_cached_transcript() {
-        let fixture = fixture(
-            IdempotencyDecision::Replay(CompletedSpeechOperation::Stt(replayed_stt_result(
-                request_id(14),
-            ))),
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-        *lock(&fixture.briefcase.access_result) = Err(BriefcaseError::NotFound);
-
-        let result = fixture
-            .service
-            .transcribe(context(request_id(96), "stt-denied"), stt_request())
-            .await;
-
-        assert_eq!(result, Err(WaveformError::SourceNotFound));
-        assert!(lock(&fixture.briefcase.read_request_ids).is_empty());
-        assert!(
-            fixture
-                .stt
-                .iter()
-                .all(|provider| lock(&provider.request_ids).is_empty())
-        );
-        assert!(lock(&fixture.idempotency.completions).is_empty());
-        assert!(lock(&fixture.idempotency.releases).is_empty());
-    }
-
-    #[tokio::test]
-    async fn exhausted_stt_chain_releases_the_owned_lease() {
-        let canonical_id = request_id(21);
-        let fixture = fixture(
-            IdempotencyDecision::Acquired {
-                lease: lease(),
-                request_id: canonical_id,
-                operation_started_at: original_operation_start(),
-            },
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-
-        let result = fixture
-            .service
-            .transcribe(context(request_id(22), "failure-key"), stt_request())
-            .await;
-
-        assert_eq!(result, Err(WaveformError::ProvidersExhausted));
-        assert_eq!(&*lock(&fixture.briefcase.read_request_ids), &[canonical_id]);
-        assert!(
-            fixture
-                .stt
-                .iter()
-                .all(|provider| lock(&provider.request_ids).as_slice() == [canonical_id])
-        );
-        assert_eq!(lock(&fixture.idempotency.releases).len(), 1);
-        assert!(lock(&fixture.idempotency.completions).is_empty());
-    }
-
-    #[tokio::test]
-    async fn in_progress_duplicate_never_releases_someone_elses_lease() {
-        let fixture = fixture(
-            IdempotencyDecision::InProgress {
-                retry_after: Duration::from_secs(2),
-            },
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-
-        let result = fixture
-            .service
-            .synthesize(context(request_id(31), "progress-key"), tts_request())
-            .await;
-
-        assert_eq!(
-            result,
-            Err(WaveformError::RequestInProgress {
-                retry_after: Duration::from_secs(2)
-            })
-        );
-        assert!(lock(&fixture.idempotency.releases).is_empty());
-        assert!(
-            fixture
-                .tts
-                .iter()
-                .all(|provider| lock(&provider.request_ids).is_empty())
-        );
-    }
-
-    #[tokio::test]
-    async fn reused_key_never_touches_briefcase_or_a_speech_provider() {
-        let fixture = fixture(
-            IdempotencyDecision::KeyReused,
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-
-        let result = fixture
-            .service
-            .synthesize(context(request_id(32), "reused-key"), tts_request())
-            .await;
-
-        assert_eq!(result, Err(WaveformError::IdempotencyKeyReused));
-        assert_eq!(*lock(&fixture.iam.authorize_count), 1);
-        assert!(lock(&fixture.iam.delegated_request_ids).is_empty());
-        assert!(lock(&fixture.briefcase.temporary_url_requests).is_empty());
-        assert!(lock(&fixture.briefcase.store_requests).is_empty());
-        assert!(
-            fixture
-                .tts
-                .iter()
-                .all(|provider| lock(&provider.request_ids).is_empty())
-        );
-        assert!(lock(&fixture.idempotency.completions).is_empty());
-        assert!(lock(&fixture.idempotency.releases).is_empty());
-    }
-
-    #[tokio::test]
-    async fn bearer_and_obo_for_the_same_actor_share_idempotency_scope() {
-        let fixture = fixture(
-            IdempotencyDecision::InProgress {
-                retry_after: Duration::from_secs(2),
-            },
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-        lock(&fixture.idempotency.decisions).push_back(Ok(IdempotencyDecision::InProgress {
-            retry_after: Duration::from_secs(2),
-        }));
-
-        let bearer_result = fixture
-            .service
-            .synthesize(context(request_id(33), "shared-app-key"), tts_request())
-            .await;
-        let obo_result = fixture
-            .service
-            .synthesize(
-                obo_context(request_id(34), "shared-app-key", "silicon-dm"),
-                tts_request(),
-            )
-            .await;
-
-        assert!(matches!(
-            bearer_result,
-            Err(WaveformError::RequestInProgress { .. })
-        ));
-        assert!(matches!(
-            obo_result,
-            Err(WaveformError::RequestInProgress { .. })
-        ));
-        let claims = lock(&fixture.idempotency.claims);
-        assert_eq!(claims.len(), 2);
-        assert_eq!(claims[0].scope, claims[1].scope);
-        assert!(lock(&fixture.iam.delegated_request_ids).is_empty());
-    }
-
-    #[tokio::test]
-    async fn completion_failure_releases_the_lease_without_masking_the_store_error() {
-        let canonical_id = request_id(41);
-        let fixture = fixture(
-            IdempotencyDecision::Acquired {
-                lease: lease(),
-                request_id: canonical_id,
-                operation_started_at: original_operation_start(),
-            },
-            [
-                Ok(audio_artifact()),
-                provider_failure(ProviderName::ElevenLabs),
-                provider_failure(ProviderName::OpenAi),
-            ],
-            provider_failures_for_stt(),
-        );
-        *lock(&fixture.idempotency.completion_result) = Err(IdempotencyStoreError::Unavailable);
-
-        let result = fixture
-            .service
-            .synthesize(context(request_id(42), "complete-failure"), tts_request())
-            .await;
-
-        assert_eq!(
-            result,
-            Err(WaveformError::DependencyUnavailable {
-                dependency: crate::domain::error::Dependency::IdempotencyStore
-            })
-        );
-        assert_eq!(lock(&fixture.idempotency.completions).len(), 1);
-        assert_eq!(lock(&fixture.idempotency.releases).len(), 1);
-    }
-
-    struct BlockingTts(tokio::sync::Notify);
-
-    #[async_trait]
-    impl TextToSpeechProvider for BlockingTts {
-        fn name(&self) -> ProviderName {
-            ProviderName::Gemini
-        }
-        async fn synthesize(
-            &self,
-            _request: TtsProviderRequest,
-            _id: RequestId,
-        ) -> Result<AudioArtifact, ProviderError> {
-            self.0.notify_one();
-            std::future::pending().await
-        }
-    }
-
-    async fn wait_for_release(store: &FakeIdempotency) {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while lock(&store.releases).is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("interrupted lease must be released"));
-    }
-
-    #[tokio::test]
-    async fn cancelling_inflight_speech_releases_the_current_lease() {
-        let mut fixture = fixture(
-            IdempotencyDecision::Acquired {
-                lease: lease(),
-                request_id: request_id(90),
-                operation_started_at: original_operation_start(),
-            },
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-        let blocker = Arc::new(BlockingTts(tokio::sync::Notify::new()));
-        fixture.service.tts_providers[0] = blocker.clone();
-        let task = tokio::spawn(async move {
-            fixture
-                .service
-                .synthesize(
-                    context(request_id(91), "cancel-current-lease"),
-                    tts_request(),
-                )
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), blocker.0.notified())
-            .await
-            .unwrap_or_else(|_| panic!("provider must start"));
-        task.abort();
-        assert!(task.await.is_err());
-        wait_for_release(&fixture.idempotency).await;
-        let releases = lock(&fixture.idempotency.releases);
-        assert_eq!(releases.len(), 1);
-        assert_eq!(releases[0].lease_id, lease_id());
-        assert!(releases[0].failure_code.is_none());
-        assert!(lock(&fixture.briefcase.store_requests).is_empty());
-    }
-
-    #[tokio::test]
-    async fn missing_storage_consent_prevents_billable_provider_work() {
-        let fixture = fixture(
-            IdempotencyDecision::Acquired {
-                lease: lease(),
-                request_id: request_id(92),
-                operation_started_at: original_operation_start(),
-            },
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-        *lock(&fixture.iam.delegation_error) = Some(IamError::StorageAuthorizationRequired);
-        let result = fixture
-            .service
-            .synthesize(
-                context(request_id(93), "needs-storage-approval"),
-                tts_request(),
-            )
-            .await;
-        assert_eq!(result, Err(WaveformError::StorageAuthorizationRequired));
-        assert!(
-            fixture
-                .tts
-                .iter()
-                .all(|provider| lock(&provider.request_ids).is_empty())
-        );
-        assert!(lock(&fixture.briefcase.store_requests).is_empty());
-    }
-
-    #[tokio::test]
-    async fn history_write_failure_prevents_provider_work() {
-        let fixture = fixture(
-            IdempotencyDecision::Acquired {
-                lease: lease(),
-                request_id: request_id(92),
-                operation_started_at: original_operation_start(),
-            },
-            provider_failures_for_tts(),
-            provider_failures_for_stt(),
-        );
-        *lock(&fixture.idempotency.job_start_result) = Err(IdempotencyStoreError::Unavailable);
-        let result = fixture
-            .service
-            .synthesize(
-                context(request_id(93), "history-write-failed"),
-                tts_request(),
-            )
-            .await;
-        assert_eq!(
-            result,
-            Err(WaveformError::DependencyUnavailable {
-                dependency: crate::domain::error::Dependency::IdempotencyStore
-            })
-        );
-        wait_for_release(&fixture.idempotency).await;
-        assert!(fixture.tts.iter().all(|p| lock(&p.request_ids).is_empty()));
-        assert!(lock(&fixture.briefcase.store_requests).is_empty());
-    }
-
-    struct PersonalKeys;
-
-    #[async_trait]
-    impl crate::application::ports::ProviderKeyStore for PersonalKeys {
-        async fn load(
-            &self,
-            plane: uuid::Uuid,
-            actor: &AuthorizedActor,
-        ) -> Result<
-            crate::application::ports::ProviderKeys,
-            crate::application::ports::ProviderKeyStoreError,
-        > {
-            assert!(plane.is_nil());
-            assert_eq!(actor.actor.id, actor_id(1));
-            Ok(std::collections::HashMap::from([(
-                ProviderName::OpenAi,
-                secrecy::SecretString::from("personal-key".to_owned()),
-            )]))
-        }
-    }
-
-    #[tokio::test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "exercises saved and request credentials across both speech operations and shared-adapter isolation"
-    )]
-    async fn personal_keys_reach_tts_and_stt_without_changing_shared_providers()
-    -> Result<(), Box<dyn std::error::Error>> {
-        use crate::infrastructure::providers::{
-            OPENAI_STT_MODEL, OPENAI_TTS_MODEL, OpenAiConfig, OpenAiProvider, ProviderHttpConfig,
-        };
-        use wiremock::{
-            Mock, MockServer, ResponseTemplate,
-            matchers::{method, path},
-        };
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/audio/speech"))
-            .and(wiremock::matchers::header_exists("authorization"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "audio/mpeg")
-                    .set_body_bytes(include_bytes!("../infrastructure/test-fixture.mp3").to_vec()),
-            )
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/audio/transcriptions"))
-            .and(wiremock::matchers::header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"text":"personal transcription","usage":{"seconds":1.0}}),
-            ))
-            .expect(2)
-            .mount(&server)
-            .await;
-        let adapter = Arc::new(OpenAiProvider::new(
-            reqwest::Client::new(),
-            secrecy::SecretString::from(String::new()),
-            OpenAiConfig {
-                tts_http: ProviderHttpConfig::new(server.uri().parse()?),
-                stt_http: ProviderHttpConfig::new(server.uri().parse()?),
-                tts_model: OPENAI_TTS_MODEL.to_owned(),
-                stt_model: OPENAI_STT_MODEL.to_owned(),
-                voice: "alloy".to_owned(),
-            },
-        ));
-        for (operation, request_override) in
-            [("tts", false), ("stt", false), ("tts", true), ("stt", true)]
-        {
-            let mut fixture = fixture(
-                IdempotencyDecision::Acquired {
-                    lease: lease(),
-                    request_id: request_id(77),
-                    operation_started_at: original_operation_start(),
-                },
-                provider_failures_for_tts(),
-                provider_failures_for_stt(),
-            );
-            fixture.service.tts_providers[2] = adapter.clone();
-            fixture.service.stt_providers[1] = adapter.clone();
-            let service = fixture.service.with_provider_keys(Arc::new(PersonalKeys));
-            let mut tts = tts_request().with_provider_order(vec![ProviderName::OpenAi]);
-            tts.auto_fallback = false;
-            let mut stt = stt_request();
-            if request_override {
-                let keys = serde_json::from_value::<crate::domain::provider_keys::ProviderApiKeys>(
-                    serde_json::json!({"openai":"request-only-key"}),
-                )?;
-                tts.provider_keys = keys.clone();
-                stt.provider_keys = keys;
-            }
-            if operation == "tts" {
-                assert_eq!(
-                    service
-                        .synthesize(context(request_id(78), "personal-tts"), tts)
-                        .await?
-                        .result
-                        .provider,
-                    ProviderName::OpenAi
-                );
-            } else {
-                assert_eq!(
-                    service
-                        .transcribe(context(request_id(79), "personal-stt"), stt)
-                        .await?
-                        .result
-                        .transcript
-                        .as_str(),
-                    "personal transcription"
-                );
-            }
-        }
-        // The shared deployment adapter still has no key and makes no network request.
-        assert!(
-            adapter
-                .synthesize(
-                    TtsProviderRequest::for_provider(&tts_request(), ProviderName::OpenAi),
-                    request_id(80)
-                )
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            server
-                .received_requests()
-                .await
-                .ok_or("requests unavailable")?
-                .len(),
-            4
-        );
-        let received = server
-            .received_requests()
-            .await
-            .ok_or("requests unavailable")?;
-        for (index, request) in received.iter().enumerate() {
-            assert_eq!(
-                request
-                    .headers
-                    .get("authorization")
-                    .ok_or("missing auth")?
-                    .to_str()?,
-                if index < 2 {
-                    "Bearer personal-key"
-                } else {
-                    "Bearer request-only-key"
-                }
-            );
-        }
-        Ok(())
-    }
-
-    fn fixture(
-        decision: IdempotencyDecision,
-        tts_results: [Result<AudioArtifact, ProviderError>; 3],
-        stt_results: [Result<SttProviderResult, ProviderError>; 3],
-    ) -> Fixture {
-        let authorized = AuthorizedActor {
-            actor: Actor::new(ActorKind::Carbon, actor_id(1)),
-            organization_id: organization_id(),
-            originating_application: None,
-            expires_at: None,
-        };
-        let iam = Arc::new(FakeIam {
-            authorized,
-            authorize_count: Mutex::new(0),
-            delegated_request_ids: Mutex::new(Vec::new()),
-            delegation_error: Mutex::new(None),
-        });
-        let idempotency = Arc::new(FakeIdempotency {
-            decisions: Mutex::new(VecDeque::from([Ok(decision)])),
-            claims: Mutex::new(Vec::new()),
-            completions: Mutex::new(Vec::new()),
-            completion_result: Mutex::new(Ok(())),
-            job_start_result: Mutex::new(Ok(())),
-            releases: Mutex::new(Vec::new()),
-        });
-        let briefcase = Arc::new(FakeBriefcase {
-            source: Ok(source_media()),
-            stored: Ok(stored_audio()),
-            access_result: Mutex::new(Ok(())),
-            temporary_url_result: Mutex::new(Ok(fresh_temporary_url())),
-            verified_accesses: Mutex::new(Vec::new()),
-            temporary_url_requests: Mutex::new(Vec::new()),
-            read_request_ids: Mutex::new(Vec::new()),
-            store_requests: Mutex::new(Vec::new()),
-        });
-        let normalizer = Arc::new(FakeNormalizer {
-            result: Ok(normalized_audio()),
-        });
-        let tts_names = [
-            ProviderName::Gemini,
-            ProviderName::ElevenLabs,
-            ProviderName::OpenAi,
-        ];
-        let tts = tts_names
-            .into_iter()
-            .zip(tts_results)
-            .map(|(name, result)| {
-                Arc::new(FakeTtsProvider {
-                    requests: Mutex::new(Vec::new()),
-                    name,
-                    result,
-                    request_ids: Mutex::new(Vec::new()),
-                })
-            })
-            .collect::<Vec<_>>();
-        let stt_names = [
-            ProviderName::Gemini,
-            ProviderName::OpenAi,
-            ProviderName::Deepgram,
-        ];
-        let stt = stt_names
-            .into_iter()
-            .zip(stt_results)
-            .map(|(name, result)| {
-                Arc::new(FakeSttProvider {
-                    name,
-                    result,
-                    request_ids: Mutex::new(Vec::new()),
-                })
-            })
-            .collect::<Vec<_>>();
-        let tts_ports = tts
-            .iter()
-            .cloned()
-            .map(|provider| provider as Arc<dyn TextToSpeechProvider>)
-            .collect();
-        let stt_ports = stt
-            .iter()
-            .cloned()
-            .map(|provider| provider as Arc<dyn SpeechToTextProvider>)
-            .collect();
-        let service = WaveformService::new(
-            iam.clone(),
-            briefcase.clone(),
-            idempotency.clone(),
-            normalizer,
-            Arc::new(FakeLeaseIds {
-                lease_id: lease_id(),
-            }),
-            tts_ports,
-            stt_ports,
-            policy(),
-        )
-        .unwrap_or_else(|error| panic!("valid fixture: {error}"));
-
-        Fixture {
-            service,
-            iam,
-            idempotency,
-            briefcase,
-            tts,
-            stt,
-        }
-    }
-
-    fn provider_failures_for_tts() -> [Result<AudioArtifact, ProviderError>; 3] {
-        [
-            provider_failure(ProviderName::Gemini),
-            provider_failure(ProviderName::ElevenLabs),
-            provider_failure(ProviderName::OpenAi),
-        ]
-    }
-
-    fn original_operation_start() -> time::OffsetDateTime {
-        datetime!(2026-08-30 01:02:03 UTC)
-    }
-
-    fn provider_failures_for_stt() -> [Result<SttProviderResult, ProviderError>; 3] {
-        [
-            provider_failure(ProviderName::Gemini),
-            provider_failure(ProviderName::OpenAi),
-            provider_failure(ProviderName::Deepgram),
-        ]
-    }
-
-    fn provider_failure<T>(provider: ProviderName) -> Result<T, ProviderError> {
-        Err(ProviderError::new(
-            provider,
-            ProviderFailureKind::Unavailable,
-        ))
-    }
-
-    fn context(request_id: RequestId, key: &str) -> SpeechRequestContext {
-        SpeechRequestContext {
-            request_id,
-            plane_id: Uuid::nil(),
-            organization_id: organization_id(),
-            credentials: InboundCredentials::Bearer(
-                AccessToken::new("opaque-token".to_owned())
-                    .unwrap_or_else(|error| panic!("valid token: {error}")),
-            ),
-            idempotency_key: IdempotencyKey::from_str(key)
-                .unwrap_or_else(|error| panic!("valid idempotency key: {error}")),
-        }
-    }
-
-    fn obo_context(request_id: RequestId, key: &str, app_id: &str) -> SpeechRequestContext {
-        SpeechRequestContext {
-            request_id,
-            plane_id: Uuid::nil(),
-            organization_id: organization_id(),
-            credentials: InboundCredentials::OnBehalfOf(OboCredentials {
-                application_id: application_id(app_id),
-                proof: secret_proof(),
-            }),
-            idempotency_key: IdempotencyKey::from_str(key)
-                .unwrap_or_else(|error| panic!("valid idempotency key: {error}")),
-        }
-    }
-
-    fn tts_request() -> TtsRequest {
-        let text = SpeechText::new("hello world".to_owned())
-            .unwrap_or_else(|error| panic!("valid text: {error}"));
-        let mut request =
-            TtsRequest::new(text, None).unwrap_or_else(|error| panic!("valid request: {error}"));
-        // Existing fallback regression scenarios explicitly opt in.
-        request.auto_fallback = true;
-        request
-    }
-
-    fn stt_request() -> SttRequest {
-        SttRequest::new(briefcase_file_url(), None)
-            .unwrap_or_else(|error| panic!("valid request: {error}"))
-    }
-
-    fn replayed_tts_result(request_id: RequestId) -> CompletedTtsOperation {
-        CompletedTtsOperation {
-            voice_profile: None,
-            request_id,
-            permanent_url: briefcase_file_url(),
-            provider: ProviderName::Gemini,
-            duration: MediaDuration::from_millis(125),
-        }
-    }
-
-    fn replayed_stt_result(request_id: RequestId) -> SttResult {
-        SttResult {
-            request_id,
-            transcript: Transcript::new("authorized replay".to_owned())
-                .unwrap_or_else(|error| panic!("valid transcript: {error}")),
-            detected_language: None,
-            provider: ProviderName::Gemini,
-            duration: Some(MediaDuration::from_millis(125)),
-        }
-    }
-
-    fn audio_artifact() -> AudioArtifact {
-        AudioArtifact::new(
-            ProviderAudioFormat::Mp3,
-            Bytes::from_static(b"provider-audio"),
-        )
-        .unwrap_or_else(|error| panic!("valid artifact: {error}"))
-    }
-
-    fn normalized_audio() -> NormalizedAudio {
-        NormalizedAudio::new(
-            Bytes::from_static(b"normalized-mp3"),
-            MediaDuration::from_millis(125),
-        )
-        .unwrap_or_else(|error| panic!("valid normalized audio: {error}"))
-    }
-
-    fn source_media() -> SourceMedia {
-        SourceMedia::new(
-            SourceMediaType::Mpeg,
-            Bytes::from_static(b"source-media"),
-            MediaSizeLimit::default(),
-        )
-        .unwrap_or_else(|error| panic!("valid source media: {error}"))
-    }
-
-    fn stored_audio() -> StoredAudio {
-        StoredAudio {
-            permanent_url: briefcase_file_url(),
-            temporary_url: Some(
-                TemporaryMediaUrl::new(
-                    Url::parse("https://cdn.briefcase.test/audio.mp3?signature=opaque")
-                        .unwrap_or_else(|error| panic!("valid URL: {error}")),
-                )
-                .unwrap_or_else(|error| panic!("valid temporary URL: {error}")),
-            ),
-        }
-    }
-
-    fn fresh_temporary_url() -> TemporaryMediaUrl {
-        TemporaryMediaUrl::new(
-            Url::parse("https://cdn.briefcase.test/audio.mp3?signature=fresh")
-                .unwrap_or_else(|error| panic!("valid URL: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("valid temporary URL: {error}"))
-    }
-
-    fn policy() -> ServicePolicy {
-        ServicePolicy::new(
-            Duration::from_secs(30),
-            MediaSizeLimit::default(),
-            BriefcaseOrigin::new(
-                Url::parse("https://briefcase.test")
-                    .unwrap_or_else(|error| panic!("valid URL: {error}")),
-            )
-            .unwrap_or_else(|error| panic!("valid origin: {error}")),
-            MAX_TTS_TEXT_CHARACTERS,
-            RequestDigestKey::new(b"application-service-test-digest-key")
-                .unwrap_or_else(|error| panic!("valid digest key: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("valid policy: {error}"))
-    }
-
-    fn briefcase_file_url() -> BriefcaseFileUrl {
-        BriefcaseFileUrl::new(
-            Url::parse("https://briefcase.test/files/source")
-                .unwrap_or_else(|error| panic!("valid URL: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("valid Briefcase URL: {error}"))
-    }
-
-    fn organization_id() -> OrganizationId {
-        OrganizationId::from_str("tos").unwrap_or_else(|error| panic!("valid org: {error}"))
-    }
-
-    fn application_id(value: &str) -> ApplicationId {
-        ApplicationId::from_str(value).unwrap_or_else(|error| panic!("valid app: {error}"))
-    }
-
-    fn actor_id(value: u128) -> ActorId {
-        ActorId::new(Uuid::from_u128(value))
-            .unwrap_or_else(|error| panic!("valid actor ID: {error}"))
-    }
-
-    fn request_id(value: u128) -> RequestId {
-        RequestId::new(Uuid::from_u128(value))
-            .unwrap_or_else(|error| panic!("valid request ID: {error}"))
-    }
-
-    fn lease_id() -> IdempotencyLeaseId {
-        IdempotencyLeaseId::new(Uuid::from_u128(900))
-            .unwrap_or_else(|error| panic!("valid lease ID: {error}"))
-    }
-
-    fn lease() -> IdempotencyLease {
-        IdempotencyLease {
-            id: lease_id(),
-            expires_at: datetime!(2026-08-31 07:05:26 UTC),
-        }
-    }
-
-    fn secret_proof() -> OboProof {
-        OboProof::new("delegated-proof".to_owned())
-            .unwrap_or_else(|error| panic!("valid proof: {error}"))
-    }
-
-    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-        mutex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
+#[path = "service_tests.rs"]
+mod tests;

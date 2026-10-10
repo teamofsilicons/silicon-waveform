@@ -37,10 +37,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Check bundled documentation
         run: python3 scripts/sync-cli-docs.py --check
-      - name: Check Honeycomb build manifests
-        run: python3 scripts/sync-honeycomb.py --check
-      - name: Check IAM 5 catalog contract
-        run: python3 scripts/check-iam5-catalog.py
+      - name: Check the packaging, deployment and development tooling
+        run: |
+          python3 scripts/test_package_apps.py
+          python3 scripts/test_dev_tools.py
+          python3 scripts/test_uuid_backfill.py
+          python3 deploy/native/test_upgrade.py
+          python3 deploy/native/test_accounts_cutover.py
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
@@ -49,7 +52,6 @@ jobs:
         run: cargo test --all-targets --all-features
       - name: Run PostgreSQL transaction tests
         run: |
-          cargo build --manifest-path cli/Cargo.toml --locked
           cargo test --lib -- --ignored --test-threads=1
           cargo test --test postgres_idempotency -- --ignored --test-threads=1
       - name: Check Rust client and CLI
@@ -63,18 +65,45 @@ jobs:
       - name: Enforce dependency policy
         uses: EmbarkStudios/cargo-deny-action@v2
 
+  silicon-apps-package:
+    # The release workflow packs every target; this packs the static Linux CLI on each change so a broken manifest,
+    # packer or discovery command fails here first.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain and the static Linux target
+        run: |
+          rustup show
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install --yes musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+          key: silicon-apps-package
+      - name: Build the static CLI
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --locked --manifest-path cli/Cargo.toml --target x86_64-unknown-linux-musl
+      - name: Install the Silicon Apps packer
+        run: cargo install --locked silicon-apps-cli --version 0.2.0
+      - name: Package and validate for linux-x86_64
+        env:
+          PACKAGE_DISCOVERY: require
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("cli/Cargo.toml", "rb"))["package"]["version"])')
+          scripts/package-apps.sh "$version" linux-x86_64 cli/target/x86_64-unknown-linux-musl/debug/waveform
+
   container:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build production image
         run: docker build --tag si:silicon-waveform .
-      - name: Verify API image manifest
-        run: docker run --rm --entrypoint cat si:silicon-waveform /usr/share/waveform/honeycomb.yaml | cmp honeycomb.yaml -
+      - name: Verify API image runs
+        run: docker run --rm si:silicon-waveform --help
       - name: Build frontend image
-        run: docker build --tag si:silicon-waveform-frontend frontend
-      - name: Verify frontend image manifest
-        run: docker run --rm --entrypoint cat si:silicon-waveform-frontend /usr/share/waveform/honeycomb.yaml | cmp honeycomb.yaml -
+        run: docker build --tag si:silicon-waveform-frontend web
 
   web-builds:
     runs-on: ubuntu-latest
@@ -83,14 +112,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - run: python3 scripts/sync-honeycomb.py --check
       - name: Build and check frontend
-        working-directory: frontend
+        working-directory: web
         run: |
-          npm ci
-          npm test
-          npm run build
-          cmp ../honeycomb.yaml dist/honeycomb.yaml
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm lint
+          pnpm test
+          NEXT_OUTPUT=standalone pnpm build
       - name: Build and check docs
         working-directory: docs-site
         run: |
@@ -100,7 +130,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: waveform-frontend
-          path: frontend/dist/
+          path: web/.next/standalone/
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:

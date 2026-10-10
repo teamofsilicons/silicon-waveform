@@ -1,25 +1,26 @@
 [package]
 name="silicon-waveform-client"
-version="0.5.1"
+version="0.6.0"
 edition="2024"
 rust-version="1.98"
-description="Stateless Rust client for Silicon Waveform speech services"
+description="Stateless Rust client for Silicon Waveform speech services, signed in with Silicon Accounts"
 repository="https://github.com/teamofsilicons/silicon-waveform"
 documentation="https://docs.rs/silicon-waveform-client"
 license-file="LICENSE"
 readme="README.md"
+keywords=["speech", "tts", "stt", "silicon", "waveform"]
+categories=["api-bindings", "multimedia::audio"]
 [dependencies]
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
-reqwest={version="0.13.4",default-features=false,features=["json","rustls"]}
+reqwest={version="0.13.4",default-features=false,features=["json","rustls","form"]}
 serde={version="1.0",features=["derive"]}
 serde_json="1.0"
 thiserror="2.0"
 url="2.5"
-semver="1.0"
-silicon-iam-client = { version = "5.0.0", path = "../vendor/silicon-iam-client" }
 secrecy="0.10"
+silicon-accounts-client = "0.4.0"
 uuid={version="1",features=["v4"]}
-tokio={version="1.53",features=["process","time"]}
+tokio={version="1.53",features=["time"]}
 [target.'cfg(unix)'.dependencies]
 space-station = "0.1.1"
 [dev-dependencies]

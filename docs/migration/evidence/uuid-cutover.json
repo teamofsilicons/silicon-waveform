@@ -1,0 +1,34 @@
+{
+  "scope": "isolated local shared Accounts migration; no production change",
+  "mapping_rows": 211,
+  "mapping_sha256": "750423f3117e11f5eb42025b457ff0f1bf42bd463c31b7e106d9cd10978ca4d9",
+  "migration": {
+    "dry_run_apply_replay": "passed"
+  },
+  "runtime_verification": {
+    "passed": true,
+    "old_subject_rejected": true,
+    "existing_jobs_retained": 3,
+    "explicit_reauthorization_required": true,
+    "actual_briefcase_tts_stt_roundtrip": true
+  },
+  "source_fixture_note": "Waveform current namespace retained; unrelated older MCPort and Apps fixtures preserved separately without rekeying",
+  "integrity": {
+    "waveform_actor_keys": 0,
+    "waveform_jobs": 51,
+    "waveform_held_audio": 12,
+    "waveform_provider_keys": 4,
+    "waveform_storage_authorizations": 0,
+    "waveform_storage_grants": 0,
+    "waveform_idempotency_records": 51,
+    "waveform_account_preferences": 13,
+    "account_storage_key_links_preserved": 13,
+    "migrated_proofs_explicitly_invalidated": 11
+  },
+  "source_cache_provenance_audit": {
+    "total": 13,
+    "matching_current_handle": 13
+  },
+  "native_candidate_build_profile": "unoptimized development profile; debug information disabled",
+  "task_owned_development_processes": "stopped after final state backup"
+}

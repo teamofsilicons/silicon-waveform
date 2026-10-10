@@ -1,6 +1,12 @@
 [advisories]
 unmaintained = "workspace"
 yanked = "deny"
+# Accounts client 0.4.0 enables jsonwebtoken's RustCrypto backend, which includes
+# rsa 0.9.10. This application has no RSA private-key operations: Accounts JWT
+# validation permits EdDSA only and Silicon assertions use ed25519-dalek.
+# The advisory concerns private RSA signing/decryption timing. Re-audit whenever
+# Accounts client/JWT algorithms change; see docs/security-advisories.md.
+ignore = ["RUSTSEC-2023-0071"]
 
 [bans]
 multiple-versions = "warn"

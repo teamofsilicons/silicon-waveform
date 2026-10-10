@@ -1,912 +1,373 @@
-//! Exercise the public CLI grammar, filesystem selection and online status.
-use serde_json::{Value, json};
-use std::{
-    fs,
-    path::PathBuf,
-    process::{Command, Output},
-};
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{body_json, header, method, path},
-};
+//! The command tree, the three discovery commands Silicon Apps runs on every package, the
+//! retired flags, and where state lives.
+mod common;
 
-struct Home(PathBuf);
-impl Home {
-    fn new() -> Self {
-        let root =
-            std::env::temp_dir().join(format!("waveform-discovery-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        Self(root)
-    }
-    async fn run(&self, url: &str, args: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_waveform"));
-        command
-            .env("SILICON_HOME", &self.0)
-            .env("WAVEFORM_AUTO_UPDATE", "false")
-            .env_remove("WAVEFORM_TEST")
-            .env_remove("WAVEFORM_PROFILE")
-            .env_remove("SILICON_ORG")
-            .args(["--url", url])
-            .args(args);
-        tokio::task::spawn_blocking(move || command.output().unwrap())
-            .await
-            .unwrap()
-    }
-}
-impl Drop for Home {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-fn output_json(output: Output) -> Value {
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("stdout contains exactly one JSON document")
-}
-fn authority(kind: &str) -> Value {
-    json!({"actor_type":kind,"public_id":if kind == "silicon" {"si:agent"} else {"c:12345678"},"organization_id":"00000000-0000-0000-0000-000000000002",
-        "org_id":"tos","membership_id":"c:12345678[tos]",
-        "membership_version":1,"authorization_epoch":1,"audience":"waveform",
-        "testing_environment_id":null,"scopes":[],"org_role":"member","tags":[]})
-}
-async fn login(home: &Home, server: &MockServer, selection: &[&str]) {
-    login_kind(home, server, selection, "carbon").await;
-}
-async fn login_kind(home: &Home, server: &MockServer, selection: &[&str], kind: &str) {
-    let mut status = authority(kind);
-    if selection.contains(&"--test") {
-        status["testing_environment_id"] = json!("00000000-0000-0000-0000-000000000004");
-    }
-    Mock::given(method("GET"))
-        .and(path("/api/v1/auth/me"))
-        .and(header("authorization", "Bearer oat_private"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(status))
-        .up_to_n_times(1)
-        .expect(1)
-        .mount(server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/auth/login"))
-        .and(body_json(json!({"slt":"oac_fixture"})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token":"oat_private","refresh_token":"ort_private","token_type":"Bearer",
-            "expires_in":1800,"scope":"","org_id":"tos","actor":{"type":kind,"public_id":if kind == "silicon" {"si:agent"} else {"c:12345678"}}
-        })))
-        .expect(1)
-        .mount(server)
-        .await;
-    let args: Vec<_> = selection
-        .iter()
-        .copied()
-        .chain(["login", "oac_fixture", "--json"])
-        .collect();
-    output_json(home.run(&server.uri(), &args).await);
-}
+use common::{Home, Stubs, json_any, json_out, text};
+use serde_json::json;
+use std::fs;
+
+const COMMANDS: [&str; 20] = [
+    "login",
+    "logout",
+    "accounts",
+    "refresh",
+    "me",
+    "silicons",
+    "tts",
+    "stt",
+    "stt-folder",
+    "audio",
+    "jobs",
+    "preferences",
+    "voice-profiles",
+    "provider-keys",
+    "storage",
+    "telemetry",
+    "report",
+    "capabilities",
+    "contracts",
+    "docs",
+];
+
+/// Words a Carbon or Silicon must never read in help (D9).
+const BANNED: [&str; 9] = [
+    "organization",
+    "--org",
+    "IAM",
+    "Honeycomb",
+    "human",
+    "AI agent",
+    "user account",
+    "Team",
+    "test-env",
+];
 
 #[tokio::test]
-async fn help_is_complete_and_login_status_is_a_subcommand() {
+async fn help_is_a_complete_tree_and_every_branch_explains_itself() {
     let home = Home::new();
-    for flag in ["-h", "--help"] {
-        let result = home.run("http://127.0.0.1:1", &[flag]).await;
-        assert!(result.status.success());
-        let help = String::from_utf8(result.stdout).unwrap();
-        assert!(help.contains("iam"));
-        assert!(help.contains("test-env"));
-        if flag == "--help" {
-            assert!(help.contains("SILICON_HOME"));
-        }
-    }
-    let result = home.run("http://127.0.0.1:1", &["login", "--help"]).await;
-    assert!(String::from_utf8(result.stdout).unwrap().contains("status"));
-    let result = home
-        .run(
-            "http://127.0.0.1:1",
-            &["login", "status", "--slt", "oac_fixture"],
-        )
-        .await;
-    assert!(!result.status.success());
-}
-
-#[tokio::test]
-async fn discovery_is_public_and_preserves_test_selection() {
-    let home = Home::new();
-    let server = MockServer::start().await;
-    Mock::given(path("/api/v1/testing-environment"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"id":"00000000-0000-0000-0000-000000000099","name":"CLI sandbox"}),
-        ))
-        .mount(&server)
-        .await;
-    let key = "A".repeat(32);
-    Mock::given(method("GET"))
-        .and(path("/api/v1/iam"))
-        .and(header("x-testing-environment-key", key.as_str()))
-        .and(|r: &wiremock::Request| !r.headers.contains_key("authorization"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "app_id":"waveform", "iam_base_url":"https://iam.example/",
-            "testing_environment_id":"00000000-0000-0000-0000-000000000004"
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let value = output_json(
-        home.run(&server.uri(), &["--test", &key, "iam", "--json"])
-            .await,
-    );
-    assert_eq!(value["app_id"], "waveform");
-    assert!(!value.to_string().contains(&key));
-}
-
-#[tokio::test]
-async fn status_without_a_session_is_false_without_contacting_server() {
-    let home = Home::new();
-    let value = output_json(
-        home.run("http://127.0.0.1:1", &["login", "status", "--json"])
-            .await,
-    );
-    assert_eq!(value["authenticated"], false);
-    assert!(value["actor"].is_null());
-    assert!(!home.0.join(".waveform").exists());
-}
-
-#[tokio::test]
-async fn status_verifies_both_actor_types_and_hides_session_tokens() {
-    for kind in ["carbon", "silicon"] {
-        let home = Home::new();
-        let server = MockServer::start().await;
-        Mock::given(path("/api/v1/testing-environment"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                json!({"id":"00000000-0000-0000-0000-000000000099","name":"CLI sandbox"}),
-            ))
-            .mount(&server)
-            .await;
-        login_kind(&home, &server, &[], kind).await;
-        assert!(home.0.join(".waveform/dir").is_dir());
-        Mock::given(method("GET"))
-            .and(path("/api/v1/auth/me"))
-            .and(header("authorization", "Bearer oat_private"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(authority(kind)))
-            .expect(2)
-            .mount(&server)
-            .await;
-        let value = output_json(
-            home.run(&server.uri(), &["login", "status", "--json"])
-                .await,
-        );
-        assert_eq!(value["authenticated"], true);
-        assert_eq!(value["actor"]["actor_type"], kind);
-        assert_eq!(
-            value["actor"]["public_id"],
-            if kind == "silicon" {
-                "si:agent"
-            } else {
-                "c:12345678"
-            }
-        );
-        assert!(value["actor"].get("principal_id").is_none());
-        assert_eq!(value["org_id"], "tos");
-        assert!(!value.to_string().contains("private"));
-        let result = home.run(&server.uri(), &["login", "status"]).await;
-        assert!(result.status.success());
+    let top = home.run(&["--help"], None).await;
+    assert!(top.status.success());
+    let top_text = String::from_utf8_lossy(&top.stdout).into_owned();
+    for command in COMMANDS {
         assert!(
-            String::from_utf8(result.stdout)
-                .unwrap()
-                .contains(if kind == "silicon" {
-                    "silicon si:agent"
-                } else {
-                    "carbon c:12345678"
-                })
+            top_text.contains(&format!("  {command} ")),
+            "{command} missing from --help"
         );
     }
-}
-
-#[tokio::test]
-async fn status_distinguishes_rejected_tokens_from_server_failure() {
-    for code in [401, 403, 503] {
-        let home = Home::new();
-        let server = MockServer::start().await;
-        Mock::given(path("/api/v1/testing-environment"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                json!({"id":"00000000-0000-0000-0000-000000000099","name":"CLI sandbox"}),
-            ))
-            .mount(&server)
-            .await;
-        login(&home, &server, &[]).await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/auth/me"))
-            .respond_with(
-                ResponseTemplate::new(code)
-                    .set_body_json(json!({"error":{"code":"fixture_error"}})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/v1/auth/refresh"))
-            .respond_with(
-                ResponseTemplate::new(401).set_body_json(json!({"error":{"code":"invalid_grant"}})),
-            )
-            .expect(if code == 503 { 0 } else { 1 })
-            .mount(&server)
-            .await;
-        let result = home
-            .run(&server.uri(), &["login", "status", "--json"])
-            .await;
-        if code == 503 {
-            assert!(!result.status.success());
-            assert!(result.stdout.is_empty());
-        } else {
-            assert_eq!(output_json(result)["authenticated"], false);
-        }
+    assert!(
+        !top_text.contains("  iam "),
+        "the transition alias stays hidden"
+    );
+    let mut pages = vec![top_text];
+    for command in COMMANDS.into_iter().chain(["config"]) {
+        let output = home.run(&[command, "--help"], None).await;
+        assert!(output.status.success(), "{command} --help failed");
+        let page = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            page.contains("Usage: waveform"),
+            "{command} --help has no usage"
+        );
+        pages.push(page);
     }
-}
-
-#[tokio::test]
-async fn status_keeps_production_and_test_sessions_separate() {
-    let home = Home::new();
-    let server = MockServer::start().await;
-    Mock::given(path("/api/v1/testing-environment"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"id":"00000000-0000-0000-0000-000000000099","name":"CLI sandbox"}),
-        ))
-        .mount(&server)
-        .await;
-    let key = "A".repeat(32);
-    login_kind(&home, &server, &["--test", &key], "silicon").await;
-    let mut identity = authority("silicon");
-    identity["testing_environment_id"] = json!("00000000-0000-0000-0000-000000000004");
-    Mock::given(method("GET"))
-        .and(path("/api/v1/auth/me"))
-        .and(header("authorization", "Bearer oat_private"))
-        .and(header("x-testing-environment-key", key.as_str()))
-        .respond_with(ResponseTemplate::new(200).set_body_json(identity))
-        .expect(1)
-        .mount(&server)
-        .await;
-    assert_eq!(
-        output_json(
-            home.run(&server.uri(), &["login", "status", "--json"])
-                .await
-        )["authenticated"],
-        false
-    );
-    let value = output_json(
-        home.run(
-            &server.uri(),
-            &["--test", &key, "login", "status", "--json"],
-        )
-        .await,
-    );
-    assert_eq!(value["authenticated"], true);
-    assert_eq!(
-        value["testing_environment_id"],
-        "00000000-0000-0000-0000-000000000004"
-    );
-}
-
-#[tokio::test]
-async fn explicit_home_overrides_silicon_default_and_pointer_stays_under_silicon_home() {
-    let home = Home::new();
-    let selected = Home::new();
-    let server = MockServer::start().await;
-    Mock::given(path("/api/v1/testing-environment"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"id":"00000000-0000-0000-0000-000000000099","name":"CLI sandbox"}),
-        ))
-        .mount(&server)
-        .await;
-    output_json(
-        home.run(
-            &server.uri(),
-            &["config", "home", selected.0.to_str().unwrap(), "--json"],
-        )
-        .await,
-    );
-    assert!(home.0.join(".waveform/config.json").is_file());
-    login(&home, &server, &[]).await;
-    assert!(selected.0.join(".waveform/dir").is_dir());
-    assert!(!home.0.join(".waveform/dir").exists());
-}
-
-#[test]
-fn missing_silicon_home_uses_the_os_home() {
-    let home = Home::new();
-    let result = Command::new(env!("CARGO_BIN_EXE_waveform"))
-        .env_remove("SILICON_HOME")
-        .env("HOME", &home.0)
-        .args(["config", "auto-update", "off", "--json"])
-        .output()
-        .unwrap();
-    output_json(result);
-    assert!(home.0.join(".waveform/dir/auto-update.json").is_file());
-}
-
-#[tokio::test]
-async fn environment_selects_test_requests_and_explicit_flag_overrides_it() {
-    let home = Home::new();
-    let server = MockServer::start().await;
-    let env_key = "abcdefghijklmnopqrstuvwxyz123456";
-    let explicit_key = "123456abcdefghijklmnopqrstuvwxyz";
-    for explicit in [false, true] {
-        Mock::given(method("GET"))
-            .and(path("/api/v1/testing-environment"))
-            .and(header("x-testing-environment-key", if explicit { explicit_key } else { env_key }))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": if explicit { "00000000-0000-0000-0000-000000000098" } else { "00000000-0000-0000-0000-000000000099" },
-                "name":"CLI sandbox"
-            }))).expect(1).mount(&server).await;
-        Mock::given(method("GET")).and(path("/api/v1/iam"))
-            .and(header("x-testing-environment-key", if explicit { explicit_key } else { env_key }))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "app_id":"waveform", "iam_base_url":"https://iam.example/", "testing_environment_id":null
-            }))).expect(1).mount(&server).await;
-        let mut command = Command::new(env!("CARGO_BIN_EXE_waveform"));
-        command
-            .env("SILICON_HOME", &home.0)
-            .env("WAVEFORM_AUTO_UPDATE", "false")
-            .env("WAVEFORM_TEST", env_key)
-            .args(["--url", &server.uri()]);
-        if explicit {
-            command.args(["--test", explicit_key]);
-        }
-        command.args(["iam", "--json"]);
-        let output = tokio::task::spawn_blocking(move || command.output().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(output_json(output)["app_id"], "waveform");
-    }
-    let output = Command::new(env!("CARGO_BIN_EXE_waveform"))
-        .env("WAVEFORM_TEST", env_key)
-        .arg("--help")
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(!String::from_utf8_lossy(&output.stdout).contains(env_key));
-}
-
-fn saved_session(home: &Home, server: &MockServer, test_key: Option<&str>) -> PathBuf {
-    use sha2::{Digest as _, Sha256};
-    let mut digest = Sha256::new();
-    digest.update(server.uri().as_bytes());
-    digest.update([0]);
-    let encoded = test_key.map(|key| serde_json::to_string(key).unwrap());
-    digest.update(encoded.as_deref().unwrap_or("production").as_bytes());
-    home.0
-        .join(".waveform/dir")
-        .join(format!("session-{:x}.json", digest.finalize()))
-}
-
-async fn named_login(
-    home: &Home,
-    server: &MockServer,
-    profile: &str,
-    suffix: &str,
-    actor: &str,
-    org: &str,
-) -> Output {
-    let kind = if actor.starts_with("si:") {
-        "silicon"
-    } else {
-        "carbon"
-    };
-    let mut status = authority(kind);
-    status["public_id"] = json!(actor);
-    status["org_id"] = json!(org);
-    Mock::given(method("GET"))
-        .and(path("/api/v1/auth/me"))
-        .and(header(
-            "authorization",
-            format!("Bearer oat_{suffix}").as_str(),
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(status))
-        .mount(server)
-        .await;
-    Mock::given(method("POST")).and(path("/api/v1/auth/login"))
-        .and(body_json(json!({"slt":format!("oac_{suffix}")})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token":format!("oat_{suffix}"),"refresh_token":format!("ort_{suffix}"),"token_type":"Bearer",
-            "expires_in":1800,"scope":"","org_id":org,"actor":{"type":kind,"public_id":actor}
-        }))).expect(1).mount(server).await;
-    home.run(
-        &server.uri(),
-        &[
-            "--profile",
-            profile,
-            "login",
-            &format!("oac_{suffix}"),
-            "--json",
-        ],
-    )
-    .await
-}
-
-fn named_path(home: &Home, server: &MockServer, profile: &str) -> PathBuf {
-    let old = saved_session(home, server, None);
-    old.parent()
-        .unwrap()
-        .join("profiles")
-        .join(profile)
-        .join(old.file_name().unwrap())
-}
-
-#[tokio::test]
-async fn independent_profiles_preserve_accounts_organizations_and_logout_siblings() {
-    let home = Home::new();
-    let server = MockServer::start().await;
-    for (profile, actor, org) in [
-        ("alice", "c:alice", "tos"),
-        ("agent", "si:agent", "another"),
+    for nested in [
+        ["login", "status"],
+        ["provider-keys", "set"],
+        ["provider-keys", "delete"],
+        ["storage", "approve"],
+        ["storage", "status"],
+        ["storage", "revoke"],
+        ["config", "show"],
+        ["config", "home"],
     ] {
-        output_json(named_login(&home, &server, profile, profile, actor, org).await);
-        let status = output_json(
-            home.run(
-                &server.uri(),
-                &["--profile", profile, "login", "status", "--json"],
-            )
-            .await,
-        );
-        assert_eq!(status["profile"], profile);
-        assert_eq!(status["actor"]["public_id"], actor);
-        assert_eq!(status["org_id"], org);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(
-                fs::metadata(named_path(&home, &server, profile))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
+        let output = home.run(&[nested[0], nested[1], "--help"], None).await;
+        assert!(output.status.success(), "{nested:?} --help failed");
+        pages.push(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    for page in &pages {
+        // "Team of Silicons" is the maker's name, not an account grouping.
+        let page = page.replace("Team of Silicons", "");
+        for word in BANNED {
+            assert!(!page.contains(word), "help says `{word}`:\n{page}");
         }
     }
-    assert_eq!(
-        output_json(
-            home.run(&server.uri(), &["login", "status", "--json"])
-                .await
-        )["authenticated"],
-        false
-    );
-    Mock::given(method("POST"))
-        .and(path("/api/v1/auth/logout"))
-        .and(body_json(json!({"token":"ort_alice"})))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&server)
-        .await;
-    output_json(
-        home.run(&server.uri(), &["--profile", "alice", "logout", "--json"])
-            .await,
-    );
-    assert!(!named_path(&home, &server, "alice").exists());
-    assert_eq!(
-        output_json(
-            home.run(
-                &server.uri(),
-                &["--profile", "agent", "login", "status", "--json"]
-            )
-            .await
-        )["actor"]["public_id"],
-        "si:agent"
-    );
-}
-
-#[tokio::test]
-async fn changed_login_refresh_and_status_cannot_replace_or_relabel_a_profile() {
-    let home = Home::new();
-    let server = MockServer::start().await;
-    output_json(named_login(&home, &server, "work", "alice", "c:alice", "tos").await);
-    let saved_path = named_path(&home, &server, "work");
-    let original = fs::read(&saved_path).unwrap();
-    let rejected = named_login(&home, &server, "work", "bob", "c:bob", "tos").await;
-    assert!(!rejected.status.success());
-    assert_eq!(fs::read(&saved_path).unwrap(), original);
-    Mock::given(method("POST")).and(path("/api/v1/auth/refresh"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token":"oat_other","refresh_token":"ort_other","token_type":"Bearer","expires_in":1800,"scope":"",
-            "org_id":"other","actor":{"type":"carbon","public_id":"c:alice"}
-        }))).expect(1).mount(&server).await;
-    assert!(
-        !home
-            .run(&server.uri(), &["--profile", "work", "refresh", "--json"])
-            .await
-            .status
-            .success()
-    );
-    let retained: Value = serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
-    assert_eq!(retained["access_token"], "oat_alice");
-    assert_eq!(retained["refresh_token"], "ort_alice");
-    // A fresh local timestamp must still verify online authority against the saved actor.
-    fs::write(&saved_path, original).unwrap();
-    let mut changed = authority("carbon");
-    changed["public_id"] = json!("c:bob");
-    Mock::given(method("GET"))
-        .and(path("/api/v1/auth/me"))
-        .and(header("authorization", "Bearer oat_alice"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(changed))
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    assert!(
-        !home
-            .run(
-                &server.uri(),
-                &["--profile", "work", "login", "status", "--json"]
-            )
-            .await
-            .status
-            .success()
-    );
-}
-
-#[tokio::test]
-async fn legacy_unbound_sessions_require_login_and_cannot_refresh_implicitly() {
-    let home = Home::new();
-    let server = MockServer::start().await;
-    let file = saved_session(&home, &server, None);
-    fs::create_dir_all(file.parent().unwrap()).unwrap();
-    let original =
-        json!({"access_token":"old","refresh_token":"old-refresh","expires_at":1}).to_string();
-    fs::write(&file, &original).unwrap();
-    assert!(
-        !home
-            .run(&server.uri(), &["login", "status", "--json"])
-            .await
-            .status
-            .success()
-    );
-    assert_eq!(fs::read_to_string(file).unwrap(), original);
-    assert!(server.received_requests().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn mismatched_request_scope_never_reaches_speech_provider() {
-    let home = Home::new();
-    let server = MockServer::start().await;
-    output_json(named_login(&home, &server, "work", "alice", "c:alice", "tos").await);
-    Mock::given(method("GET")).and(path("/api/v1/iam"))
-        .and(|r: &wiremock::Request| !r.headers.contains_key("authorization"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"app_id":"waveform","iam_base_url":"https://iam.example","testing_environment_id":null})))
-        .expect(1).mount(&server).await;
-    assert_eq!(
-        output_json(
-            home.run(
-                &server.uri(),
-                &[
-                    "--profile",
-                    "work",
-                    "--organization",
-                    "other",
-                    "iam",
-                    "--json"
-                ]
-            )
-            .await
-        )["app_id"],
-        "waveform"
-    );
-    for (org, actor) in [("other", "c:alice"), ("tos", "c:bob")] {
-        assert!(
-            !home
-                .run(
-                    &server.uri(),
-                    &[
-                        "--profile",
-                        "work",
-                        "tts",
-                        "hello",
-                        "--org",
-                        org,
-                        "--actor",
-                        actor,
-                        "--json"
-                    ]
-                )
-                .await
-                .status
-                .success()
-        );
+    let login = &pages[1];
+    for needle in [
+        "--slt-stdin",
+        "silicon-accounts login --app waveform -q",
+        "--open",
+        "status",
+    ] {
+        assert!(login.contains(needle), "login --help lacks {needle}");
     }
-    assert!(
-        !server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .any(|r| r.url.path() == "/api/v1/tts")
-    );
-}
-
-#[tokio::test]
-async fn refresh_wrong_world_is_rejected_before_credentials_are_committed() {
-    let home = Home::new();
-    let server = MockServer::start().await;
-    output_json(named_login(&home, &server, "work", "alice", "c:alice", "tos").await);
-    Mock::given(method("POST")).and(path("/api/v1/auth/refresh"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token":"oat_wrong_world","refresh_token":"ort_wrong_world","token_type":"Bearer","expires_in":1800,"scope":"",
-            "org_id":"tos","actor":{"type":"carbon","public_id":"c:alice"}
-        }))).expect(1).mount(&server).await;
-    let mut identity = authority("carbon");
-    identity["public_id"] = json!("c:alice");
-    identity["testing_environment_id"] = json!(uuid::Uuid::new_v4().to_string());
-    Mock::given(method("GET"))
-        .and(path("/api/v1/auth/me"))
-        .and(header("authorization", "Bearer oat_wrong_world"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(identity))
-        .expect(1)
-        .mount(&server)
-        .await;
-    assert!(
-        !home
-            .run(&server.uri(), &["--profile", "work", "refresh", "--json"])
-            .await
-            .status
-            .success()
-    );
-    let retained: Value =
-        serde_json::from_slice(&fs::read(named_path(&home, &server, "work")).unwrap()).unwrap();
-    assert_eq!(retained["refresh_token"], "ort_alice");
-    assert_eq!(retained["access_token"], "oat_alice");
-    assert!(retained["refresh_started_at"].is_number());
-}
-
-#[tokio::test]
-async fn profile_environment_and_explicit_selection_choose_independent_files() {
-    let home = Home::new();
-    let server = MockServer::start().await;
-    for profile in ["alice", "other"] {
-        output_json(
-            named_login(
-                &home,
-                &server,
-                profile,
-                profile,
-                &format!("c:{profile}"),
-                "tos",
-            )
-            .await,
-        );
-    }
-    for explicit in [false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_waveform"));
-        command
-            .env("SILICON_HOME", &home.0)
-            .env_remove("SILICON_ORG")
-            .env_remove("WAVEFORM_TEST")
-            .env("WAVEFORM_PROFILE", "other")
-            .args(["--url", &server.uri()]);
-        if explicit {
-            command.args(["--profile", "alice"]);
-        }
-        command.args(["login", "status", "--json"]);
-        let result = tokio::task::spawn_blocking(move || command.output().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            output_json(result)["profile"],
-            if explicit { "alice" } else { "other" }
-        );
-    }
-    let result = home
-        .run(
-            &server.uri(),
-            &["--profile", "../escape", "login", "status", "--json"],
-        )
-        .await;
-    assert!(!result.status.success());
-}
-
-#[tokio::test]
-async fn legacy_session_refresh_is_automatic_serialized_and_environment_bound() {
-    for test_key in [None, Some("abcdefghijklmnopqrstuvwxyz123456")] {
-        let home = Home::new();
-        let server = MockServer::start().await;
-        let selection: Vec<_> = test_key.map(|key| vec!["--test", key]).unwrap_or_default();
-        Mock::given(path("/api/v1/testing-environment"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                json!({"id":"00000000-0000-0000-0000-000000000099","name":"sandbox"}),
-            ))
-            .mount(&server)
-            .await;
-        login(&home, &server, &selection).await;
-        let session_path = saved_session(&home, &server, test_key);
-        let mut saved: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
-        saved.as_object_mut().unwrap().remove("expires_at");
-        fs::write(&session_path, saved.to_string()).unwrap();
-        Mock::given(method("POST")).and(path("/api/v1/auth/refresh"))
-            .and(body_json(json!({"refresh_token":"ort_private"})))
-            .and(move |r: &wiremock::Request| {
-                r.headers.contains_key("idempotency-key") && !r.headers.contains_key("authorization")
-                    && r.headers.get("x-testing-environment-key").and_then(|v| v.to_str().ok()) == test_key
-            })
-            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(100))
-                .set_body_json(json!({"access_token":"oat_new", "refresh_token":"ort_new", "expires_in":1800,
-                    "token_type":"Bearer", "scope":"self.identity.read", "org_id":"tos", "actor":{"type":"carbon","public_id":"c:12345678"}})))
-            .expect(1).mount(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/auth/me"))
-            .and(header("authorization", "Bearer oat_new"))
-            .respond_with(ResponseTemplate::new(200).set_body_json({
-                let mut v = authority("carbon");
-                if test_key.is_some() {
-                    v["testing_environment_id"] = json!("00000000-0000-0000-0000-000000000004");
-                }
-                v
-            }))
-            .expect(3)
-            .mount(&server)
-            .await;
-        let args: Vec<_> = selection
-            .iter()
-            .copied()
-            .chain(["login", "status", "--json"])
-            .collect();
-        let url = server.uri();
-        let (first, second) = tokio::join!(home.run(&url, &args), home.run(&url, &args));
-        assert_eq!(output_json(first)["authenticated"], true);
-        assert_eq!(output_json(second)["authenticated"], true);
-        let saved: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
-        assert_eq!(saved["refresh_token"], "ort_new");
-        assert!(
-            saved["expires_at"].as_u64().unwrap()
-                > std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-        );
-        if test_key.is_some() {
-            assert!(!saved_session(&home, &server, None).exists());
-        }
-    }
-}
-
-#[tokio::test]
-async fn failed_refresh_preserves_session_and_retry_key_and_reports_revocation() {
-    for status in [401, 503] {
-        let home = Home::new();
-        let server = MockServer::start().await;
-        login(&home, &server, &[]).await;
-        let session_path = saved_session(&home, &server, None);
-        let mut saved: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
-        saved["expires_at"] = json!(1);
-        let original = saved.to_string();
-        fs::write(&session_path, &original).unwrap();
-        Mock::given(method("POST"))
-            .and(path("/api/v1/auth/refresh"))
-            .respond_with(
-                ResponseTemplate::new(status)
-                    .set_body_json(json!({"error":{"code":"fixture_error"}})),
-            )
-            .expect(2)
-            .mount(&server)
-            .await;
-        for _ in 0..2 {
-            let output = home
-                .run(&server.uri(), &["login", "status", "--json"])
-                .await;
-            if status == 401 {
-                assert_eq!(output_json(output)["authenticated"], false);
-            } else {
-                assert!(!output.status.success());
-            }
-            let retained: Value =
-                serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
-            assert_eq!(retained["access_token"], saved["access_token"]);
-            assert_eq!(retained["refresh_token"], saved["refresh_token"]);
-            assert!(retained["refresh_started_at"].is_u64());
-        }
-        let requests: Vec<_> = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|r| r.url.path() == "/api/v1/auth/refresh")
-            .collect();
-        assert_eq!(
-            requests[0].headers["idempotency-key"],
-            requests[1].headers["idempotency-key"]
-        );
-    }
-}
-
-#[tokio::test]
-async fn delayed_refresh_replay_is_rotated_again_before_status() {
-    let home = Home::new();
-    let server = MockServer::start().await;
-    login(&home, &server, &[]).await;
-    let session_path = saved_session(&home, &server, None);
-    let mut saved: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
-    saved["expires_at"] = json!(1);
-    saved["refresh_started_at"] = json!(1);
-    fs::write(&session_path, saved.to_string()).unwrap();
-    for (old, new) in [("private", "replayed"), ("replayed", "fresh")] {
-        Mock::given(method("POST"))
-            .and(path("/api/v1/auth/refresh"))
-            .and(body_json(json!({"refresh_token":format!("ort_{old}")})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "access_token":format!("oat_{new}"), "refresh_token":format!("ort_{new}"),
-                "expires_in":1800,"token_type":"Bearer","scope":"","org_id":"tos",
-                "actor":{"type":"carbon","public_id":"c:12345678"}})))
-            .expect(1)
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path("/api/v1/auth/me"))
-        .and(header("authorization", "Bearer oat_fresh"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(authority("carbon")))
-        .expect(2)
-        .mount(&server)
-        .await;
-    assert_eq!(
-        output_json(
-            home.run(&server.uri(), &["login", "status", "--json"])
-                .await
-        )["authenticated"],
-        true
-    );
-    let saved: Value = serde_json::from_slice(&fs::read(session_path).unwrap()).unwrap();
-    assert_eq!(saved["refresh_token"], "ort_fresh");
-    assert!(saved["refresh_started_at"].is_null());
-}
-
-#[tokio::test]
-async fn rejected_access_refreshes_before_local_expiry_and_persists_successor() {
-    let home = Home::new();
-    let server = MockServer::start().await;
-    login(&home, &server, &[]).await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/auth/me"))
-        .and(header("authorization", "Bearer oat_private"))
-        .respond_with(
-            ResponseTemplate::new(401).set_body_json(json!({"error":{"code":"unauthenticated"}})),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/auth/refresh"))
-        .and(body_json(json!({"refresh_token":"ort_private"})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token":"oat_new", "refresh_token":"ort_new", "expires_in":1800,
-            "token_type":"Bearer", "scope":"", "org_id":"tos", "actor":{"type":"carbon","public_id":"c:12345678"}
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/auth/me"))
-        .and(header("authorization", "Bearer oat_new"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(authority("carbon")))
-        .expect(3)
-        .mount(&server)
-        .await;
-    for _ in 0..2 {
-        assert_eq!(
-            output_json(
-                home.run(&server.uri(), &["login", "status", "--json"])
-                    .await
-            )["authenticated"],
-            true
-        );
-    }
-    let saved = fs::read_dir(home.0.join(".waveform/dir"))
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("session-")
-                && path.extension().is_some_and(|ext| ext == "json")
-        })
+    let tts = pages
+        .iter()
+        .find(|page| page.contains("Usage: waveform tts"))
         .unwrap();
-    let saved: Value = serde_json::from_slice(&fs::read(saved).unwrap()).unwrap();
-    assert_eq!(saved["refresh_token"], "ort_new");
+    for needle in [
+        "--proof-file",
+        "--provider-options",
+        "--idempotency",
+        "Examples:",
+    ] {
+        assert!(tts.contains(needle), "tts --help lacks {needle}");
+    }
+    let jobs = pages
+        .iter()
+        .find(|page| page.contains("Usage: waveform jobs"))
+        .unwrap();
+    assert!(jobs.contains("--account") && jobs.contains("si:"));
+}
+
+#[tokio::test]
+async fn discovery_answers_in_an_empty_environment_with_the_exact_shapes() {
+    let home = Home::new();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_waveform"));
+    command
+        .env_clear()
+        .env("HOME", &home.root)
+        .env("SILICON_HOME", &home.root);
+    let help = home.run_with(command, &["--help"], None).await;
+    assert!(help.status.success() && !help.stdout.is_empty());
+
+    let accounts = json_out(&home.run(&["accounts", "--json"], None).await);
+    assert_eq!(
+        accounts,
+        json!({
+            "app_id": "waveform",
+            "accounts_url": "https://accounts.teamofsilicons.com",
+            "api_url": "https://api.waveform.teamofsilicons.com",
+            "docs_url": "https://docs.waveform.teamofsilicons.com",
+            "version": env!("CARGO_PKG_VERSION"),
+            "proof_scopes": ["waveform.tts", "waveform.stt"],
+            "sign_in": {
+                "carbon": "waveform login",
+                "silicon": "silicon-accounts login --app waveform -q | waveform login --slt-stdin",
+                "short_lived_token": "silicon-accounts login --app waveform -q",
+            },
+        })
+    );
+    // The hidden transition alias prints exactly the same object, with or without --json.
+    assert_eq!(
+        json_out(&home.run(&["iam", "--json"], None).await),
+        accounts
+    );
+    assert_eq!(json_out(&home.run(&["iam"], None).await), accounts);
+
+    let status = json_out(&home.run(&["login", "status", "--json"], None).await);
+    assert_eq!(status, json!({"authenticated": false}));
+    let text_status = home.run(&["login", "status"], None).await;
+    assert_eq!(
+        text_status.status.code(),
+        Some(1),
+        "signed out without --json exits 1"
+    );
+    assert!(text(&text_status).contains("waveform login"));
+
+    assert!(
+        fs::read_dir(&home.root).unwrap().next().is_none(),
+        "discovery writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn discovery_reports_the_configured_origins() {
+    let home = Home::new();
+    let mut command = home.command();
+    command
+        .env("WAVEFORM_URL", "http://127.0.0.1:4161/")
+        .env("ACCOUNTS_URL", "http://localhost:9590/");
+    let value = json_out(&home.run_with(command, &["accounts", "--json"], None).await);
+    assert_eq!(value["api_url"], "http://127.0.0.1:4161");
+    assert_eq!(value["accounts_url"], "http://localhost:9590");
+    // Flags win over the environment, and nothing is validated or contacted offline.
+    let value = json_out(
+        &home
+            .run(
+                &["--url", "https://waveform.example", "accounts", "--json"],
+                None,
+            )
+            .await,
+    );
+    assert_eq!(value["api_url"], "https://waveform.example");
+}
+
+#[tokio::test]
+async fn status_json_exits_zero_even_when_nothing_can_be_read() {
+    let home = Home::new();
+    let invalid = home
+        .run(
+            &["--profile", "../escape", "login", "status", "--json"],
+            None,
+        )
+        .await;
+    let value = json_out(&invalid);
+    assert_eq!(value["authenticated"], false);
+    assert_eq!(value["reason"], "invalid_input");
+    let failed = home
+        .run(&["--profile", "../escape", "login", "status"], None)
+        .await;
+    assert_eq!(failed.status.code(), Some(2));
+}
+
+#[tokio::test]
+async fn retired_flags_and_commands_say_what_replaced_them() {
+    let home = Home::new();
+    for (args, code, needle) in [
+        (
+            vec!["tts", "Hi", "--org", "tos", "--actor", "c:ada"],
+            "organizations_removed",
+            "--account si:",
+        ),
+        (
+            vec!["--test", "ask_x", "jobs"],
+            "test_environments_removed",
+            "development Waveform",
+        ),
+        (
+            vec!["tts", "Hi", "--obo-app", "ting", "--obo-token-file", "t"],
+            "delegated_tokens_removed",
+            "--proof-file",
+        ),
+        (
+            vec!["jobs", "--org", "tos"],
+            "organizations_removed",
+            "--account",
+        ),
+        (
+            vec!["test-env", "list"],
+            "test_environments_removed",
+            "waveform docs testing",
+        ),
+        (
+            vec!["daemon", "status"],
+            "updater_removed",
+            "silicon-apps install waveform",
+        ),
+        (
+            vec!["config", "auto-update", "off"],
+            "updater_removed",
+            "Silicon Apps",
+        ),
+        (
+            vec!["provider-key-set", "gemini", "--key-file", "k"],
+            "command_renamed",
+            "provider-keys set",
+        ),
+        (
+            vec!["storage", "start"],
+            "command_renamed",
+            "storage approve",
+        ),
+    ] {
+        let output = home.run(&args, None).await;
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let shown = text(&output);
+        assert!(shown.contains(needle), "{args:?}: {shown}");
+        let mut with_json = args.clone();
+        with_json.push("--json");
+        let value = json_any(&home.run(&with_json, None).await);
+        assert_eq!(value["error"]["code"], code, "{args:?}");
+        assert!(value["error"]["hint"].is_string());
+    }
+    // Usage errors under --json are JSON too.
+    let value = json_any(&home.run(&["tts", "--bogus", "--json"], None).await);
+    assert_eq!(value["error"]["code"], "invalid_arguments");
+}
+
+#[tokio::test]
+async fn config_home_moves_state_and_the_pointer_stays_under_silicon_home() {
+    let home = Home::new();
+    let elsewhere = Home::new();
+    let value = json_out(
+        &home
+            .run(
+                &["config", "home", elsewhere.root.to_str().unwrap(), "--json"],
+                None,
+            )
+            .await,
+    );
+    assert_eq!(
+        value["state_dir"].as_str().unwrap(),
+        fs::canonicalize(&elsewhere.root)
+            .unwrap()
+            .join(".waveform/dir")
+            .to_str()
+            .unwrap()
+    );
+    assert!(home.root.join(".waveform/config.json").is_file());
+    json_out(
+        &home
+            .run(&["config", "telemetry", "off", "--json"], None)
+            .await,
+    );
+    assert!(
+        elsewhere
+            .root
+            .join(".waveform/dir/telemetry.json")
+            .is_file()
+    );
+    assert!(!home.root.join(".waveform/dir").exists());
+    let shown = json_out(&home.run(&["config", "show", "--json"], None).await);
+    assert_eq!(shown["local_telemetry"], false);
+    assert_eq!(shown["signed_in"], serde_json::Value::Null);
+    let missing = home
+        .run(&["config", "home", "/definitely/not/here"], None)
+        .await;
+    assert_eq!(missing.status.code(), Some(2));
+}
+
+#[tokio::test]
+async fn without_silicon_home_the_os_home_is_used() {
+    let home = Home::new();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_waveform"));
+    command.env_clear().env("HOME", &home.root);
+    json_out(
+        &home
+            .run_with(command, &["config", "telemetry", "off", "--json"], None)
+            .await,
+    );
+    assert!(home.root.join(".waveform/dir/telemetry.json").is_file());
+}
+
+#[tokio::test]
+async fn earlier_sign_ins_are_never_used_and_logout_removes_them() {
+    let home = Home::new();
+    let stubs = Stubs::start().await;
+    fs::create_dir_all(home.state_dir()).unwrap();
+    fs::write(
+        home.state_dir().join("session-0f0f.json"),
+        br#"{"access_token":"oat_old_private","refresh_token":"ort_old_private","identity":{"org_id":"tos"}}"#,
+    )
+    .unwrap();
+    let status = json_out(&stubs.run(&home, &["login", "status", "--json"], None).await);
+    assert_eq!(status["authenticated"], false);
+    assert_eq!(status["reason"], "legacy_session");
+    let refused = stubs.run(&home, &["jobs"], None).await;
+    assert_eq!(refused.status.code(), Some(3));
+    assert!(text(&refused).contains("earlier Waveform version"));
+    assert!(
+        stubs.waveform_requests().await.is_empty(),
+        "nothing was sent with the old tokens"
+    );
+    let logout = json_out(&stubs.run(&home, &["logout", "--json"], None).await);
+    assert_eq!(logout["legacy_files_removed"], 1);
+    assert!(!home.state_dir().join("session-0f0f.json").exists());
+    assert!(stubs.accounts_requests("/").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_corrupted_sign_in_is_reported_and_replaced_by_the_next_sign_in() {
+    let home = Home::new();
+    let stubs = Stubs::start().await;
+    common::sign_in(&home, &stubs, "carbon", "eyJ-first", "sar_first", 1800).await;
+    let file = home.session_files().remove(0);
+    fs::write(&file, b"{ truncated").unwrap();
+    let status = json_out(&stubs.run(&home, &["login", "status", "--json"], None).await);
+    assert_eq!(status["authenticated"], false);
+    assert_eq!(status["reason"], "session_unreadable");
+    let refused = stubs.run(&home, &["me", "--json"], None).await;
+    assert_eq!(refused.status.code(), Some(3));
+    assert_eq!(json_any(&refused)["error"]["code"], "session_unreadable");
+    common::sign_in(&home, &stubs, "carbon", "eyJ-second", "sar_second", 1800).await;
+    assert_eq!(home.session()["access_token"], "eyJ-second");
 }

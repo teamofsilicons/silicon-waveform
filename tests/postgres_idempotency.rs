@@ -11,8 +11,8 @@ use silicon_waveform::{
             IdempotencyRelease, IdempotencyScope, RequestDigest, RequestDigestKey, SpeechJobStart,
             SpeechOperation,
         },
-        identity::{Actor, ActorId, ActorKind, OrganizationId, RequestId},
-        media::{BriefcaseFileUrl, MediaDuration},
+        identity::{Actor, ActorId, ActorKind, RequestId},
+        media::{AudioStorage, BriefcaseFileUrl, MediaDuration},
         provider::ProviderName,
         speech::{SpeechText, TtsRequest},
     },
@@ -149,6 +149,7 @@ async fn release_reclaim_preserves_identity_and_fences_stale_owner()
     store
         .start_job(SpeechJobStart {
             voice_profile: None,
+            issuing_app: None,
             scope: scope.clone(),
             lease_id: current_lease_id,
             first_line: "hello".into(),
@@ -284,7 +285,7 @@ async fn first_claim_refreshes_timestamps_after_a_unique_conflict_wait()
         ",
     )
     .bind(scope.actor.id.as_uuid())
-    .bind(scope.organization_id.as_str())
+    .bind(silicon_waveform::domain::idempotency::ACCOUNT_SCOPE)
     .bind(scope.key.as_str())
     .bind(digest.as_bytes().as_slice())
     .bind(request_id()?.as_uuid())
@@ -327,7 +328,7 @@ async fn first_claim_refreshes_timestamps_after_a_unique_conflict_wait()
         ",
     )
     .bind(scope.actor.id.as_uuid())
-    .bind(scope.organization_id.as_str())
+    .bind(silicon_waveform::domain::idempotency::ACCOUNT_SCOPE)
     .bind(scope.key.as_str())
     .execute(&mut *blocker)
     .await?;
@@ -373,6 +374,7 @@ async fn late_completion_wins_when_it_precedes_reclaim_in_the_lock_queue()
     store
         .start_job(SpeechJobStart {
             voice_profile: None,
+            issuing_app: None,
             scope: scope.clone(),
             lease_id: completing_lease_id,
             first_line: "hello".into(),
@@ -394,7 +396,7 @@ async fn late_completion_wins_when_it_precedes_reclaim_in_the_lock_queue()
         ",
     )
     .bind(scope.actor.id.as_uuid())
-    .bind(scope.organization_id.as_str())
+    .bind(silicon_waveform::domain::idempotency::ACCOUNT_SCOPE)
     .bind(scope.key.as_str())
     .fetch_one(&mut *blocker)
     .await?;
@@ -581,7 +583,6 @@ fn scope() -> Result<IdempotencyScope, Box<dyn std::error::Error>> {
     Ok(IdempotencyScope {
         plane_id: Uuid::nil(),
         actor: Actor::new(ActorKind::Carbon, ActorId::new(Uuid::new_v4())?),
-        organization_id: OrganizationId::from_str("integration-test")?,
         operation: SpeechOperation::Tts,
         key: IdempotencyKey::from_str(&format!("integration-{}", Uuid::new_v4()))?,
     })
@@ -607,9 +608,11 @@ fn completed_tts_operation(
     Ok(CompletedTtsOperation {
         voice_profile: None,
         request_id,
-        permanent_url: BriefcaseFileUrl::new(Url::parse(
-            "https://briefcase.example.test/files/generated",
-        )?)?,
+        storage: AudioStorage::Briefcase {
+            permanent_url: BriefcaseFileUrl::new(Url::parse(
+                "https://briefcase.example.test/files/generated",
+            )?)?,
+        },
         provider: ProviderName::Gemini,
         duration: MediaDuration::from_millis(1_234),
     })
@@ -642,6 +645,7 @@ async fn jobs_retry_under_one_id_and_commit_with_idempotency()
     store
         .start_job(SpeechJobStart {
             voice_profile: None,
+            issuing_app: None,
             scope: scope.clone(),
             lease_id: old_lease,
             first_line: "first line".into(),
@@ -676,6 +680,7 @@ async fn jobs_retry_under_one_id_and_commit_with_idempotency()
     store
         .start_job(SpeechJobStart {
             voice_profile: None,
+            issuing_app: None,
             scope: scope.clone(),
             lease_id: current,
             first_line: "first line".into(),
@@ -761,6 +766,7 @@ async fn crashed_jobs_expire_and_retired_keys_can_start_new_jobs()
     store
         .start_job(SpeechJobStart {
             voice_profile: None,
+            issuing_app: None,
             scope: scope.clone(),
             lease_id: first_lease,
             first_line: "crash fixture".into(),
@@ -799,6 +805,7 @@ async fn crashed_jobs_expire_and_retired_keys_can_start_new_jobs()
     store
         .start_job(SpeechJobStart {
             voice_profile: None,
+            issuing_app: None,
             scope: scope.clone(),
             lease_id: new_lease,
             first_line: "crash fixture".into(),

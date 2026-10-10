@@ -1,11 +1,28 @@
-//! Official Briefcase uploads, delegated source reads, and current replay access checks.
+//! Briefcase delegated operations, authorized by the User verification proof
+//! Waveform holds for the account (`Authorization: Proof sap_…`).
+//!
+//! Briefcase's Silicon Accounts contract is being published in parallel, so this
+//! adapter keeps Briefcase 3.0's delegated routes and JSON manifests and changes
+//! only what the migration settles: a proof replaces `X-App-ID` +
+//! `X-IAM-OBO-Access-Token`, and there is no organization header. Assumptions
+//! (recorded in docs/migration/decisions.md for the integration stage):
+//! - an empty `parent_path` puts an upload in Waveform's folder of the account's
+//!   drive, `WAVEFORM_BRIEFCASE_APP_FOLDER` (default `apps/waveform`);
+//! - list paths are drive-relative, and listing with no parent lists that
+//!   folder (Briefcase creates it on first use);
+//! - an app sees only `apps/{app}/` and what is inside it (not the drive's top
+//!   or `apps/` itself), so the folder's own entry is learnt from its children;
+//! - a permanent URL is `{origin}/{owner}/{drive path}`; legacy
+//!   `{origin}/org/{org}/{path}` URLs still resolve.
 
-use std::str::FromStr as _;
+use std::{collections::HashSet, time::Duration};
 
 use async_trait::async_trait;
-use thiserror::Error;
-use time::OffsetDateTime;
+use bytes::Bytes;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::Digest as _;
 use url::{Origin, Url};
+use uuid::Uuid;
 
 use crate::{
     application::ports::{
@@ -14,408 +31,677 @@ use crate::{
     },
     config::BriefcaseSettings,
     domain::{
-        auth::{DelegatedAuthorization, DelegationPurpose},
-        identity::ApplicationId,
-        media::{SourceMedia, StoredAudio, TemporaryMediaUrl},
+        auth::BriefcaseProof,
+        identity::RequestId,
+        media::{BriefcaseFileUrl, SourceMedia},
     },
 };
 
-/// Construction failure for the fail-closed Briefcase boundary.
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+const USER_AGENT: &str = concat!("silicon-waveform/", env!("CARGO_PKG_VERSION"));
+const MAX_PAGES: usize = 100;
+const PAGE_SIZE: u16 = 100;
+
+/// Construction failure for the Briefcase adapter.
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
 pub enum BriefcaseAdapterBuildError {
-    /// The permanent origin is not a credential-free HTTP(S) origin.
-    #[error("invalid Briefcase permanent origin configuration")]
-    InvalidPermanentOrigin,
-    /// The Briefcase application identifier is not a valid scoped ID.
-    #[error("invalid Briefcase application identity configuration")]
-    InvalidApplicationIdentity,
+    /// A configured URL is not a credential-free HTTP(S) origin.
+    #[error("invalid Briefcase URL configuration")]
+    InvalidUrl,
+    /// The HTTP client could not be built.
+    #[error("failed to build the Briefcase HTTP client")]
+    HttpClient,
 }
 
-/// Briefcase port backed by the published SDK and fresh per-operation IAM proofs.
+/// Waveform's folder in an account's drive, as Briefcase reports it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SourceTarget {
+    /// Briefcase entry id of the folder.
+    pub folder_id: Uuid,
+    /// Drive-relative folder path.
+    pub folder_path: String,
+}
+
+#[derive(Serialize)]
+struct ReserveBody<'a> {
+    operation_id: Uuid,
+    parent_path: &'a str,
+    name: &'a str,
+    content_type: &'a str,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+struct CommitBody {
+    operation_id: Uuid,
+    upload_id: Uuid,
+}
+
+#[derive(Serialize)]
+struct ListBody {
+    parent_id: Option<Uuid>,
+    path: Option<String>,
+    filter: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u16>,
+}
+
+#[derive(Serialize)]
+struct ReadBody {
+    entry_id: Uuid,
+    range: Option<String>,
+    download: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum UploadState {
+    Reserved,
+    Receiving,
+    Staged,
+    Committed,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct UploadStatus {
+    operation_id: Uuid,
+    upload_id: Uuid,
+    state: UploadState,
+    #[serde(default)]
+    published_entry_id: Option<Uuid>,
+    #[serde(default)]
+    capability: Option<String>,
+    #[serde(default)]
+    entry: Option<Entry>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct Entry {
+    id: Uuid,
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    parent_id: Option<Uuid>,
+    #[serde(default)]
+    permanent_url: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    origin_app_id: Option<String>,
+    #[serde(default)]
+    deleted_at: Option<String>,
+}
+
+impl Entry {
+    fn is_folder(&self) -> bool {
+        self.kind == "folder"
+    }
+
+    fn is_live(&self) -> bool {
+        self.deleted_at.is_none() && !self.id.is_nil()
+    }
+}
+
+#[derive(Deserialize)]
+struct EntryPage {
+    items: Vec<Entry>,
+    #[serde(default)]
+    folder: Option<Entry>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+/// Briefcase port speaking the delegated routes with a proof.
 #[derive(Clone, Debug)]
-pub struct FailClosedBriefcaseStore {
+pub struct BriefcaseHttp {
+    http: reqwest::Client,
+    api_root: Url,
     permanent_origin: Origin,
-    application_id: ApplicationId,
-    uploader: Option<super::briefcase_sdk::BriefcaseSdkUploader>,
-    environment: Option<briefcase_client::EnvironmentKey>,
-    reader: Option<super::briefcase_reader::BriefcaseSdkReader>,
+    waveform_app_id: String,
+    app_folder: String,
+    timeout: Duration,
+    download_timeout: Duration,
+    max_download_bytes: usize,
 }
 
-impl FailClosedBriefcaseStore {
-    /// Builds the boundary and freezes the exact trusted permanent-URL origin.
+impl BriefcaseHttp {
+    /// Builds the adapter from validated settings.
     ///
     /// # Errors
     ///
-    /// Returns a redacted error when the configured value contains credentials,
-    /// a non-root path, query, fragment, or invalid application identifier.
-    pub fn new(settings: &BriefcaseSettings) -> Result<Self, BriefcaseAdapterBuildError> {
-        validate_origin(&settings.permanent_origin)?;
-        let application_id = ApplicationId::from_str(&settings.app_id)
-            .map_err(|_| BriefcaseAdapterBuildError::InvalidApplicationIdentity)?;
-        if application_id.as_str() != settings.app_id.as_str() {
-            return Err(BriefcaseAdapterBuildError::InvalidApplicationIdentity);
+    /// Returns a redacted error for unusable URLs or HTTP client settings.
+    pub fn new(
+        settings: &BriefcaseSettings,
+        waveform_app_id: &str,
+    ) -> Result<Self, BriefcaseAdapterBuildError> {
+        let mut api_root = settings.base_url.clone();
+        if !matches!(api_root.scheme(), "http" | "https")
+            || api_root.host_str().is_none()
+            || !api_root.username().is_empty()
+            || api_root.password().is_some()
+        {
+            return Err(BriefcaseAdapterBuildError::InvalidUrl);
         }
+        let path = api_root.path().trim_end_matches('/').to_owned();
+        api_root.set_path(&if path.is_empty() {
+            "/api/v1/".to_owned()
+        } else {
+            format!("{path}/")
+        });
+        let permanent = &settings.permanent_origin;
+        if !matches!(permanent.scheme(), "http" | "https") || permanent.host_str().is_none() {
+            return Err(BriefcaseAdapterBuildError::InvalidUrl);
+        }
+        let http = reqwest::Client::builder()
+            .connect_timeout(settings.timeout.min(Duration::from_secs(5)))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(USER_AGENT)
+            .build()
+            .map_err(|_| BriefcaseAdapterBuildError::HttpClient)?;
         Ok(Self {
-            permanent_origin: settings.permanent_origin.origin(),
-            application_id,
-            uploader: None,
-            environment: None,
-            reader: None,
+            http,
+            api_root,
+            permanent_origin: permanent.origin(),
+            waveform_app_id: waveform_app_id.to_owned(),
+            app_folder: settings.app_folder.clone(),
+            timeout: settings.timeout,
+            download_timeout: settings.download_timeout,
+            max_download_bytes: settings.max_download_bytes,
         })
     }
 
-    /// Enables the published one-shot upload contract with official SDK transport.
-    #[must_use]
-    pub fn with_uploads(mut self, settings: &BriefcaseSettings) -> Self {
-        self.uploader = Some(super::briefcase_sdk::BriefcaseSdkUploader::new(
-            settings.clone(),
-        ));
-        self
+    fn endpoint(&self, path: &str) -> Result<Url, BriefcaseError> {
+        self.api_root
+            .join(path)
+            .map_err(|_| BriefcaseError::InvalidResponse)
     }
 
-    /// Binds every SDK storage request to the paired Briefcase test plane.
-    #[must_use]
-    pub fn with_environment(mut self, key: briefcase_client::EnvironmentKey) -> Self {
-        self.environment = Some(key);
-        self
-    }
-
-    /// Enables current-file reads using a fresh proof for each storage operation.
-    #[must_use]
-    pub fn with_reads(
-        mut self,
-        settings: &BriefcaseSettings,
-        iam: std::sync::Arc<dyn crate::application::ports::IamPort>,
-    ) -> Self {
-        self.reader = Some(super::briefcase_reader::BriefcaseSdkReader::new(
-            settings.clone(),
-            iam,
-        ));
-        self
-    }
-
-    fn validate_delegation(
+    async fn send(
         &self,
-        authorization: &DelegatedAuthorization,
-        purpose: DelegationPurpose,
-    ) -> Result<(), BriefcaseError> {
-        if authorization.application_id != self.application_id
-            || authorization.purpose != purpose
-            || authorization.expires_at <= OffsetDateTime::now_utc()
-        {
-            return Err(BriefcaseError::Unauthorized);
+        request: reqwest::RequestBuilder,
+        timeout: Duration,
+        upload_route: bool,
+    ) -> Result<reqwest::Response, BriefcaseError> {
+        let response = request.timeout(timeout).send().await.map_err(|error| {
+            if error.is_timeout() {
+                BriefcaseError::Timeout
+            } else {
+                BriefcaseError::Unavailable
+            }
+        })?;
+        let status = response.status().as_u16();
+        if response.status().is_success() {
+            return Ok(response);
         }
-        Ok(())
+        Err(match status {
+            401 => BriefcaseError::Unauthorized,
+            403 => BriefcaseError::Forbidden,
+            404 if upload_route => BriefcaseError::ContractUnavailable,
+            404 | 410 => BriefcaseError::NotFound,
+            405 | 501 => BriefcaseError::ContractUnavailable,
+            408 | 504 => BriefcaseError::Timeout,
+            413 => BriefcaseError::MediaTooLarge,
+            415 => BriefcaseError::UnsupportedMediaType,
+            _ => BriefcaseError::Unavailable,
+        })
     }
 
-    fn validate_file_access(
+    async fn post_json<T: DeserializeOwned>(
         &self,
-        request: &BriefcaseFileAccessRequest,
-    ) -> Result<(), BriefcaseError> {
-        if request.file_url.as_url().origin() != self.permanent_origin {
+        path: &str,
+        proof: &BriefcaseProof,
+        body: &impl Serialize,
+        request_id: RequestId,
+        upload_route: bool,
+    ) -> Result<T, BriefcaseError> {
+        let request = self
+            .http
+            .post(self.endpoint(path)?)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Proof {}", proof.token.expose_secret()),
+            )
+            .header("x-request-id", request_id.to_string())
+            .json(body);
+        self.send(request, self.timeout, upload_route)
+            .await?
+            .json::<T>()
+            .await
+            .map_err(|_| BriefcaseError::InvalidResponse)
+    }
+
+    async fn list(
+        &self,
+        proof: &BriefcaseProof,
+        path: Option<String>,
+        cursor: Option<String>,
+        limit: u16,
+        request_id: RequestId,
+    ) -> Result<EntryPage, BriefcaseError> {
+        self.post_json(
+            "obo/entries/list",
+            proof,
+            &ListBody {
+                parent_id: None,
+                path,
+                filter: None,
+                cursor,
+                limit: Some(limit),
+            },
+            request_id,
+            false,
+        )
+        .await
+    }
+
+    /// Pages through one folder until `matches` finds an entry.
+    async fn find(
+        &self,
+        proof: &BriefcaseProof,
+        path: Option<String>,
+        request_id: RequestId,
+        matches: impl Fn(&Entry) -> bool,
+    ) -> Result<Entry, BriefcaseError> {
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        for _ in 0..MAX_PAGES {
+            let page = self
+                .list(proof, path.clone(), cursor, PAGE_SIZE, request_id)
+                .await?;
+            if let Some(entry) = page.items.into_iter().find(|entry| matches(entry)) {
+                return Ok(entry);
+            }
+            match page.next_cursor {
+                Some(next) if seen.insert(next.clone()) => cursor = Some(next),
+                Some(_) => return Err(BriefcaseError::InvalidResponse),
+                None => return Err(BriefcaseError::NotFound),
+            }
+        }
+        Err(BriefcaseError::InvalidResponse)
+    }
+
+    /// Drive-relative path behind a permanent URL. Segments are decoded once;
+    /// the result is a lookup key, never a URL to fetch.
+    fn relative_path(&self, url: &BriefcaseFileUrl) -> Result<String, BriefcaseError> {
+        if url.as_url().origin() != self.permanent_origin {
             return Err(BriefcaseError::Forbidden);
         }
-        if request
-            .authorization
-            .expires_at
-            .is_some_and(|expiry| expiry <= OffsetDateTime::now_utc())
-        {
-            return Err(BriefcaseError::Unauthorized);
+        let segments = url
+            .as_url()
+            .path_segments()
+            .ok_or(BriefcaseError::NotFound)?
+            .map(|part| {
+                percent_encoding::percent_decode_str(part)
+                    .decode_utf8()
+                    .map(std::borrow::Cow::into_owned)
+                    .map_err(|_| BriefcaseError::NotFound)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if segments.iter().any(|segment| {
+            segment.is_empty()
+                || segment == "."
+                || segment == ".."
+                || segment.contains(['/', '\\'])
+                || segment.chars().any(char::is_control)
+        }) {
+            return Err(BriefcaseError::NotFound);
         }
-        Ok(())
+        // Legacy: /org/{org}/{path…}. Accounts era: /{owner}/{path…}.
+        let skip = if segments.first().is_some_and(|first| first == "org") && segments.len() >= 4 {
+            2
+        } else {
+            1
+        };
+        if segments.len() <= skip {
+            return Err(BriefcaseError::NotFound);
+        }
+        Ok(segments[skip..].join("/"))
+    }
+
+    async fn resolve(
+        &self,
+        proof: &BriefcaseProof,
+        url: &BriefcaseFileUrl,
+        request_id: RequestId,
+    ) -> Result<Uuid, BriefcaseError> {
+        let path = self.relative_path(url)?;
+        let parent = path.rsplit_once('/').map(|(parent, _)| parent.to_owned());
+        let entry = self
+            .find(proof, parent, request_id, |entry| {
+                entry.path == path && !entry.is_folder() && entry.is_live()
+            })
+            .await?;
+        if let Some(listed) = &entry.permanent_url {
+            let listed = Url::parse(listed)
+                .ok()
+                .and_then(|listed| BriefcaseFileUrl::new(listed).ok())
+                .ok_or(BriefcaseError::InvalidResponse)?;
+            if self.relative_path(&listed)? != path {
+                return Err(BriefcaseError::InvalidResponse);
+            }
+        }
+        Ok(entry.id)
+    }
+
+    async fn open(
+        &self,
+        proof: &BriefcaseProof,
+        url: &BriefcaseFileUrl,
+        request_id: RequestId,
+        probe: bool,
+    ) -> Result<reqwest::Response, BriefcaseError> {
+        let entry_id = self.resolve(proof, url, request_id).await?;
+        let request = self
+            .http
+            .post(self.endpoint("obo/files/read")?)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Proof {}", proof.token.expose_secret()),
+            )
+            .header("x-request-id", request_id.to_string())
+            .json(&ReadBody {
+                entry_id,
+                // Briefcase serves downloads as octet-stream; inline keeps the
+                // declared media type for codec validation.
+                range: probe.then(|| "bytes=0-0".to_owned()),
+                download: false,
+            });
+        self.send(request, self.download_timeout, false).await
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "reserve, transfer, commit and published-entry validation form one ordered upload"
+    )]
+    async fn upload(
+        &self,
+        request: &StoreGeneratedAudioRequest,
+    ) -> Result<BriefcaseFileUrl, BriefcaseError> {
+        let bytes = request.audio.bytes();
+        let operation_id = request.request_id.as_uuid();
+        let reservation: UploadStatus = self
+            .post_json(
+                "obo/uploads/reserve",
+                &request.proof,
+                &ReserveBody {
+                    operation_id,
+                    parent_path: "",
+                    name: request.filename.as_str(),
+                    content_type: "audio/mpeg",
+                    size: u64::try_from(bytes.len()).map_err(|_| BriefcaseError::MediaTooLarge)?,
+                    sha256: format!("{:x}", sha2::Sha256::digest(bytes)),
+                },
+                request.request_id,
+                true,
+            )
+            .await?;
+        if reservation.operation_id != operation_id || reservation.upload_id.is_nil() {
+            return Err(BriefcaseError::InvalidResponse);
+        }
+        let upload_id = reservation.upload_id;
+        let status = match reservation.state {
+            UploadState::Reserved | UploadState::Receiving => {
+                let capability = reservation
+                    .capability
+                    .ok_or(BriefcaseError::InvalidResponse)?;
+                let transfer = self
+                    .http
+                    .put(self.endpoint(&format!("obo/uploads/{upload_id}/content"))?)
+                    .header("x-briefcase-upload-capability", capability)
+                    .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(bytes.clone());
+                let staged: UploadStatus = self
+                    .send(transfer, self.download_timeout, true)
+                    .await?
+                    .json()
+                    .await
+                    .map_err(|_| BriefcaseError::InvalidResponse)?;
+                if staged.operation_id != operation_id
+                    || staged.upload_id != upload_id
+                    || !matches!(staged.state, UploadState::Staged | UploadState::Committed)
+                {
+                    return Err(BriefcaseError::InvalidResponse);
+                }
+                staged
+            }
+            UploadState::Staged | UploadState::Committed => reservation,
+            UploadState::Other => return Err(BriefcaseError::Unavailable),
+        };
+        let committed = if status.state == UploadState::Committed {
+            status
+        } else {
+            self.post_json(
+                "obo/uploads/commit",
+                &request.proof,
+                &CommitBody {
+                    operation_id,
+                    upload_id,
+                },
+                request.request_id,
+                true,
+            )
+            .await?
+        };
+        if committed.operation_id != operation_id
+            || committed.upload_id != upload_id
+            || committed.state != UploadState::Committed
+        {
+            return Err(BriefcaseError::InvalidResponse);
+        }
+        let published = committed
+            .published_entry_id
+            .ok_or(BriefcaseError::InvalidResponse)?;
+        let entry = match committed.entry {
+            Some(entry) if entry.id == published => entry,
+            _ => {
+                self.find(
+                    &request.proof,
+                    Some(self.app_folder.clone()),
+                    request.request_id,
+                    |entry| entry.id == published,
+                )
+                .await?
+            }
+        };
+        let size = u64::try_from(bytes.len()).map_err(|_| BriefcaseError::MediaTooLarge)?;
+        if entry.is_folder()
+            || !entry.is_live()
+            || entry.name != request.filename.as_str()
+            || entry
+                .content_type
+                .as_deref()
+                .is_some_and(|value| value != "audio/mpeg")
+            || entry.size.is_some_and(|value| value != size)
+            || entry
+                .origin_app_id
+                .as_deref()
+                .is_some_and(|app| app != self.waveform_app_id)
+        {
+            return Err(BriefcaseError::InvalidResponse);
+        }
+        let url = entry
+            .permanent_url
+            .as_deref()
+            .and_then(|value| Url::parse(value).ok())
+            .and_then(|value| BriefcaseFileUrl::new(value).ok())
+            .ok_or(BriefcaseError::InvalidResponse)?;
+        if url.as_url().origin() != self.permanent_origin {
+            return Err(BriefcaseError::InvalidResponse);
+        }
+        Ok(url)
+    }
+
+    /// Makes sure Waveform's folder exists in the account's drive and returns it,
+    /// so a caller can put STT source audio there.
+    ///
+    /// Briefcase shows an app only what is inside `apps/{app}/`, not `apps/`
+    /// itself. Current Briefcase includes the listed folder as metadata, including
+    /// when empty. Earlier responses are supported through a child's `parent_id`
+    /// or an explicitly accessible apps/ container.
+    ///
+    /// # Errors
+    ///
+    /// [`BriefcaseError`] by category; `NotFound` when Briefcase does not let
+    /// Waveform see its folder's entry (the folder is empty and the container is
+    /// not listed to Waveform).
+    pub async fn prepare_source_target(
+        &self,
+        proof: &BriefcaseProof,
+        request_id: RequestId,
+    ) -> Result<SourceTarget, BriefcaseError> {
+        // Listing with no parent opens Waveform's folder, creating it on first use.
+        let page = self.list(proof, None, None, 1, request_id).await?;
+        if let Some(folder) = page.folder.as_ref().filter(|folder| {
+            folder.path == self.app_folder
+                && folder.is_folder()
+                && folder.is_live()
+                && folder
+                    .origin_app_id
+                    .as_deref()
+                    .is_none_or(|app| app == self.waveform_app_id)
+        }) {
+            return Ok(SourceTarget {
+                folder_id: folder.id,
+                folder_path: self.app_folder.clone(),
+            });
+        }
+        let prefix = format!("{}/", self.app_folder);
+        if let Some(folder_id) = page
+            .items
+            .iter()
+            .find(|entry| {
+                entry.path.starts_with(&prefix) && !entry.path[prefix.len()..].contains('/')
+            })
+            .and_then(|entry| entry.parent_id)
+            .filter(|id| !id.is_nil())
+        {
+            return Ok(SourceTarget {
+                folder_id,
+                folder_path: self.app_folder.clone(),
+            });
+        }
+        let parent = self
+            .app_folder
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_owned());
+        let folder = self
+            .find(proof, parent, request_id, |entry| {
+                entry.path == self.app_folder && entry.is_folder() && entry.is_live()
+            })
+            .await
+            .map_err(|error| match error {
+                BriefcaseError::Forbidden => BriefcaseError::NotFound,
+                other => other,
+            })?;
+        if folder
+            .origin_app_id
+            .as_deref()
+            .is_some_and(|app| app != self.waveform_app_id)
+        {
+            return Err(BriefcaseError::InvalidResponse);
+        }
+        Ok(SourceTarget {
+            folder_id: folder.id,
+            folder_path: folder.path,
+        })
     }
 }
 
 #[async_trait]
-impl BriefcasePort for FailClosedBriefcaseStore {
+impl BriefcasePort for BriefcaseHttp {
     async fn verify_file_read_access(
         &self,
         request: BriefcaseFileAccessRequest,
     ) -> Result<(), BriefcaseError> {
-        self.validate_file_access(&request)?;
-        self.reader
-            .as_ref()
-            .ok_or(BriefcaseError::ContractUnavailable)?
-            .verify(request, self.environment.clone())
-            .await
-    }
-
-    async fn issue_temporary_url(
-        &self,
-        request: BriefcaseFileAccessRequest,
-    ) -> Result<TemporaryMediaUrl, BriefcaseError> {
-        self.validate_file_access(&request)?;
-        Err(BriefcaseError::ContractUnavailable)
+        tokio::time::timeout(self.download_timeout, async {
+            // Successful read headers establish current access; the body is dropped.
+            self.open(&request.proof, &request.file_url, request.request_id, true)
+                .await
+                .map(drop)
+        })
+        .await
+        .map_err(|_| BriefcaseError::Timeout)?
     }
 
     async fn read_source_media(
         &self,
         request: ReadSourceMediaRequest,
     ) -> Result<SourceMedia, BriefcaseError> {
-        if request.source_url.as_url().origin() != self.permanent_origin {
-            return Err(BriefcaseError::Forbidden);
-        }
-        self.reader
-            .as_ref()
-            .ok_or(BriefcaseError::ContractUnavailable)?
-            .read(request, self.environment.clone())
-            .await
+        tokio::time::timeout(self.download_timeout, async {
+            let mut response = self
+                .open(
+                    &request.proof,
+                    &request.source_url,
+                    request.request_id,
+                    false,
+                )
+                .await?;
+            let limit = request.size_limit.get().min(
+                u64::try_from(self.max_download_bytes)
+                    .map_err(|_| BriefcaseError::MediaTooLarge)?,
+            );
+            if response
+                .content_length()
+                .is_some_and(|length| length > limit)
+            {
+                return Err(BriefcaseError::MediaTooLarge);
+            }
+            if response
+                .headers()
+                .contains_key(reqwest::header::CONTENT_RANGE)
+            {
+                return Err(BriefcaseError::InvalidResponse);
+            }
+            let media_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .ok_or(BriefcaseError::UnsupportedMediaType)?
+                .parse()
+                .map_err(|_| BriefcaseError::UnsupportedMediaType)?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| BriefcaseError::Unavailable)?
+            {
+                let size = bytes
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or(BriefcaseError::MediaTooLarge)?;
+                if u64::try_from(size).map_err(|_| BriefcaseError::MediaTooLarge)? > limit {
+                    return Err(BriefcaseError::MediaTooLarge);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            SourceMedia::new(media_type, Bytes::from(bytes), request.size_limit)
+                .map_err(|_| BriefcaseError::InvalidResponse)
+        })
+        .await
+        .map_err(|_| BriefcaseError::Timeout)?
     }
 
     async fn store_generated_audio(
         &self,
         request: StoreGeneratedAudioRequest,
-    ) -> Result<StoredAudio, BriefcaseError> {
-        self.validate_delegation(
-            &request.delegated_authorization,
-            DelegationPurpose::StoreGeneratedAudio,
-        )?;
-        let uploader = self
-            .uploader
-            .as_ref()
-            .ok_or(BriefcaseError::ContractUnavailable)?;
-        let entry = uploader
-            .upload(super::briefcase_sdk::AudioUpload {
-                app_id: self.application_id.as_str(),
-                organization: request.delegated_authorization.organization_id.as_str(),
-                operation_id: request.request_id.as_uuid(),
-                delegated_authorization: &request.delegated_authorization,
-                environment: self.environment.clone(),
-                filename: &request.filename,
-                audio: &request.audio,
-            })
-            .await
-            .map_err(|error| match error {
-                super::briefcase_sdk::UploadError::InvalidEntry => BriefcaseError::InvalidResponse,
-                super::briefcase_sdk::UploadError::Delegation => BriefcaseError::Unauthorized,
-                _ => BriefcaseError::Unavailable,
-            })?;
-        Ok(StoredAudio {
-            permanent_url: crate::domain::media::BriefcaseFileUrl::new(entry.permanent_url)
-                .map_err(|_| BriefcaseError::InvalidResponse)?,
-            temporary_url: None,
-        })
+    ) -> Result<BriefcaseFileUrl, BriefcaseError> {
+        tokio::time::timeout(
+            self.download_timeout.max(self.timeout),
+            self.upload(&request),
+        )
+        .await
+        .map_err(|_| BriefcaseError::Timeout)?
     }
-}
-
-fn validate_origin(value: &Url) -> Result<(), BriefcaseAdapterBuildError> {
-    if !matches!(value.scheme(), "http" | "https")
-        || value.host_str().is_none()
-        || !value.username().is_empty()
-        || value.password().is_some()
-        || !matches!(value.path(), "" | "/")
-        || value.query().is_some()
-        || value.fragment().is_some()
-    {
-        return Err(BriefcaseAdapterBuildError::InvalidPermanentOrigin);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{str::FromStr as _, time::Duration};
-
-    use bytes::Bytes;
-    use time::OffsetDateTime;
-    use url::Url;
-    use uuid::Uuid;
-
-    use super::FailClosedBriefcaseStore;
-    use crate::{
-        application::ports::{
-            BriefcaseError, BriefcaseFileAccessRequest, BriefcasePort, ReadSourceMediaRequest,
-            StoreGeneratedAudioRequest,
-        },
-        config::BriefcaseSettings,
-        domain::{
-            auth::{AuthorizedActor, DelegatedAuthorization, DelegationPurpose, OboProof},
-            idempotency::IdempotencyKey,
-            identity::{Actor, ActorId, ActorKind, ApplicationId, OrganizationId, RequestId},
-            media::{
-                BriefcaseFileUrl, GeneratedAudioFileName, MediaDuration, MediaSizeLimit,
-                NormalizedAudio,
-            },
-        },
-    };
-
-    fn settings() -> Result<BriefcaseSettings, url::ParseError> {
-        Ok(BriefcaseSettings {
-            base_url: Url::parse("https://briefcase.example.test/api/v1")?,
-            permanent_origin: Url::parse("https://briefcase.example.test")?,
-            cdn_origin: Url::parse("https://cdn.example.test")?,
-            app_id: "waveform".to_owned(),
-            audience: "briefcase".to_owned(),
-            timeout: Duration::from_secs(10),
-            download_timeout: Duration::from_secs(30),
-            max_download_bytes: 25 * 1_024 * 1_024,
-        })
-    }
-
-    fn request_id() -> Result<RequestId, crate::domain::identity::IdentityError> {
-        RequestId::new(Uuid::new_v4())
-    }
-
-    fn authorized_actor() -> Result<AuthorizedActor, Box<dyn std::error::Error>> {
-        Ok(AuthorizedActor {
-            actor: Actor::new(ActorKind::Carbon, ActorId::new(Uuid::new_v4())?),
-            organization_id: OrganizationId::from_str("acme")?,
-            originating_application: None,
-            expires_at: None,
-        })
-    }
-
-    fn delegation(
-        purpose: DelegationPurpose,
-    ) -> Result<DelegatedAuthorization, Box<dyn std::error::Error>> {
-        Ok(DelegatedAuthorization {
-            organization_id: "acme".parse()?,
-            commit_proof: None,
-            list_proof: None,
-            actor_id: None,
-            testing_secret: None,
-            application_id: ApplicationId::from_str("waveform")?,
-            proof: OboProof::new("obo_downstream-proof".to_owned())?,
-            purpose,
-            expires_at: OffsetDateTime::now_utc() + time::Duration::seconds(60),
-        })
-    }
-
-    #[tokio::test]
-    async fn trusted_source_origin_reaches_explicit_contract_gap()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let adapter = FailClosedBriefcaseStore::new(&settings()?)?;
-        let source_url = BriefcaseFileUrl::new(Url::parse(
-            "https://briefcase.example.test/api/v1/entries/one",
-        )?)?;
-        let result = adapter
-            .read_source_media(ReadSourceMediaRequest {
-                authorization: authorized_actor()?,
-                source_url,
-                subject_token: None,
-                size_limit: MediaSizeLimit::default(),
-                request_id: request_id()?,
-            })
-            .await;
-
-        assert_eq!(result, Err(BriefcaseError::ContractUnavailable));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn untrusted_origin_is_rejected_before_contract_gap()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let adapter = FailClosedBriefcaseStore::new(&settings()?)?;
-        let source_url = BriefcaseFileUrl::new(Url::parse(
-            "https://attacker.example.test/api/v1/entries/one",
-        )?)?;
-        let result = adapter
-            .read_source_media(ReadSourceMediaRequest {
-                authorization: authorized_actor()?,
-                source_url,
-                subject_token: None,
-                size_limit: MediaSizeLimit::default(),
-                request_id: request_id()?,
-            })
-            .await;
-
-        assert_eq!(result, Err(BriefcaseError::Forbidden));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn replay_access_checks_reach_the_explicit_contract_gap()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let adapter = FailClosedBriefcaseStore::new(&settings()?)?;
-        let file_url = BriefcaseFileUrl::new(Url::parse(
-            "https://briefcase.example.test/api/v1/entries/one",
-        )?)?;
-        let access_request = BriefcaseFileAccessRequest {
-            authorization: authorized_actor()?,
-            subject_token: None,
-            file_url,
-            request_id: request_id()?,
-        };
-
-        assert_eq!(
-            adapter
-                .verify_file_read_access(access_request.clone())
-                .await,
-            Err(BriefcaseError::ContractUnavailable)
-        );
-        assert_eq!(
-            adapter.issue_temporary_url(access_request).await,
-            Err(BriefcaseError::ContractUnavailable)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn replay_access_rejects_untrusted_origins_and_expired_delegation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let adapter = FailClosedBriefcaseStore::new(&settings()?)?;
-        let untrusted = BriefcaseFileAccessRequest {
-            authorization: authorized_actor()?,
-            subject_token: None,
-            file_url: BriefcaseFileUrl::new(Url::parse(
-                "https://attacker.example.test/api/v1/entries/one",
-            )?)?,
-            request_id: request_id()?,
-        };
-        assert_eq!(
-            adapter.issue_temporary_url(untrusted).await,
-            Err(BriefcaseError::Forbidden)
-        );
-
-        let mut expired_actor = authorized_actor()?;
-        expired_actor.expires_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
-        let expired = BriefcaseFileAccessRequest {
-            authorization: expired_actor,
-            subject_token: None,
-            file_url: BriefcaseFileUrl::new(Url::parse(
-                "https://briefcase.example.test/api/v1/entries/one",
-            )?)?,
-            request_id: request_id()?,
-        };
-        assert_eq!(
-            adapter.verify_file_read_access(expired).await,
-            Err(BriefcaseError::Unauthorized)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn generated_audio_storage_never_invents_an_app_folder_route()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let adapter = FailClosedBriefcaseStore::new(&settings()?)?;
-        let request_id = request_id()?;
-        let result = adapter
-            .store_generated_audio(StoreGeneratedAudioRequest {
-                authorization: authorized_actor()?,
-                delegated_authorization: delegation(DelegationPurpose::StoreGeneratedAudio)?,
-                filename: GeneratedAudioFileName::for_request(
-                    OffsetDateTime::now_utc(),
-                    request_id,
-                ),
-                audio: NormalizedAudio::new(
-                    Bytes::from_static(b"bounded-mp3"),
-                    MediaDuration::from_millis(1),
-                )?,
-                idempotency_key: IdempotencyKey::for_briefcase_upload(request_id),
-                request_id,
-            })
-            .await;
-
-        assert_eq!(result, Err(BriefcaseError::ContractUnavailable));
-        Ok(())
-    }
-
-    #[test]
-    fn constructor_rejects_path_bearing_origins() -> Result<(), url::ParseError> {
-        let mut settings = settings()?;
-        settings.permanent_origin = Url::parse("https://briefcase.example.test/api/v1")?;
-
-        assert!(FailClosedBriefcaseStore::new(&settings).is_err());
-        Ok(())
-    }
-}
+#[path = "briefcase_tests.rs"]
+mod tests;

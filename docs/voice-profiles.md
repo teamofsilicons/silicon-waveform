@@ -7,9 +7,9 @@ provider's capitalization.
 
 ## Usage
 
-Authenticate and list `GET /api/v1/voice-profiles` with `X-Org-Id`. The response
-is `{ "items": [...] }`, including each profile's Gemini voice, OpenAI voice,
-ElevenLabs configuration, revision, and listening-review status.
+List the catalog with `GET /api/v1/voice-profiles` (any signed-in account; `waveform voice-profiles` in the CLI).
+The response is `{ "items": [...] }`, including each profile's Gemini voice, OpenAI voice, ElevenLabs configuration,
+revision, and listening-review status.
 
 Set an account default with `PATCH /api/v1/preferences`:
 
@@ -45,23 +45,17 @@ replays retain the original profile and audio even after defaults or mappings
 change. Changing the explicit profile while reusing a key is a conflicting
 request. Failed attempts may resolve the current mapping when retried.
 
-## Account and test-environment lifecycle
+## Account defaults
 
-IAM owns signup. Waveform persists the initial default on the first successful
-Waveform login after signup, and on first authenticated use for existing accounts
-or headless/OBO callers. Login never overwrites an existing preference. Accounts
-are scoped by environment, organization, and IAM principal ID.
+Every account starts with Waveform's default profile, which lives in the database (`waveform_provider_defaults`), not
+in code. Waveform saves it as the account's preference the first time the account uses Waveform; signing in again
+never overwrites a saved choice, and an account that had a choice before Silicon Accounts keeps it once its data is
+linked. A Carbon can read and change the default of a Silicon it looks after with
+`PATCH /api/v1/preferences?account=si:…` (`waveform preferences --account si:… --voice-profile …`).
 
-New test environments copy the production catalog and workspace defaults into
-their own rows. Their preferences and catalog edits cannot affect production.
-Cleaning a test environment clears account choices; the next authenticated use
-assigns that environment's default again. Catalog configuration survives cleaning.
-Deletion and retention cleanup remove the catalog with the environment.
-
-Test speech still uses the prescribed prerecorded fixture and IAM-discovered Briefcase
-storage; profile selection and metadata are real, but the fixture cannot validate
-how a selected voice sounds. Provider HTTP contract tests verify the mapped
-parameters independently.
+With speech fixtures on (`WAVEFORM_SPEECH_FIXTURES=true`, development and CI only), TTS returns the prerecorded clip
+of the resolved profile instead of calling a provider. Profile selection and metadata are real, but a fixture cannot
+show how a selected voice sounds; provider HTTP contract tests verify the mapped parameters independently.
 
 ## Initial mappings and listening review
 
@@ -85,12 +79,12 @@ OpenAI voice. The active API key must have access to the mapped library voice.
 Provider failures advance only when `auto_fallback: true` is explicitly requested.
 The default is off. See [per-provider controls and BYOK](api.md).
 
-Operators can tune `waveform_voice_profiles.profile` in the selected plane after
-listening to samples. Every edit automatically increments the profile revision.
+Operators can tune `waveform_voice_profiles.profile` (the rows with the nil `plane_id`)
+after listening to samples. Every edit automatically increments the profile revision.
 Runtime validation rejects unsupported OpenAI voices, incorrect ElevenLabs models,
 invalid identifiers, and settings outside the provider's numeric limits. Set
-`auditioned` to true only after reviewing the mapping. There is no user-facing
-catalog editing API; account users select among the available profiles.
+`auditioned` to true only after reviewing the mapping. There is no catalog editing
+API; Carbons and Silicons choose among the available profiles.
 
 Sources checked on 2026-09-08:
 
@@ -102,8 +96,6 @@ Sources checked on 2026-09-08:
 
 ## Rollout
 
-Deploy the backend with migration `0009_voice_profiles.sql` before the frontend
-and client changes. Startup applies migrations automatically. Existing account
-rows are assigned their plane's workspace default; existing speech requests
-remain valid. The frontend can then list profiles and save/select defaults.
-This feature's local implementation does not itself deploy AWS or host the UI.
+The catalog arrived with migration `0009_voice_profiles.sql`, which startup applies; existing accounts were given the
+default profile and existing speech requests stayed valid. A new profile or mapping is a database change: no client or
+website release is needed for it to appear.

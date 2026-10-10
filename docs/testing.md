@@ -1,47 +1,95 @@
-# Testing environments
+# Testing with Waveform
 
-## Select your sandbox
+Waveform has no hosted sandboxes. Test against a development Waveform: one you run on your machine (or in CI) with
+deterministic speech fixtures, signed in with a development Silicon Accounts. Nothing you do there reaches a paid
+speech provider or production data.
 
-Create or import Waveform in a Honeycomb testing environment. Take the application's `app_secret`, not the IAM environment root key. Use Honeycomb for lifecycle management and IAM for test identities.
+## Run a development Waveform
+
+Start the service with fixtures on, pointed at a development Silicon Accounts and a PostgreSQL database:
 
 ```sh
-waveform --app-secret-file /private/path/test-secret login TEST_PUBLIC_ID
-waveform --test ENVIRONMENT_UUID tts 'Hello' --org TEST_ORG --actor TEST_PRINCIPAL_UUID
+export WAVEFORM_DATABASE_URL=postgres://postgres@127.0.0.1:5432/waveform_dev
+export WAVEFORM_BIND_ADDR=127.0.0.1:4161 WAVEFORM_PUBLIC_URL=http://127.0.0.1:4161
+export ACCOUNTS_URL=http://localhost:9590 ACCOUNTS_API_URL=http://127.0.0.1:9589
+export WAVEFORM_APP_SECRET=sa_app_…            # Waveform's secret at that Silicon Accounts
+export WAVEFORM_SPEECH_FIXTURES=true WAVEFORM_ENVIRONMENT=development
+export WAVEFORM_IDEMPOTENCY_DIGEST_KEY="$(openssl rand -hex 32)"
+cargo run --bin waveform-api
 ```
 
-You may also use `waveform --test 'ask_…' COMMAND`. A private file or stdin avoids putting the secret in shell history. Once discovery succeeds, the CLI stores a private UUID-to-secret mapping so `--test ENVIRONMENT_UUID` works. State lives under `$SILICON_HOME/.waveform/dir`, or `~/.waveform/dir` by default. The selected sandbox is printed to stderr at the end, including failures; stdout remains usable as JSON.
+`WAVEFORM_SPEECH_FIXTURES=true` (refused in production) replaces every speech provider for the whole process:
 
-In the website, choose **Use a test app_secret** on sign-in or in settings. Enter the secret, then an IAM test SLT or an existing active Carbon/Silicon public ID. The banner identifies the environment and identity. **Exit testing mode** returns to the separate production session.
+- TTS returns the prerecorded clip of the requested (or your default) voice profile, whichever provider you select.
+  Provider controls are validated but do not change the clip.
+- STT returns a fixed transcript for any valid source audio.
+- Saved and request-only provider keys are accepted and never used, so key flows can be exercised end to end.
 
-## API and Rust
+Everything else is real: sign-in, history, preferences, idempotency, Briefcase access and storage. See
+[configuration](configuration.md) for every variable.
 
-Send `X-Testing-Environment-Key: <Waveform IAM test app_secret>` on every request. This historical header name now accepts application secrets. `GET /api/v1/testing-environment` discovers the sandbox without a user login. `POST /api/v1/auth/login` accepts `{"slt":"TEST_PUBLIC_ID"}` or an IAM-issued test SLT. Other operations require the resulting bearer and the appropriate organization and permissions.
+## Point the CLI at it
 
-```rust,no_run
-use silicon_waveform_client::{Auth, Client, TestEnvironmentKey};
-# async fn example(secret: String) -> Result<(), Box<dyn std::error::Error>> {
-let sandbox = Client::new("https://backend.waveform.teamofsilicons.com", Auth::Anonymous)?
-    .with_test_environment(TestEnvironmentKey::new(secret)?);
-let environment = sandbox.current_test_environment().await?;
-let tokens = sandbox.login("existing-test-user").await?;
-let authenticated = sandbox.with_bearer(tokens.access_token);
-# Ok(()) }
+```sh
+export WAVEFORM_URL=http://127.0.0.1:4161 ACCOUNTS_URL=http://localhost:9590
+waveform login                                                    # a Carbon: approve the code
+silicon-accounts login --app waveform -q | waveform login --slt-stdin   # a Silicon
+waveform tts 'Test speech'
 ```
 
-## Isolation and permissions
+Plain `http://` is accepted only for this machine. Sign-ins are kept per Silicon Accounts origin, so a development
+sign-in never replaces your production one. Use `--profile NAME` to keep several test accounts side by side.
 
-The secret selects a world; it does not select a user or confer administrative privileges. Ordinary IAM authorization, organization and speech scopes apply. Unknown/inactive identities, production tokens, wrong-world tokens, revoked secrets and unavailable IAM are rejected. A failed test selection never falls back to production.
+## Everything on one machine, end to end
 
-New sandboxes contain no user data. Voice profiles and provider defaults are configuration shared as initial defaults. Jobs, provider keys, preferences, idempotency, reports and webhook metadata are scoped to the environment. Honeycomb owns environment creation and lifecycle. Waveform receives authenticated preparation, rotation, cleaning, disabling, restoration and removal instructions; IAM still authenticates the test identities. Cleanup fences running operations and clears test records before acknowledging completion. The environment link survives cleanup. Old public lifecycle URLs return `manage_environment_in_honeycomb`. See the [participant protocol](honeycomb-lifecycle.md).
+In a checkout of the repository, `scripts/dev-accounts.sh` runs Waveform against a development Silicon Accounts with
+one command, and `scripts/e2e-accounts.sh` proves the whole product against it with real tokens:
 
-## Speech and Briefcase
+```sh
+export WAVEFORM_DEV_STACK=/path/to/stack.json   # the development Silicon Accounts (below)
+scripts/dev-accounts.sh start                   # API on 127.0.0.1:4161, a Briefcase stand-in on :4162
+eval "$(scripts/dev-accounts.sh env)"           # WAVEFORM_URL and ACCOUNTS_URL for the CLI
+waveform login
+scripts/dev-accounts.sh stop
+```
 
-Test TTS selects the prerecorded Gemini clip matching the requested/account-default voice profile, even when ElevenLabs or OpenAI is selected with fallback off. Provider controls are validated, but do not change prerecorded audio. Supplied BYOK credentials are never sent to a real provider. Each request uploads a new uniquely named MP3 through the Briefcase client. Test STT validates source access and returns the fixed test transcript. No paid TTS or STT provider call runs.
+The stack description is JSON: `accounts_public_url`, `accounts_api_url`, optionally `fake_apps_url`, and
+`apps.waveform.app_secret` and `apps.briefcase.app_secret` (development secrets only; the script refuses a Silicon
+Accounts that is not on this machine). `start` is idempotent: it creates and migrates the database (`waveform_e2e` on
+`127.0.0.1:5460`), keeps encryption keys in `.mig/dev/`, makes Waveform's sign-in setup there offer email codes, the
+device flow, the CLI as a public client and the local callbacks, points Waveform's webhook at the API with a fresh
+secret (kept in `.mig/dev/`, never in the repository), starts a stand-in Briefcase that verifies every proof with
+Briefcase's own development credentials (or uses the Briefcase at `WAVEFORM_BRIEFCASE_BASE_URL`), starts the API
+with speech fixtures, and waits until a signed test event arrives. `restart-api`, `status` and `stop` do what they say.
 
-Approve Briefcase separately through the storage authorization flow after login. The selected IAM testing world supplies Briefcase's app credential with the approved token. Waveform keeps direct grant credentials encrypted and forwards the recipient secret only to Briefcase. Incoming OBO uses the same approved chain token at each dependency. Missing or mismatched testing context fails closed; clean/purge also removes storage grants. No separate Briefcase key is supplied by the caller.
+`scripts/e2e-accounts.sh` starts a fresh stack and checks, with new Carbons and Silicons on every run: a Carbon on the
+API, a Silicon on the CLI, the device flow, custodians and outsiders, account events (an id change, access removed, a
+custodian transfer, forged and replayed deliveries), proofs from other apps and Waveform's own proofs to Briefcase
+(refresh, recovery and revocation), discovery from a packaged archive, and a restart. It prints PASS or FAIL for every
+check, keeps a transcript without secrets in `.mig/e2e/`, and exits 1 when anything failed (`--help` lists what it
+needs).
 
-## Webhooks and side effects
+## Automated tests
 
-Waveform verifies signatures over the complete raw body before interpreting the test wrapper. The authenticated testing key digest selects the matching environment. It records content-free event metadata, deduplicates event IDs and always reads current authorization from IAM, so reordered events cannot grant stale access. Root keys and raw webhook payloads are not stored.
+- `cargo test --manifest-path cli/Cargo.toml` runs the real `waveform` binary in empty homes against a stub Silicon
+  Accounts and a stub Waveform: the device flow, short-lived token refusals, refresh rotation across processes,
+  sign-out, discovery shapes and the speech commands.
+- `cargo test --manifest-path client/Cargo.toml` covers the Rust client against stubs.
+- The service's own tests run against PostgreSQL with `WAVEFORM_TEST_DATABASE_URL` set
+  (`cargo test --lib -- --ignored --test-threads=1`).
 
-Bug reports in testing are persisted as `simulated`; they never send real mail. Test operations do not emit production telemetry. Sandbox requests cannot invoke paid speech providers.
+In your own tests, stub Waveform with any HTTP mock: the client sends `Authorization: Bearer …` (or `Proof …`),
+`Idempotency-Key` on speech, and the version headers `X-Waveform-API-Version: v1` and
+`X-Waveform-Protocol-Version: 1`.
+
+## Proofs in tests
+
+To test an app that calls Waveform for its users, register the app at your development Silicon Accounts, sign a test
+account in to it, issue a User verification proof for `receiving_app` `waveform` with scope `waveform.tts` or
+`waveform.stt`, and allow the app in the development Waveform's `WAVEFORM_PROOF_ISSUERS`. A proof from an app that is
+not allowed for the scope is refused with `403 proof_issuer_not_allowed`.
+
+## Bug reports
+
+`waveform report` needs a configured mail service (`WAVEFORM_POSTMARK_TOKEN`); without one a development Waveform
+answers `503 postmark_not_configured` and keeps nothing.

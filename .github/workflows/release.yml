@@ -1,4 +1,9 @@
-name: Build validated Honeycomb release
+name: Build Silicon Apps release
+
+# Builds the waveform CLI for every target it ships, packs one Silicon Apps archive per target on that target's own
+# runner (after running the three discovery commands there), and uploads them with SHA256SUMS as the workflow artifact
+# `waveform-silicon-apps-release`. It publishes nothing: uploads to Silicon Apps, crates.io and GitHub releases are
+# separate, reviewed steps (docs/releases.md).
 
 on:
   workflow_dispatch:
@@ -8,8 +13,31 @@ on:
 permissions:
   contents: read
 
+env:
+  SILICON_APPS_CLI_VERSION: 0.2.0
+
 jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the CLI version and check the release tag against it
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("cli/Cargo.toml", "rb"))["package"]["version"])')
+          if [ "$REF_TYPE" = tag ] && [ "$REF_NAME" != "v$version" ]; then
+            echo "::error::The release tag $REF_NAME must be v$version, the version in cli/Cargo.toml."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   binaries:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -39,9 +67,6 @@ jobs:
             triple: aarch64-apple-darwin
             binary: waveform
     runs-on: ${{ matrix.runner }}
-    defaults:
-      run:
-        working-directory: cli
     env:
       CC_x86_64_unknown_linux_musl: musl-gcc
       CC_aarch64_unknown_linux_musl: musl-gcc
@@ -59,11 +84,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: cli
-      - run: python ../scripts/sync-cli-docs.py --check
-      - run: python ../scripts/sync-honeycomb.py --check
-      - run: cargo test --locked -p waveform-cli --target ${{ matrix.triple }}
-      - run: cargo build --release --locked -p waveform-cli --target ${{ matrix.triple }}
-      - run: ./target/${{ matrix.triple }}/release/${{ matrix.binary }} --version
+          key: ${{ matrix.target }}
+      - name: Check bundled documentation
+        run: python scripts/sync-cli-docs.py --check
+      - name: Test the CLI on its target
+        run: cargo test --locked --manifest-path cli/Cargo.toml --target ${{ matrix.triple }}
+      - name: Build the release binary
+        run: cargo build --release --locked --manifest-path cli/Cargo.toml --target ${{ matrix.triple }}
       - name: Reject dynamic Linux linkage
         if: startsWith(matrix.target, 'linux-')
         shell: bash
@@ -72,7 +99,7 @@ jobs:
         run: |
           python - <<'PY'
           import os, pathlib, struct
-          executable = pathlib.Path('target') / os.environ['TRIPLE'] / 'release/waveform'
+          executable = pathlib.Path('cli/target') / os.environ['TRIPLE'] / 'release/waveform'
           data = executable.read_bytes()
           assert data[:6] == b'\x7fELF\x02\x01'
           offset = struct.unpack_from('<Q', data, 32)[0]
@@ -80,59 +107,56 @@ jobs:
           assert all(struct.unpack_from('<I', data, offset + size * index)[0] != 3 for index in range(count)), 'Linux executable requires a dynamic loader'
           assert b'GLIBC_2.' not in data, 'Linux executable has a GLIBC requirement'
           PY
-      - name: Stage native artifact with its manifest
+      - name: Install the Silicon Apps packer
+        shell: bash
+        run: cargo install --locked silicon-apps-cli --version "$SILICON_APPS_CLI_VERSION"
+      - name: Package for Silicon Apps (runs the discovery commands on this runner)
         shell: bash
         env:
+          PACKAGE_DISCOVERY: require
+          VERSION: ${{ needs.version.outputs.version }}
           TARGET: ${{ matrix.target }}
-          TRIPLE: ${{ matrix.triple }}
-          BINARY: ${{ matrix.binary }}
-        run: |
-          python - <<'PY'
-          import os, pathlib, shutil
-          stage = pathlib.Path('../build-artifacts') / os.environ['TARGET']
-          stage.mkdir(parents=True, exist_ok=True)
-          shutil.copyfile(pathlib.Path('target') / os.environ['TRIPLE'] / 'release' / os.environ['BINARY'], stage / os.environ['BINARY'])
-          shutil.copyfile('../honeycomb.yaml', stage / 'honeycomb.yaml')
-          PY
+          BINARY: cli/target/${{ matrix.triple }}/release/${{ matrix.binary }}
+        run: scripts/package-apps.sh "$VERSION" "$TARGET" "$BINARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
-          path: build-artifacts/${{ matrix.target }}/
+          name: waveform-apps-${{ matrix.target }}
+          path: dist/apps/
           if-no-files-found: error
 
   package:
-    needs: binaries
+    needs: [version, binaries]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          pattern: '*-*64'
-          path: release-binaries
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.98.0
-      - name: Install the pinned Honeycomb packager
-        run: cargo install silicon-honeycomb-cli --locked --version 0.4.0
-      - name: Check release tag against the CLI version
-        if: startsWith(github.ref, 'refs/tags/')
+          pattern: waveform-apps-*
+          path: release
+          merge-multiple: true
+      - name: Check every archive and write SHA256SUMS
+        working-directory: release
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
-          python - <<'PY'
-          import os, tomllib
-          with open('cli/Cargo.toml', 'rb') as source:
-              version = tomllib.load(source)['package']['version']
-          assert os.environ['RELEASE_TAG'] == f'v{version}', 'Release tag must match the CLI version'
-          PY
-      - run: python scripts/package-release.py --binaries-dir release-binaries
+          set -euo pipefail
+          for target in linux-x86_64 linux-aarch64 windows-x86_64 windows-aarch64 macos-x86_64 macos-aarch64; do
+            archive="waveform-$VERSION-$target.tar.gz"
+            test -f "$archive" || { echo "::error::$archive is missing"; exit 1; }
+            sha256sum --check --strict "$archive.sha256"
+            members=$(tar -tzf "$archive" | sort | tr '\n' ' ')
+            case "$target" in
+              windows-*) expected="apps.yaml bin/waveform.exe " ;;
+              *) expected="apps.yaml bin/waveform " ;;
+            esac
+            test "$members" = "$expected" || { echo "::error::$archive holds: $members"; exit 1; }
+          done
+          sha256sum waveform-"$VERSION"-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: waveform-honeycomb-release
-          path: dist/*
+          name: waveform-silicon-apps-release
+          path: release/*
           if-no-files-found: error
 
-# This workflow produces reviewable artifacts; it does not publish a release.
+# Silicon Apps validates uploads on its Linux workers today (linux-x86_64, linux-i686, linux-aarch64, linux-armv7hf).
+# The macOS and Windows archives are built, checked on their own runners and kept for when those workers go live.

@@ -1,0 +1,20 @@
+{
+  "verified_at": "2026-10-10",
+  "authentication": "Genuine Carbon Silicon Accounts SLT exchanged by released CLI; canonical UUID",
+  "tts": {
+    "provider": "openai",
+    "duration_ms": 1680,
+    "request_id": "66908a5d-81f9-4749-bfd7-299a49785944",
+    "storage": {
+      "status": "stored"
+    },
+    "real_briefcase_file": true
+  },
+  "stt": {
+    "provider": "openai",
+    "duration_ms": 1680,
+    "request_id": "5b893bb2-426e-42e3-a394-5434776fd10c",
+    "transcript": "Silicon waveform is ready."
+  },
+  "legacy_iam_adoption": false
+}

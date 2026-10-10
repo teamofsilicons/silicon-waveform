@@ -1,23 +1,29 @@
-//! Durable product APIs: application login, account settings and IAM events.
+//! Account APIs (history, settings, keys, Briefcase access), discovery, the
+//! Accounts webhook and operator maintenance.
+//!
+//! Every route authenticates with Silicon Accounts. Routes that manage account
+//! data accept `?account=c:…|si:…|<uuid>`: a Carbon may select a Silicon it is
+//! the custodian of; anyone may select themselves; nothing else is allowed.
 
+#[cfg(test)]
+mod account_tests;
 mod accounts;
-pub(crate) mod contracts;
-mod discovery;
-mod environments;
+mod audio;
+pub mod contracts;
 mod events;
 mod jobs;
-mod lifecycle;
 mod reporting;
 mod sessions;
 mod source_target;
-pub(crate) mod storage;
+mod storage;
 #[cfg(test)]
 mod tests;
-mod vault;
 mod voices;
-mod webhooks;
+pub(crate) mod webhooks;
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
+
+pub(crate) use accounts::{key_context, legacy_key_context};
 
 use axum::{
     Json, Router,
@@ -25,480 +31,293 @@ use axum::{
     routing::{get, post},
 };
 use http::{HeaderMap, StatusCode};
-use secrecy::ExposeSecret as _;
+use secrecy::SecretString;
 use serde_json::json;
-use silicon_iam_client::{
-    Client, Credential, EnvironmentKey, models,
-    webhook::{WebhookSecret, WebhookSecretKeyring, WebhookVerifier},
-};
-use sqlx::{PgPool, Row as _};
+use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::config::Settings;
-use crate::domain::auth::AuthorizedActor;
-use crate::domain::identity::{Actor, ActorId, ActorKind, OrganizationId};
-use crate::domain::provider::{ProviderName, STT_PROVIDER_CHAIN, TTS_PROVIDER_CHAIN};
-use vault::Vault;
+use crate::{
+    application::ports::{AccountsError, AccountsPort as _},
+    config::Settings,
+    domain::{
+        auth::{
+            AuthFailure, AuthorizationRequest, AuthorizedActor, InboundCredentials, WaveformAction,
+        },
+        identity::ActorKind,
+    },
+    infrastructure::{
+        authenticator::AccountsAuthenticator,
+        briefcase::BriefcaseHttp,
+        directory::{AccountDirectory, AccountRecord, Confirm, Selection, SweepReport},
+        held_audio::PostgresHeldAudio,
+        storage_proofs::StorageProofs,
+        vault::Vault,
+    },
+};
 
-/// Shared infrastructure for the user-facing control APIs.
+/// Accounts asked about per run of the background account check (one run a
+/// minute, the lookup budget's share for it).
+const SWEEP_BATCH: i64 = 50;
+
+/// Shared infrastructure for the control APIs.
 pub struct ControlState {
     pool: PgPool,
-    honeycomb_token: Option<secrecy::SecretString>,
-    fence_slots: Arc<tokio::sync::Semaphore>,
     mail: Option<reporting::Mail>,
     station: Option<space_station::SpaceClient>,
-    iam: Client,
     app_id: String,
-    tts_scope: String,
-    stt_scope: String,
-    briefcase_settings: crate::config::BriefcaseSettings,
-    iam_timeout: std::time::Duration,
-    source_stt_action: String,
+    accounts_url: String,
+    public_url: url::Url,
+    authenticator: AccountsAuthenticator,
+    storage_proofs: Option<StorageProofs>,
+    briefcase: Arc<BriefcaseHttp>,
+    held_audio: PostgresHeldAudio,
     vault: Option<Vault>,
-    verifier: Option<WebhookVerifier>,
+    webhook_secrets: Vec<SecretString>,
 }
 
 impl ControlState {
-    /// Builds the official IAM client and secret-storage boundary.
+    /// Wires the control APIs.
     ///
     /// # Errors
-    /// Returns a redacted error for unusable integration or secret settings.
-    pub fn new(pool: PgPool, settings: &Settings) -> Result<Self, &'static str> {
-        let iam = Client::builder(settings.iam.base_url.as_str())
-            .map_err(|_| "invalid IAM base URL")?
-            .credential(Credential::application(&settings.iam.app_id, settings.iam.app_secret.expose_secret()))
-            .timeout(settings.iam.timeout)
-            // Backend deployments use a pinned lockfile, updated by CI.
-            .auto_update(false)
-            .build().map_err(|_| "could not construct IAM client")?;
+    /// Returns a redacted error for unusable secret or mail settings.
+    pub fn new(
+        pool: PgPool,
+        settings: &Settings,
+        authenticator: AccountsAuthenticator,
+        storage_proofs: Option<StorageProofs>,
+        briefcase: Arc<BriefcaseHttp>,
+        held_audio: PostgresHeldAudio,
+    ) -> Result<Self, &'static str> {
         let vault = settings
             .control
             .encryption_key
             .as_ref()
             .map(Vault::new)
             .transpose()?;
-        let verifier = settings
-            .control
-            .webhook_secret
-            .as_ref()
-            .map(|secret| {
-                let secret = WebhookSecret::new(secret.expose_secret())
-                    .map_err(|_| "invalid webhook secret")?;
-                let keyring =
-                    WebhookSecretKeyring::new(settings.control.webhook_key_version, secret)
-                        .map_err(|_| "invalid webhook signing version")?;
-                Ok::<_, &'static str>(WebhookVerifier::new(keyring))
-            })
-            .transpose()?;
         Ok(Self {
-            honeycomb_token: settings.control.honeycomb_token.clone(),
-            fence_slots: Arc::new(tokio::sync::Semaphore::new(
-                settings.database.max_connections.get() as usize,
-            )),
             mail: reporting::Mail::from_env()?,
             station: crate::telemetry::from_environment(),
             pool,
-            iam,
-            app_id: settings.iam.app_id.clone(),
-            tts_scope: settings.iam.tts_action.clone(),
-            stt_scope: settings.iam.stt_action.clone(),
-            briefcase_settings: settings.briefcase.clone(),
-            iam_timeout: settings.iam.timeout,
-            source_stt_action: settings.iam.stt_action.clone(),
+            app_id: settings.accounts.app_id.clone(),
+            accounts_url: settings.accounts.issuer(),
+            public_url: settings.public.base_url.clone(),
+            authenticator,
+            storage_proofs,
+            briefcase,
+            held_audio,
             vault,
-            verifier,
+            webhook_secrets: settings
+                .accounts
+                .webhook_secret
+                .iter()
+                .chain(settings.accounts.previous_webhook_secret.iter())
+                .cloned()
+                .collect(),
         })
     }
 
     fn vault(&self) -> Result<&Vault, ControlError> {
-        self.vault
-            .as_ref()
-            .ok_or_else(|| ControlError::unavailable("secret_storage_unavailable"))
+        self.vault.as_ref().ok_or_else(|| {
+            ControlError::unavailable(
+                "secret_storage_unavailable",
+                "Waveform has no WAVEFORM_ENCRYPTION_KEY configured, so it cannot store secrets.",
+            )
+        })
     }
 
-    async fn plane(&self, headers: &HeaderMap) -> Result<Plane, ControlError> {
-        let Some(key) = single_header(headers, "x-testing-environment-key")? else {
-            return Ok(Plane {
-                id: Uuid::nil(),
-                iam: self.iam.clone(),
-                iam_environment_id: None,
-                fence: None,
+    fn storage_proofs(&self) -> Result<&StorageProofs, ControlError> {
+        self.storage_proofs.as_ref().ok_or_else(|| {
+            ControlError::unavailable(
+                "secret_storage_unavailable",
+                "Waveform has no WAVEFORM_ENCRYPTION_KEY configured, so it cannot hold Briefcase access.",
+            )
+        })
+    }
+
+    fn directory(&self) -> &AccountDirectory {
+        self.authenticator.directory()
+    }
+
+    /// One batch of the background account check: refreshes the accounts
+    /// Silicon Accounts was not asked about for a day and deletes Waveform's
+    /// data for the ones it reports deleted (see `AccountDirectory::sweep`).
+    ///
+    /// # Errors
+    /// Database failures.
+    pub(crate) async fn sweep_accounts(&self) -> Result<SweepReport, ControlError> {
+        Ok(self.directory().sweep(SWEEP_BATCH).await?)
+    }
+
+    /// Authenticates the caller for one action.
+    async fn caller(
+        &self,
+        headers: &HeaderMap,
+        action: WaveformAction,
+    ) -> Result<Caller, ControlError> {
+        let credentials = crate::api::headers::parse_credentials(headers)
+            .map_err(ControlError::authentication)?;
+        let actor = self
+            .authenticator
+            .authorize(AuthorizationRequest {
+                credentials: credentials.clone(),
+                action,
+                request_id: crate::api::headers::request_id(headers),
+            })
+            .await
+            .map_err(ControlError::accounts)?;
+        let record = self
+            .directory()
+            .load(&actor.account.uuid)
+            .await?
+            .ok_or_else(|| {
+                ControlError::unavailable("database_unavailable", "The account record is missing.")
+            })?;
+        Ok(Caller {
+            actor,
+            credentials,
+            record,
+        })
+    }
+
+    /// Like [`Self::caller`], and for bearer tokens also asks Silicon Accounts
+    /// whether the sign-in is still live (sensitive changes see revocation at once).
+    async fn fresh_caller(
+        &self,
+        headers: &HeaderMap,
+        action: WaveformAction,
+    ) -> Result<Caller, ControlError> {
+        let caller = self.caller(headers, action).await?;
+        self.ensure_live(&caller).await?;
+        Ok(caller)
+    }
+
+    /// Asks Silicon Accounts whether a bearer caller's sign-in is still live.
+    async fn ensure_live(&self, caller: &Caller) -> Result<(), ControlError> {
+        if let InboundCredentials::Bearer(token) = &caller.credentials {
+            let active = self
+                .authenticator
+                .gateway()
+                .introspect_active(token.expose_secret())
+                .await
+                .map_err(ControlError::accounts)?;
+            if !active {
+                return Err(ControlError::authentication(AuthFailure::TokenInactive));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves `?account=` to the account whose data a route acts on. A Carbon
+    /// may name a Silicon it looks after: reads (`Confirm::Recent`) trust a
+    /// custodian Silicon Accounts confirmed in the last ten minutes, writes
+    /// (`Confirm::Always`) ask Silicon Accounts every time.
+    async fn target(
+        &self,
+        caller: &Caller,
+        selector: Option<&str>,
+        confirm: Confirm,
+    ) -> Result<Target, ControlError> {
+        let Some(selector) = selector.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Target {
+                record: caller.record.clone(),
+                as_custodian: false,
             });
         };
-        if key.starts_with("ask_") {
-            return self.discover_plane(key).await;
-        }
-        EnvironmentKey::new(key).map_err(|_| ControlError::unauthorized())?;
-        let digest = self
-            .vault()?
-            .digest(key, "environment-root")
-            .map_err(ControlError::internal)?;
-        let row = sqlx::query("UPDATE waveform_environments SET last_activity_at=now() WHERE root_key_hash=$1 AND deleted_at IS NULL AND id <> $2 AND NOT EXISTS(SELECT 1 FROM waveform_lifecycle l WHERE l.environment_id=waveform_environments.id) RETURNING id, iam_key_cipher, app_secret_cipher, iam_environment_id")
-            .bind(digest).bind(Uuid::nil()).fetch_optional(&self.pool).await?
-            .ok_or_else(ControlError::unauthorized)?;
-        let id: Uuid = row.try_get("id")?;
-        let fence = self.test_fence(id).await?;
-        let encrypted: Vec<u8> = row.try_get("iam_key_cipher")?;
-        let iam_key = self
-            .vault()?
-            .open(&encrypted, &format!("{id}/iam-key"))
-            .map_err(ControlError::internal)?;
-        let environment = EnvironmentKey::new(iam_key.expose_secret())
-            .map_err(|_| ControlError::unavailable("invalid_environment_binding"))?;
-        let app_cipher: Vec<u8> = row.try_get("app_secret_cipher")?;
-        let app_secret = self
-            .vault()?
-            .open(&app_cipher, &format!("{id}/app-secret"))
-            .map_err(ControlError::internal)?;
-        let iam = Client::builder(self.iam.base_url().as_str())
-            .map_err(|_| ControlError::unavailable("iam_unavailable"))?
-            .credential(Credential::application(
-                &self.app_id,
-                app_secret.expose_secret(),
-            ))
-            .timeout(self.iam_timeout)
-            .auto_update(false)
-            .build()
-            .map_err(|_| ControlError::unavailable("iam_unavailable"))?
-            .with_environment(environment);
-        Ok(Plane {
-            id,
-            iam,
-            iam_environment_id: row.try_get("iam_environment_id")?,
-            fence: Some(fence),
-        })
-    }
-
-    async fn identity(&self, headers: &HeaderMap) -> Result<Identity, ControlError> {
-        let org = single_header(headers, "x-org-id")?
-            .ok_or_else(|| ControlError::bad_request("organization_required"))?;
-        self.identity_for_org(headers, Some(org)).await
-    }
-
-    async fn identity_for_org(
-        &self,
-        headers: &HeaderMap,
-        org: Option<&str>,
-    ) -> Result<Identity, ControlError> {
-        let plane = self.plane(headers).await?;
-        let token = bearer(headers)?;
-        org.map(str::parse::<crate::domain::identity::OrganizationId>)
-            .transpose()
-            .map_err(|_| ControlError::bad_request("invalid_organization"))?;
-        let authority = if let Some(org) = org {
-            plane
-                .iam
-                .oauth()
-                .authorization(token, Some(org))
-                .await
-                .map_err(ControlError::iam)?
-        } else {
-            // Unscoped application tokens have a list of current organization
-            // snapshots. IAM returns them in handle order; use the first as the
-            // initial workspace instead of assuming the application's owning org.
-            plane
-                .iam
-                .oauth()
-                .authorizations(token)
-                .await
-                .map_err(ControlError::iam)?
-                .and_then(|items| items.into_iter().next())
-        }
-        .ok_or_else(ControlError::unauthorized)?;
-        if org.is_some_and(|org| authority.org_id != org)
-            || authority.audience != self.app_id
-            || authority.testing_environment_id != plane.iam_environment_id
+        if selector == caller.record.uuid.as_str()
+            || caller.record.current_id.as_deref() == Some(selector)
         {
-            return Err(ControlError::forbidden());
+            return Ok(Target {
+                record: caller.record.clone(),
+                as_custodian: false,
+            });
         }
-        let public_id = authority
-            .public_id
-            .as_deref()
-            .ok_or_else(ControlError::forbidden)?;
-        let kind = match authority.actor_type {
-            Some(models::ApplicationAuthorizationActorType::Carbon) => ActorKind::Carbon,
-            Some(models::ApplicationAuthorizationActorType::Silicon) => ActorKind::Silicon,
-            _ => return Err(ControlError::forbidden()),
-        };
-        if crate::infrastructure::actor_keys::canonical_kind(public_id) != Some(kind) {
-            return Err(ControlError::forbidden());
-        }
-        let storage_actor_id = crate::infrastructure::actor_keys::resolve(
-            &self.pool,
-            plane.id,
-            authority
-                .public_id
-                .as_deref()
-                .ok_or_else(ControlError::forbidden)?,
-        )
-        .await?;
-        self.ensure_voice_default(plane.id, &authority.org_id, storage_actor_id)
-            .await?;
-        if plane.id.is_nil()
-            && let Some(station) = &self.station
-        {
-            let enabled: bool = sqlx::query_scalar("SELECT COALESCE((SELECT telemetry_enabled FROM waveform_account_preferences WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3),true)").bind(plane.id).bind(&authority.org_id).bind(storage_actor_id).fetch_one(&self.pool).await?;
-            if enabled {
-                crate::telemetry::record(station, "backend", "iam_authorization", true, 0);
-            }
-        }
-        Ok(Identity {
-            storage_actor_id,
-            plane,
-            authority,
-        })
-    }
-
-    pub(crate) async fn speech_fence(
-        &self,
-        headers: &HeaderMap,
-    ) -> Result<Option<lifecycle::Fence>, ControlError> {
-        Ok(self.plane(headers).await?.fence)
-    }
-
-    /// Authorizes a test-plane speech request against the selected IAM plane.
-    /// This is deliberately separate from production management identity so a
-    /// root test key can select the plane while the bearer still identifies the
-    /// Carbon or Silicon performing the operation.
-    pub(crate) async fn authorize_test_speech(
-        &self,
-        headers: &HeaderMap,
-        required_scope: &str,
-    ) -> Result<TestSpeechContext, ControlError> {
-        let (plane, actor) = if headers.contains_key("x-iam-obo-access-token") {
-            let plane = self.plane(headers).await?;
-            let parsed = crate::api::headers::SpeechHeaders::parse(headers)
-                .map_err(|_| ControlError::unauthorized())?;
-            let crate::domain::auth::InboundCredentials::OnBehalfOf(credentials) =
-                &parsed.credentials
-            else {
-                return Err(ControlError::unauthorized());
-            };
-            let request = crate::domain::auth::AuthorizationRequest {
-                credentials: parsed.credentials.clone(),
-                organization_id: parsed.organization_id,
-                request_id: parsed.request_id,
-                action: if required_scope == "tts" {
-                    crate::domain::auth::WaveformAction::SynthesizeSpeech
-                } else {
-                    crate::domain::auth::WaveformAction::TranscribeSpeech
-                },
-            };
-            let actor = crate::infrastructure::auth::verify_obo(
-                &plane.iam,
-                Some(&self.pool),
-                plane.id,
-                plane.iam_environment_id,
-                &self
-                    .app_id
-                    .parse()
-                    .map_err(|_| ControlError::unavailable("invalid_application"))?,
-                &request,
-                credentials,
+        let not_custodian = || {
+            ControlError::forbidden(
+                "not_custodian",
+                format!(
+                    "{} is not the custodian of {selector}. Only a Silicon's custodian can manage its Waveform history, settings, keys and Briefcase access.",
+                    caller.display_id()
+                ),
             )
+        };
+        if caller.record.kind != ActorKind::Carbon {
+            return Err(not_custodian());
+        }
+        match self
+            .directory()
+            .select_for_custodian(&caller.record.uuid, selector, confirm)
             .await
-            .map_err(|error| match error {
-                crate::application::ports::IamError::InvalidCredential => {
-                    ControlError::unauthorized()
-                }
-                crate::application::ports::IamError::Forbidden => ControlError::forbidden(),
-                _ => ControlError::unavailable("iam_unavailable"),
-            })?;
-            (plane, actor)
-        } else {
-            let identity = self.identity(headers).await?;
-            let scope = if required_scope == "tts" {
-                &self.tts_scope
-            } else {
-                &self.stt_scope
-            };
-            if !identity.authority.scopes.contains(scope) {
-                return Err(ControlError::forbidden());
-            }
-            let actor = Self::authorized_actor_from_identity(&identity)?;
-            (identity.plane, actor)
-        };
-        if plane.id.is_nil() {
-            return Err(ControlError::bad_request("test_environment_required"));
-        }
-        let plane_id = plane.id;
-        let cipher: Vec<u8> = sqlx::query_scalar("SELECT briefcase_key_cipher FROM waveform_environments WHERE id=$1 AND deleted_at IS NULL")
-            .bind(plane_id).fetch_one(&self.pool).await?;
-        let environment = if cipher.is_empty() {
-            None
-        } else {
-            let key = self
-                .vault()?
-                .open(&cipher, &format!("{plane_id}/briefcase-key"))
-                .map_err(ControlError::internal)?;
-            Some(
-                briefcase_client::EnvironmentKey::new(key.expose_secret()).map_err(|_| {
-                    ControlError::unavailable("legacy_environment_requires_iam_app_secret")
-                })?,
+            .map_err(ControlError::accounts)?
+        {
+            Selection::Custodian(record) => Ok(Target {
+                record: *record,
+                as_custodian: true,
+            }),
+            Selection::NotCustodian => Err(not_custodian()),
+            Selection::NotFound => Err(ControlError::not_found(
+                "account_not_found",
+                format!("No Silicon Accounts account has the id or uuid {selector}."),
+            )),
+            Selection::Throttled => Err(ControlError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "account_lookup_limit",
+                "Naming this account needs a lookup at Silicon Accounts, and you reached the limit of 30 such lookups a minute.",
             )
-        };
-        let iam = Arc::new(crate::infrastructure::auth::TestStorageDelegator {
-            store: self.storage_grants()?,
-            plane: plane.id,
-            sdk: plane.iam,
-            application_id: self
-                .app_id
-                .parse()
-                .map_err(|_| ControlError::unavailable("invalid_application"))?,
-            audience: self.briefcase_settings.audience.clone(),
-        });
-        let mut briefcase = crate::infrastructure::briefcase::FailClosedBriefcaseStore::new(
-            &self.briefcase_settings,
-        )
-        .map_err(|_| ControlError::unavailable("invalid_briefcase_configuration"))?
-        .with_uploads(&self.briefcase_settings)
-        .with_reads(&self.briefcase_settings, iam.clone());
-        if let Some(environment) = environment {
-            briefcase = briefcase.with_environment(environment);
+            .with_hint("Wait a minute and retry, or name a Silicon by the uuid `waveform silicons` (GET /api/v1/silicons) shows; a Silicon Waveform already knows needs no lookup.")
+            .with_retry_after(60)),
         }
-        Ok(TestSpeechContext {
-            authorization: actor,
-            plane_id,
-            fence: plane.fence,
-            iam,
-            briefcase: Arc::new(briefcase),
-        })
-    }
-
-    /// Returns the authenticated actor's effective provider order for one
-    /// operation. Defaults and account overrides are read from the selected
-    /// plane so the fallback chain is data-driven rather than compiled into
-    /// request handling.
-    pub(crate) async fn effective_provider_order(
-        &self,
-        headers: &HeaderMap,
-        operation: &str,
-    ) -> Result<Vec<ProviderName>, ControlError> {
-        let identity = self.identity(headers).await?;
-        let (default_column, preference_column, base) = match operation {
-            "tts" => ("default_tts", "tts_order", TTS_PROVIDER_CHAIN.as_slice()),
-            "stt" => ("default_stt", "stt_order", STT_PROVIDER_CHAIN.as_slice()),
-            _ => return Err(ControlError::bad_request("invalid_operation")),
-        };
-        let row = sqlx::query("SELECT d.tts_order AS default_tts, d.stt_order AS default_stt, p.tts_order, p.stt_order FROM waveform_provider_defaults d LEFT JOIN waveform_account_preferences p ON p.plane_id=d.plane_id AND p.org_id=$2 AND p.actor_id=$3 WHERE d.plane_id=$1")
-            .bind(identity.plane.id)
-            .bind(&identity.authority.org_id)
-            .bind(identity.storage_actor_id)
-            .fetch_one(&self.pool)
-            .await?;
-        let default: serde_json::Value = row.try_get(default_column)?;
-        let preference: Option<serde_json::Value> = row.try_get(preference_column)?;
-        let parse = |value: serde_json::Value| -> Result<Vec<ProviderName>, ControlError> {
-            let parsed: Vec<ProviderName> = serde_json::from_value(value)
-                .map_err(|_| ControlError::unavailable("invalid_provider_defaults"))?;
-            let order = crate::domain::provider::resolve_order(&parsed, base)
-                .ok_or_else(|| ControlError::unavailable("invalid_provider_defaults"))?;
-            (order.len() == parsed.len())
-                .then_some(order)
-                .ok_or_else(|| ControlError::unavailable("invalid_provider_defaults"))
-        };
-        parse(preference.unwrap_or(default))
-    }
-
-    fn authorized_actor_from_identity(
-        identity: &Identity,
-    ) -> Result<AuthorizedActor, ControlError> {
-        let actor_kind = match identity.authority.actor_type {
-            Some(models::ApplicationAuthorizationActorType::Carbon) => ActorKind::Carbon,
-            Some(models::ApplicationAuthorizationActorType::Silicon) => ActorKind::Silicon,
-            Some(models::ApplicationAuthorizationActorType::Other(_)) | None => {
-                return Err(ControlError::forbidden());
-            }
-        };
-        let actor_id = ActorId::new(identity.storage_actor_id)
-            .map_err(|_| ControlError::unavailable("invalid_actor"))?;
-        Ok(AuthorizedActor {
-            actor: Actor::new(actor_kind, actor_id),
-            organization_id: identity
-                .authority
-                .org_id
-                .parse::<OrganizationId>()
-                .map_err(|_| ControlError::unavailable("invalid_organization"))?,
-            originating_application: None,
-            expires_at: None,
-        })
-    }
-
-    /// Retention belongs to Honeycomb. Kept as the runtime maintenance hook.
-    pub(crate) async fn cleanup_environments(&self) -> Result<u64, sqlx::Error> {
-        self.sunset_contracts().await
     }
 }
 
-pub(crate) struct TestSpeechContext {
-    pub(crate) fence: Option<lifecycle::Fence>,
-    pub(crate) authorization: AuthorizedActor,
-    pub(crate) plane_id: Uuid,
-    pub(crate) iam: Arc<dyn crate::application::ports::IamPort>,
-    pub(crate) briefcase: Arc<dyn crate::application::ports::BriefcasePort>,
+/// The authenticated caller of a control route.
+pub(crate) struct Caller {
+    actor: AuthorizedActor,
+    credentials: InboundCredentials,
+    record: AccountRecord,
 }
 
-struct Plane {
-    fence: Option<lifecycle::Fence>,
-    id: Uuid,
-    iam: Client,
-    iam_environment_id: Option<Uuid>,
+impl Caller {
+    fn display_id(&self) -> String {
+        self.record
+            .current_id
+            .clone()
+            .unwrap_or_else(|| self.record.uuid.to_string())
+    }
 }
 
-struct Identity {
-    storage_actor_id: Uuid,
-    plane: Plane,
-    authority: models::ApplicationAuthorization,
+/// The account a control route acts on (the caller, or a Silicon it looks after).
+pub(crate) struct Target {
+    record: AccountRecord,
+    as_custodian: bool,
 }
 
-/// Routes merged before the main API's admission, deadlines and logging layers.
+impl Target {
+    const fn storage_key(&self) -> Uuid {
+        self.record.storage_key
+    }
+}
+
+/// Routes merged under the main API's admission, deadline and logging layers.
 pub fn router(state: Arc<ControlState>) -> Router {
     Router::new()
         .route("/api/contracts", get(contracts::describe))
         .route("/api/v1/contracts", get(contracts::describe))
-        .route("/internal/contracts/{version}/deprecate", post(contracts::deprecate))
-        .route("/internal/honeycomb/organizations/{org}/testing-environments/{environment}/operations/{operation}", axum::routing::put(lifecycle::apply).get(lifecycle::receipt))
-        .route("/internal/honeycomb/organizations/{org}/testing-environments/{environment}/activity", get(lifecycle::activity))
+        .route("/api/v1/accounts", get(sessions::discovery))
+        .route("/api/v1/auth/me", get(sessions::me))
+        .route("/api/v1/me", get(sessions::me))
+        .route("/api/v1/silicons", get(sessions::silicons))
         .route("/api/v1/telemetry", post(events::record))
         .route("/api/v1/reports", post(reporting::submit))
-        .route("/api/v1/iam", get(sessions::iam))
-        .route("/api/v1/auth/login", post(sessions::login))
-        .route("/api/v1/auth/refresh", post(sessions::refresh))
-        .route("/api/v1/auth/logout", post(sessions::logout))
-        .route("/api/v1/auth/me", get(sessions::me))
-        .route("/api/v1/storage-authorizations", post(storage::start))
-        .route("/api/v1/storage-authorizations/{id}", get(storage::status))
-        .route("/api/v1/storage-authorizations/{id}/complete", post(storage::complete))
+        .route(
+            "/api/v1/storage-authorizations",
+            post(storage::approve)
+                .get(storage::status)
+                .delete(storage::revoke),
+        )
         .route("/api/v1/stt/source-target", post(source_target::prepare))
+        .route("/api/v1/audio/{request_id}", get(audio::download))
         .route("/api/v1/jobs", get(jobs::list))
         .route("/api/v1/jobs/{job_id}", get(jobs::get))
-        .route("/api/v1/testing-environments", post(environments::managed_by_honeycomb))
-        .route("/api/v1/testing-environments", get(environments::list))
-        .route(
-            "/api/v1/testing-environments/{environment_id}",
-            get(environments::detail),
-        )
-        .route(
-            "/api/v1/testing-environments/{environment_id}/key",
-            get(environments::managed_by_honeycomb),
-        )
-        .route(
-            "/api/v1/testing-environments/{environment_id}/rotate-key",
-            post(environments::managed_by_honeycomb),
-        )
-        .route(
-            "/api/v1/testing-environments/{environment_id}/delete",
-            post(environments::managed_by_honeycomb),
-        )
-        .route(
-            "/api/v1/testing-environments/{environment_id}/restore",
-            post(environments::managed_by_honeycomb),
-        )
-        .route("/api/v1/testing-environment", get(environments::current))
-        .route(
-            "/api/v1/testing-environment/clean",
-            post(environments::managed_by_honeycomb),
-        )
         .route(
             "/api/v1/preferences",
             get(accounts::preferences).patch(accounts::update_preferences),
@@ -509,161 +328,151 @@ pub fn router(state: Arc<ControlState>) -> Router {
             "/api/v1/provider-keys/{provider}",
             axum::routing::put(accounts::put_provider_key).delete(accounts::delete_provider_key),
         )
-        .route("/webhooks/", post(webhooks::receive))
-        .route("/webhook/", post(webhooks::receive))
+        .route("/webhooks/accounts", post(webhooks::receive))
+        .route("/api/v1/iam", axum::routing::any(retired))
+        .route("/api/v1/auth/login", axum::routing::any(retired))
+        .route("/api/v1/auth/refresh", axum::routing::any(retired))
+        .route("/api/v1/auth/logout", axum::routing::any(retired))
+        .route("/api/v1/testing-environment", axum::routing::any(retired))
+        .route("/api/v1/testing-environments", axum::routing::any(retired))
+        .route("/webhooks/", axum::routing::any(retired))
+        .route("/webhook/", axum::routing::any(retired))
         .with_state(state)
 }
 
-fn single_header<'a>(
-    headers: &'a HeaderMap,
-    name: &'static str,
-) -> Result<Option<&'a str>, ControlError> {
-    let mut all = headers.get_all(name).iter();
-    let first = all.next();
-    if all.next().is_some() {
-        return Err(ControlError::bad_request("duplicate_security_header"));
-    }
-    first
-        .map(|value| {
-            value
-                .to_str()
-                .map_err(|_| ControlError::bad_request("invalid_header"))
-        })
-        .transpose()
+/// IAM- and Honeycomb-era routes answer 410 with what replaced them.
+async fn retired() -> ControlError {
+    ControlError::new(
+        StatusCode::GONE,
+        "route_retired",
+        "This route was removed when Waveform moved to Silicon Accounts.",
+    )
+    .with_hint("CLIs sign in with Silicon Accounts directly (`waveform login`, or `waveform login --slt-stdin` for Silicons); apps acting for an account send Authorization: Proof sap_…; discovery is GET /api/v1/accounts.")
 }
 
-fn bearer(headers: &HeaderMap) -> Result<&str, ControlError> {
-    if single_header(headers, "x-iam-obo-access-token")?.is_some()
-        || single_header(headers, "x-iam-obo-access-proof")?.is_some()
-        || single_header(headers, "x-app-id")?.is_some()
-    {
-        return Err(ControlError::bad_request("unsupported_authentication_mode"));
-    }
-    let auth = single_header(headers, "authorization")?.ok_or_else(ControlError::unauthorized)?;
-    let mut parts = auth.split_ascii_whitespace();
-    let scheme = parts.next().ok_or_else(ControlError::unauthorized)?;
-    let token = parts.next().ok_or_else(ControlError::unauthorized)?;
-    if !scheme.eq_ignore_ascii_case("bearer") || parts.next().is_some() || token.len() > 16_384 {
-        return Err(ControlError::unauthorized());
-    }
-    Ok(token)
-}
-
-pub(super) struct ControlError {
+/// Control-route error: `{"error":{"code","message","hint"?}}`.
+pub(crate) struct ControlError {
     status: StatusCode,
     code: &'static str,
+    message: Cow<'static, str>,
+    hint: Option<&'static str>,
+    reason: Option<&'static str>,
+    retry_after: Option<u32>,
 }
 
 impl ControlError {
-    fn bad_request(code: &'static str) -> Self {
+    fn new(status: StatusCode, code: &'static str, message: impl Into<Cow<'static, str>>) -> Self {
         Self {
-            status: StatusCode::BAD_REQUEST,
+            status,
             code,
+            message: message.into(),
+            hint: None,
+            reason: None,
+            retry_after: None,
         }
     }
-    fn unauthorized() -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            code: "unauthenticated",
-        }
+
+    const fn with_hint(mut self, hint: &'static str) -> Self {
+        self.hint = Some(hint);
+        self
     }
-    fn forbidden() -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            code: "forbidden",
-        }
+
+    const fn with_retry_after(mut self, seconds: u32) -> Self {
+        self.retry_after = Some(seconds);
+        self
     }
-    fn not_found() -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            code: "not_found",
-        }
+
+    fn bad_request(code: &'static str, message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, code, message)
     }
-    fn unavailable(code: &'static str) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code,
-        }
+
+    /// `?account=` on a speech route: speech always runs as the caller.
+    fn speech_runs_as_yourself() -> Self {
+        Self::bad_request(
+            "speech_runs_as_yourself",
+            "Speech always runs as the account that calls Waveform, so `account` cannot be given here: a custodian manages a Silicon's history, settings, keys and Briefcase access, but never speaks as it or fetches its audio.",
+        )
+        .with_hint("Remove ?account= and call as the account itself (a Silicon signs in with `silicon-accounts login --app waveform -q | waveform login --slt-stdin`).")
     }
-    fn internal(_detail: &'static str) -> Self {
-        Self::unavailable("secret_storage_unavailable")
+
+    fn forbidden(code: &'static str, message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, code, message)
     }
-    fn iam(error: silicon_iam_client::Error) -> Self {
+
+    fn not_found(code: &'static str, message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, code, message)
+    }
+
+    fn unavailable(code: &'static str, message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, code, message)
+    }
+
+    fn authentication(failure: AuthFailure) -> Self {
+        let (status, code) = if failure.is_forbidden() {
+            (StatusCode::FORBIDDEN, "forbidden")
+        } else {
+            (StatusCode::UNAUTHORIZED, "unauthenticated")
+        };
+        let mut error = Self::new(status, code, failure.message()).with_hint(failure.hint());
+        error.reason = Some(failure.reason());
+        error
+    }
+
+    fn accounts(error: AccountsError) -> Self {
         match error {
-            silicon_iam_client::Error::Api(api) if api.code == "invalid_client" => {
-                Self::unavailable("iam_unavailable")
-            }
-            silicon_iam_client::Error::Api(api)
-                if matches!(api.status, 400 | 401)
-                    && matches!(
-                        api.code.as_str(),
-                        "invalid_grant"
-                            | "refresh_token_reuse"
-                            | "unauthenticated"
-                            | "invalid_token"
-                    ) =>
-            {
-                Self::unauthorized()
-            }
-            silicon_iam_client::Error::Api(api) if api.status == 403 => Self::forbidden(),
-            silicon_iam_client::Error::RateLimited { .. } => Self {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                code: "iam_rate_limited",
-            },
-            _ => Self::unavailable("iam_unavailable"),
+            AccountsError::Rejected(failure) => Self::authentication(failure),
+            AccountsError::Unavailable => Self::unavailable(
+                "dependency_unavailable",
+                "Silicon Accounts is temporarily unavailable.",
+            ),
+            AccountsError::Timeout => Self::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "dependency_timeout",
+                "Silicon Accounts did not answer in time.",
+            ),
         }
     }
 }
 
 impl From<sqlx::Error> for ControlError {
     fn from(_: sqlx::Error) -> Self {
-        Self::unavailable("database_unavailable")
+        Self::unavailable(
+            "database_unavailable",
+            "Waveform's database is unavailable.",
+        )
     }
 }
 
 impl IntoResponse for ControlError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({"error": {"code": self.code, "message": self.code.replace('_', " ")}})),
-        )
-            .into_response()
+        let mut body = json!({"error": {"code": self.code, "message": self.message}});
+        if let Some(hint) = self.hint {
+            body["error"]["hint"] = json!(hint);
+        }
+        if let Some(reason) = self.reason {
+            body["error"]["reason"] = json!(reason);
+        }
+        let mut response = (self.status, Json(body)).into_response();
+        let retry_after = self
+            .retry_after
+            .or((self.status == StatusCode::SERVICE_UNAVAILABLE).then_some(5));
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, http::HeaderValue::from(seconds));
+        }
+        response
     }
 }
 
-#[async_trait::async_trait]
-impl crate::application::ports::ProviderKeyStore for ControlState {
-    async fn load(
-        &self,
-        plane_id: Uuid,
-        actor: &AuthorizedActor,
-    ) -> Result<
-        crate::application::ports::ProviderKeys,
-        crate::application::ports::ProviderKeyStoreError,
-    > {
-        use crate::application::ports::{ProviderKeyStoreError, ProviderKeys};
-        let rows = sqlx::query("SELECT provider,secret_cipher FROM waveform_provider_keys WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3")
-            .bind(plane_id).bind(actor.organization_id.as_str()).bind(actor.actor.id.as_uuid())
-            .fetch_all(&self.pool).await.map_err(|_| ProviderKeyStoreError)?;
-        let mut keys = ProviderKeys::new();
-        for row in rows {
-            let name: String = row.try_get("provider").map_err(|_| ProviderKeyStoreError)?;
-            let provider: ProviderName =
-                serde_json::from_value(json!(name)).map_err(|_| ProviderKeyStoreError)?;
-            let cipher: Vec<u8> = row
-                .try_get("secret_cipher")
-                .map_err(|_| ProviderKeyStoreError)?;
-            let context = format!(
-                "{}/{}/{}/{}",
-                plane_id, actor.organization_id, actor.actor.id, name
-            );
-            let key = self
-                .vault()
-                .map_err(|_| ProviderKeyStoreError)?
-                .open(&cipher, &context)
-                .map_err(|_| ProviderKeyStoreError)?;
-            keys.insert(provider, key);
-        }
-        Ok(keys)
-    }
+fn single_header<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+) -> Result<Option<&'a str>, ControlError> {
+    crate::api::headers::optional_header(headers, name).map_err(|_| {
+        ControlError::bad_request(
+            "invalid_header",
+            format!("Header {name} must be sent at most once, as visible text."),
+        )
+    })
 }

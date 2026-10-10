@@ -58,7 +58,6 @@ def main():
         subprocess.run([str(wrapper), "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.1", "-f", "wav", "-y", str(stage / "audio-smoke.wav")], check=True)
         assert (stage / "audio-smoke.wav").stat().st_size > 100
         (stage / "audio-smoke.wav").unlink()
-        shutil.copyfile(ROOT / "honeycomb.yaml", stage / "honeycomb.yaml")
         shutil.copyfile(ROOT / "deploy/native/waveform-api.service", stage / "waveform-api.service")
         shutil.copyfile(ROOT / "deploy/native/prepare.py", stage / "prepare.py")
         for package in ("ffmpeg", "libc6"):

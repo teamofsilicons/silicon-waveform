@@ -1,9 +1,11 @@
 name: Verify Linux CLI on Amazon Linux 2023
+# Runs the exact Silicon Apps archives a release run produced on the oldest Linux the Silicon fleet uses, in a clean,
+# read-only container: the three discovery commands Silicon Apps requires, signed out.
 on:
   workflow_dispatch:
     inputs:
       release_run:
-        description: Successful native binary workflow run
+        description: Successful "Build Silicon Apps release" workflow run
         required: true
         type: string
       source_revision:
@@ -19,9 +21,9 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-24.04
-            artifact: linux-x86_64
+            target: linux-x86_64
           - runner: ubuntu-24.04-arm
-            artifact: linux-aarch64
+            target: linux-aarch64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Verify artifact source
@@ -34,13 +36,20 @@ jobs:
           test "$(gh api "repos/$REPO/actions/runs/$RELEASE_RUN" --jq .head_sha)" = "$SOURCE"
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: waveform-apps-${{ matrix.target }}
           path: smoke
           run-id: ${{ inputs.release_run }}
           github-token: ${{ github.token }}
-      - name: Run exact artifact with the production Linux baseline
+      - name: Check and extract the archive
+        working-directory: smoke
         run: |
-          chmod +x smoke/waveform
-          docker run --rm --read-only --tmpfs /tmp:rw -e SILICON_HOME=/tmp -e WAVEFORM_AUTO_UPDATE=false \
-            -v "$PWD/smoke/waveform:/opt/waveform:ro" public.ecr.aws/amazonlinux/amazonlinux:2023 \
-            sh -c 'ldd --version | head -1; /opt/waveform --version; /opt/waveform iam --json'
+          sha256sum --check --strict ./*.tar.gz.sha256
+          mkdir package
+          tar -xzf ./*.tar.gz -C package
+          cat package/apps.yaml
+      - name: Run the discovery commands on the production Linux baseline
+        run: |
+          docker run --rm --read-only --tmpfs /tmp:rw -e HOME=/tmp -e SILICON_HOME=/tmp \
+            -v "$PWD/smoke/package/bin/waveform:/opt/waveform:ro" public.ecr.aws/amazonlinux/amazonlinux:2023 \
+            sh -c 'set -e; ldd --version | head -1; /opt/waveform --version; /opt/waveform --help >/tmp/help;
+                   test -s /tmp/help; /opt/waveform accounts --json; /opt/waveform login status --json'

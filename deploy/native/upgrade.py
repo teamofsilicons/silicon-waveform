@@ -17,10 +17,22 @@ import tarfile
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
 BODY_LIMIT = "WAVEFORM_JSON_BODY_LIMIT_BYTES"
+APP_ID = "waveform"
+DEFAULT_ACCOUNTS_URL = "https://accounts.teamofsilicons.com"
+# Settings of the earlier sign-in and distribution systems. A native.env holding any of them has not been through
+# accounts_cutover.py yet; the Accounts-era service ignores them (with a warning) or refuses them at start.
+RETIRED_KEYS = (
+    "WAVEFORM_IAM_BASE_URL", "WAVEFORM_IAM_APP_ID", "WAVEFORM_IAM_APP_SECRET", "WAVEFORM_IAM_TOKEN_INTROSPECTION_PATH",
+    "WAVEFORM_IAM_OBO_VERIFY_PATH", "WAVEFORM_IAM_AUDIENCE", "WAVEFORM_IAM_TTS_ACTION", "WAVEFORM_IAM_STT_ACTION",
+    "WAVEFORM_IAM_TIMEOUT_SECONDS", "WAVEFORM_WEBHOOK_SIGNING_SECRET", "WAVEFORM_WEBHOOK_KEY_VERSION",
+    "WAVEFORM_WEBHOOK_PUBLIC_URL", "WAVEFORM_HONEYCOMB_SERVICE_TOKEN", "SILICON_IAM_CLIENT_AUTO_UPDATE",
+    "WAVEFORM_BRIEFCASE_CDN_ORIGIN", "WAVEFORM_BRIEFCASE_AUDIENCE", "BRIEFCASE_CLIENT_AUTO_UPDATE",
+)
 
 
 def require(condition, message):
@@ -58,6 +70,73 @@ def upgrade_env(content):
         return content
     return re.sub(rb"(?m)^" + BODY_LIMIT.encode() + rb"=[^\r\n]*",
                   BODY_LIMIT.encode() + b"=327680", content)
+
+
+def accounts_identity(content):
+    """Require an Accounts-era native.env for app `waveform`: no retired settings, an app secret present."""
+    retired = [key for key in RETIRED_KEYS if env_value(content, key) is not None]
+    require(not retired, "native.env still has settings of the earlier sign-in system (" + ", ".join(retired)
+            + "); run deploy/native/accounts_cutover.py once instead of upgrade.py")
+    require((env_value(content, "WAVEFORM_APP_ID") or APP_ID) == APP_ID, "native.env names another app than waveform")
+    require(env_value(content, "WAVEFORM_APP_SECRET"), "native.env has no WAVEFORM_APP_SECRET")
+
+
+class AccountsNoRedirect(urllib.request.HTTPRedirectHandler):
+    """App credentials must only reach the configured Accounts origin."""
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        return None
+
+
+def accounts_open(request, timeout=20):
+    return urllib.request.build_opener(AccountsNoRedirect()).open(request, timeout=timeout)
+
+
+def accounts_preflight(content, timeout=20):
+    """Prove Silicon Accounts accepts Waveform's app credentials before anything stops: introspecting a token that
+    does not exist must answer exactly {"active": false}; wrong credentials answer 401 invalid_client."""
+    base = (env_value(content, "ACCOUNTS_API_URL") or env_value(content, "ACCOUNTS_URL") or DEFAULT_ACCOUNTS_URL)
+    app_id = env_value(content, "WAVEFORM_APP_ID") or APP_ID
+    basic = base64.b64encode(f"{app_id}:{env_value(content, 'WAVEFORM_APP_SECRET')}".encode()).decode("ascii")
+    request = urllib.request.Request(base.rstrip("/") + "/v1/oauth/introspect",
+                                     data=urllib.parse.urlencode({"token": "waveform-deploy-preflight"}).encode(),
+                                     headers={"authorization": "Basic " + basic,
+                                              "content-type": "application/x-www-form-urlencoded"})
+    try:
+        with accounts_open(request, timeout=timeout) as response:
+            answer = json.loads(response.read() or b"null")
+            require(response.status == 200 and answer == {"active": False},
+                    f"Silicon Accounts answered the credential check unexpectedly ({response.status})")
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"Silicon Accounts refused Waveform's app credentials ({error.code}); check "
+                           "WAVEFORM_APP_SECRET and WAVEFORM_APP_ID") from None
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
+        raise RuntimeError(f"Silicon Accounts could not be reached at {base} for the credential check: {error}") from None
+
+
+def backup_database(backup, bucket, region, kms_key_id=None):
+    """Dump PostgreSQL into the backup directory (checked with pg_restore --list), upload it encrypted with an
+    explicit SHA-256 checksum, and return (local dump, S3 URL)."""
+    dump_path = backup / "postgres.dump"
+    with dump_path.open("wb") as dump:
+        run("docker", "exec", "waveform-postgres", "pg_dump", "-U", "postgres", "-d", "waveform", "-Fc", stdout=dump)
+        dump.flush()
+        os.fsync(dump.fileno())
+    require(dump_path.stat().st_size > 0, "PostgreSQL backup is empty")
+    with dump_path.open("rb") as dump:
+        run("docker", "exec", "-i", "waveform-postgres", "pg_restore", "--list", stdin=dump, stdout=subprocess.DEVNULL)
+    backup_key = f"backups/{backup.name}.dump"
+    require(dump_path.stat().st_size < 5 * 1024**3, "Database backup exceeds single-object upload limit")
+    checksum = base64.b64encode(bytes.fromhex(digest(dump_path))).decode("ascii")
+    encryption = (["--server-side-encryption", "aws:kms", "--ssekms-key-id", kms_key_id]
+                  if kms_key_id else ["--server-side-encryption", "AES256"])
+    remote = json.loads(subprocess.check_output([
+        "aws", "s3api", "put-object", "--bucket", bucket, "--key", backup_key,
+        "--body", str(dump_path), "--checksum-sha256", checksum,
+        "--region", region, "--output", "json", *encryption]))
+    require(remote.get("ServerSideEncryption") in ("AES256", "aws:kms", "aws:kms:dsse")
+            and remote.get("ChecksumSHA256") == checksum,
+            "Encrypted remote database backup verification failed")
+    return dump_path, f"s3://{bucket}/{backup_key}"
 
 
 def atomic_write(path, data, mode):
@@ -186,6 +265,8 @@ def main():
     parser.add_argument("--backup-kms-key-id")
     parser.add_argument("--region", default="us-east-1")
     parser.add_argument("--public-ready-url", default="https://backend.waveform.teamofsilicons.com/health/ready")
+    parser.add_argument("--skip-accounts-check", action="store_true",
+                        help="do not check Waveform's app credentials with Silicon Accounts first (an outage there)")
     args = parser.parse_args()
     require(os.geteuid() == 0, "Run as root")
     require(platform.machine() == "aarch64", "This bundle requires an ARM64 host")
@@ -212,7 +293,7 @@ def upgrade(args):
     require(env_path.is_file() and not env_path.is_symlink(), "A regular native.env is required")
     require(unit.is_file() and not unit.is_symlink(), "A regular native service unit is required")
     old_env = env_path.read_bytes()
-    require(env_value(old_env, "WAVEFORM_IAM_APP_ID") == "waveform", "Unexpected native app identity")
+    accounts_identity(old_env)
     bind = env_value(old_env, "WAVEFORM_BIND_ADDR")
     require(bind and bind.count(":") == 1, "An explicit private IPv4 bind is required")
     host, port = bind.rsplit(":", 1)
@@ -221,6 +302,8 @@ def upgrade(args):
     require(env_value(old_env, "WAVEFORM_FFMPEG_PATH") == "/opt/waveform/current/bin/ffmpeg",
             "Unexpected FFmpeg path; review the existing native environment")
     local_ready = f"http://{bind}/health/ready"
+    if not args.skip_accounts_check:
+        accounts_preflight(old_env)
     run("systemctl", "is-active", "--quiet", "waveform-api")
     ready(local_ready, 15)
     ready(args.public_ready_url, 15)
@@ -236,31 +319,12 @@ def upgrade(args):
     receipt_path = Path("/etc/waveform/native-release.json")
     if receipt_path.is_file():
         shutil.copyfile(receipt_path, backup / "native-release.json")
-    with (backup / "postgres.dump").open("wb") as dump:
-        run("docker", "exec", "waveform-postgres", "pg_dump", "-U", "postgres", "-d", "waveform", "-Fc", stdout=dump)
-        dump.flush()
-        os.fsync(dump.fileno())
-    require((backup / "postgres.dump").stat().st_size > 0, "PostgreSQL backup is empty")
-    with (backup / "postgres.dump").open("rb") as dump:
-        run("docker", "exec", "-i", "waveform-postgres", "pg_restore", "--list", stdin=dump, stdout=subprocess.DEVNULL)
-    backup_key = f"backups/{backup.name}.dump"
-    dump_path = backup / "postgres.dump"
-    require(dump_path.stat().st_size < 5 * 1024**3, "Database backup exceeds single-object upload limit")
-    checksum = base64.b64encode(bytes.fromhex(digest(dump_path))).decode("ascii")
-    encryption = (["--server-side-encryption", "aws:kms", "--ssekms-key-id", args.backup_kms_key_id]
-                  if args.backup_kms_key_id else ["--server-side-encryption", "AES256"])
-    remote = json.loads(subprocess.check_output([
-        "aws", "s3api", "put-object", "--bucket", args.backup_bucket, "--key", backup_key,
-        "--body", str(dump_path), "--checksum-sha256", checksum,
-        "--region", args.region, "--output", "json", *encryption]))
-    require(remote.get("ServerSideEncryption") in ("AES256", "aws:kms", "aws:kms:dsse")
-            and remote.get("ChecksumSHA256") == checksum,
-            "Encrypted remote database backup verification failed")
+    _, database_backup = backup_database(backup, args.backup_bucket, args.region, args.backup_kms_key_id)
     new_env = upgrade_env(old_env)
     old_unit = (backup / "waveform-api.service").read_bytes()
     receipt = {"source_revision": args.source_revision, "archive_sha256": args.sha256,
                "release": str(release), "previous_release": str(old_release), "backup": str(backup),
-               "database_backup_s3": f"s3://{args.backup_bucket}/{backup_key}",
+               "database_backup_s3": database_backup,
                "runtime": "native-systemd", "deployed_at": stamp, "bind": bind,
                "json_body_limit_updated": new_env != old_env}
     try:

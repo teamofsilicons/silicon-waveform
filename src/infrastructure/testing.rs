@@ -1,35 +1,23 @@
-//! Deterministic speech fixtures used exclusively by Waveform test planes.
+//! Deterministic speech fixtures for development and CI.
 //!
-//! A test plane must exercise the same application orchestration (authorization,
-//! idempotency, Briefcase storage and history) without contacting a billable
-//! speech provider.  These adapters keep the provider boundary intact while
-//! returning the prescribed fixture values from `UNDERSTANDING.md`.
-//!
-//! The module intentionally does not inspect or accept production credentials;
-//! runtime composition must select these adapters only after a test-plane root
-//! key has been validated by the control plane.
+//! With `WAVEFORM_SPEECH_FIXTURES=true` (refused in production) every paid
+//! provider is replaced by these adapters, so the whole orchestration
+//! (authentication, idempotency, Briefcase storage, history) runs end to end
+//! without provider keys. They return the prerecorded clips and transcript
+//! whose wording `UNDERSTANDING.md` prescribes.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use time::OffsetDateTime;
-use url::Url;
 
 use crate::{
     application::ports::{
-        AudioNormalizationError, AudioNormalizer, BriefcaseError, BriefcaseFileAccessRequest,
-        BriefcasePort, IamError, IamPort, ReadSourceMediaRequest, SpeechToTextProvider,
-        StoreGeneratedAudioRequest, TextToSpeechProvider,
+        AudioNormalizationError, AudioNormalizer, SpeechToTextProvider, TextToSpeechProvider,
     },
     domain::{
-        auth::{AuthorizationRequest, AuthorizedActor, DelegatedAuthorization, DelegationPurpose},
         identity::RequestId,
-        identity::{Actor, ActorId, ActorKind, ApplicationId},
-        media::{
-            AudioArtifact, BriefcaseFileUrl, MediaDuration, NormalizedAudio, ProviderAudioFormat,
-            SourceMedia, SourceMediaType, StoredAudio, TemporaryMediaUrl,
-        },
+        media::{AudioArtifact, MediaDuration, NormalizedAudio, ProviderAudioFormat, SourceMedia},
         provider::{ProviderError, ProviderFailureKind, ProviderName},
         speech::{SttProviderRequest, SttProviderResult, Transcript, TtsProviderRequest},
         voice::ProviderVoice,
@@ -145,6 +133,11 @@ impl TextToSpeechProvider for FixtureTtsProvider {
         self.provider
     }
 
+    /// Saved or request keys are accepted and never used: fixtures call no provider.
+    fn with_api_key(&self, _key: secrecy::SecretString) -> Option<Arc<dyn TextToSpeechProvider>> {
+        Some(Arc::new(*self))
+    }
+
     async fn synthesize(
         &self,
         request: TtsProviderRequest,
@@ -181,6 +174,11 @@ impl FixtureSttProvider {
 impl SpeechToTextProvider for FixtureSttProvider {
     fn name(&self) -> ProviderName {
         self.provider
+    }
+
+    /// Saved or request keys are accepted and never used: fixtures call no provider.
+    fn with_api_key(&self, _key: secrecy::SecretString) -> Option<Arc<dyn SpeechToTextProvider>> {
+        Some(Arc::new(*self))
     }
 
     async fn transcribe(
@@ -273,12 +271,18 @@ pub(crate) async fn seed_audio(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct DatabaseFixtureTtsProvider(sqlx::PgPool, ProviderName);
 
 #[async_trait]
 impl TextToSpeechProvider for DatabaseFixtureTtsProvider {
     fn name(&self) -> ProviderName {
         self.1
+    }
+
+    /// Saved or request keys are accepted and never used: fixtures call no provider.
+    fn with_api_key(&self, _key: secrecy::SecretString) -> Option<Arc<dyn TextToSpeechProvider>> {
+        Some(Arc::new(self.clone()))
     }
 
     async fn synthesize(
@@ -310,343 +314,15 @@ pub(crate) fn database_provider_chains(pool: &sqlx::PgPool) -> FixtureProviderCh
     (tts, stt)
 }
 
-/// IAM port for a test-plane composition. It keeps the application boundary
-/// and actor/org metadata intact while avoiding a network call to IAM in local
-/// deterministic runs. The surrounding request router must select this port
-/// only after validating the test-plane root key.
-#[derive(Clone, Debug)]
-pub struct FixtureIam {
-    actor: Actor,
-    briefcase_application: ApplicationId,
-}
-
-impl FixtureIam {
-    /// Creates a test IAM fixture with a stable actor identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns an identity error when `actor_id` is nil.
-    pub fn new(
-        actor_kind: ActorKind,
-        actor_id: uuid::Uuid,
-        briefcase_application: ApplicationId,
-    ) -> Result<Self, crate::domain::identity::IdentityError> {
-        Ok(Self {
-            actor: Actor::new(actor_kind, ActorId::new(actor_id)?),
-            briefcase_application,
-        })
-    }
-}
-
-#[async_trait]
-impl IamPort for FixtureIam {
-    async fn authorize(&self, request: AuthorizationRequest) -> Result<AuthorizedActor, IamError> {
-        // Header parsing already guarantees a non-empty, bounded credential;
-        // preserving the actor metadata here lets history remain actor-scoped.
-        Ok(AuthorizedActor {
-            actor: self.actor,
-            organization_id: request.organization_id,
-            originating_application: None,
-            expires_at: None,
-        })
-    }
-
-    async fn delegate(
-        &self,
-        request: crate::domain::auth::DelegationRequest,
-    ) -> Result<DelegatedAuthorization, IamError> {
-        let proof = crate::domain::auth::OboProof::new("test-plane-fixture-proof".to_owned())
-            .map_err(|_| IamError::InvalidResponse)?;
-        Ok(DelegatedAuthorization {
-            organization_id: request.authorization.organization_id.clone(),
-            commit_proof: Some(proof.clone()),
-            list_proof: Some(proof.clone()),
-            actor_id: None,
-            testing_secret: None,
-            application_id: self.briefcase_application.clone(),
-            proof,
-            purpose: request.purpose,
-            expires_at: fixture_expiry(),
-        })
-    }
-}
-
-/// Briefcase port for a test-plane composition. Generated bytes are recorded
-/// in an in-memory ledger and every upload receives a URL containing its unique
-/// generated filename, mirroring the production upload contract.
-#[derive(Clone, Debug)]
-pub struct FixtureBriefcase {
-    permanent_origin: url::Origin,
-    cdn_origin: url::Origin,
-    application: ApplicationId,
-    ledger: FixtureUploadLedger,
-}
-
-impl FixtureBriefcase {
-    /// Creates an isolated fixture store rooted at the supplied HTTPS origins.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BriefcaseError::InvalidResponse`] when either origin is not
-    /// HTTPS.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn new(
-        application: ApplicationId,
-        permanent_origin: Url,
-        cdn_origin: Url,
-        ledger: FixtureUploadLedger,
-    ) -> Result<Self, BriefcaseError> {
-        if permanent_origin.scheme() != "https" || cdn_origin.scheme() != "https" {
-            return Err(BriefcaseError::InvalidResponse);
-        }
-        Ok(Self {
-            permanent_origin: permanent_origin.origin(),
-            cdn_origin: cdn_origin.origin(),
-            application,
-            ledger,
-        })
-    }
-
-    fn validate_access(
-        &self,
-        application: &ApplicationId,
-        purpose: DelegationPurpose,
-        actual: DelegationPurpose,
-        expires_at: OffsetDateTime,
-    ) -> Result<(), BriefcaseError> {
-        if application != &self.application
-            || purpose != actual
-            || expires_at <= OffsetDateTime::now_utc()
-        {
-            return Err(BriefcaseError::Unauthorized);
-        }
-        Ok(())
-    }
-
-    fn file_urls(
-        &self,
-        filename: &str,
-    ) -> Result<(BriefcaseFileUrl, TemporaryMediaUrl), BriefcaseError> {
-        let permanent = Url::parse(&format!(
-            "{}/waveform/{filename}",
-            self.permanent_origin.ascii_serialization()
-        ))
-        .map_err(|_| BriefcaseError::InvalidResponse)?;
-        let temporary = Url::parse(&format!(
-            "{}/waveform/{filename}?fixture=1",
-            self.cdn_origin.ascii_serialization()
-        ))
-        .map_err(|_| BriefcaseError::InvalidResponse)?;
-        if permanent.origin() != self.permanent_origin || temporary.origin() != self.cdn_origin {
-            return Err(BriefcaseError::InvalidResponse);
-        }
-        Ok((
-            BriefcaseFileUrl::new(permanent).map_err(|_| BriefcaseError::InvalidResponse)?,
-            TemporaryMediaUrl::new(temporary).map_err(|_| BriefcaseError::InvalidResponse)?,
-        ))
-    }
-}
-
-#[async_trait]
-impl BriefcasePort for FixtureBriefcase {
-    async fn verify_file_read_access(
-        &self,
-        request: BriefcaseFileAccessRequest,
-    ) -> Result<(), BriefcaseError> {
-        if request.file_url.as_url().origin() != self.permanent_origin {
-            return Err(BriefcaseError::Forbidden);
-        }
-        Ok(())
-    }
-
-    async fn issue_temporary_url(
-        &self,
-        request: BriefcaseFileAccessRequest,
-    ) -> Result<TemporaryMediaUrl, BriefcaseError> {
-        self.verify_file_read_access(request.clone()).await?;
-        let filename = request
-            .file_url
-            .as_url()
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
-            .ok_or(BriefcaseError::NotFound)?;
-        Ok(self.file_urls(filename)?.1)
-    }
-
-    async fn read_source_media(
-        &self,
-        request: ReadSourceMediaRequest,
-    ) -> Result<SourceMedia, BriefcaseError> {
-        if request.source_url.as_url().origin() != self.permanent_origin {
-            return Err(BriefcaseError::Forbidden);
-        }
-        SourceMedia::new(
-            SourceMediaType::Mpeg,
-            Bytes::from_static(b"test-plane-uploaded-audio"),
-            request.size_limit,
-        )
-        .map_err(|_| BriefcaseError::InvalidResponse)
-    }
-
-    async fn store_generated_audio(
-        &self,
-        request: StoreGeneratedAudioRequest,
-    ) -> Result<StoredAudio, BriefcaseError> {
-        self.validate_access(
-            &request.delegated_authorization.application_id,
-            DelegationPurpose::StoreGeneratedAudio,
-            request.delegated_authorization.purpose,
-            request.delegated_authorization.expires_at,
-        )?;
-        let filename = request.filename.as_str();
-        self.ledger
-            .record(filename.to_owned(), request.audio.bytes().clone());
-        let (permanent_url, temporary_url) = self.file_urls(filename)?;
-        Ok(StoredAudio {
-            permanent_url,
-            temporary_url: Some(temporary_url),
-        })
-    }
-}
-
-/// Small observable record useful to test-plane Briefcase fixtures.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FixtureUpload {
-    /// Caller-selected generated filename.
-    pub filename: String,
-    /// Bytes written to the test storage boundary.
-    pub bytes: Bytes,
-}
-
-/// In-memory upload ledger for request-level test-plane integration tests.
-#[derive(Clone, Debug, Default)]
-pub struct FixtureUploadLedger {
-    uploads: Arc<Mutex<Vec<FixtureUpload>>>,
-}
-
-impl FixtureUploadLedger {
-    /// Records one generated TTS upload.
-    pub fn record(&self, filename: impl Into<String>, bytes: Bytes) {
-        if let Ok(mut uploads) = self.uploads.lock() {
-            uploads.push(FixtureUpload {
-                filename: filename.into(),
-                bytes,
-            });
-        }
-    }
-
-    /// Returns a snapshot of uploads made by this test plane.
-    #[must_use]
-    pub fn uploads(&self) -> Vec<FixtureUpload> {
-        self.uploads
-            .lock()
-            .map(|uploads| uploads.clone())
-            .unwrap_or_default()
-    }
-}
-
-/// Returns the fixture permanent URL used by an upload assertion.
-///
-/// Each request should append its own generated filename (which includes the
-/// request ID), preserving the same per-request upload semantics as production.
-#[must_use]
-pub fn fixture_permanent_url(filename: &str) -> Url {
-    Url::parse(&format!("https://briefcase.test/waveform/{filename}")).unwrap_or_else(|_| {
-        Url::parse("https://briefcase.test/waveform/fixture.mp3").unwrap_or_else(|_| unreachable!())
-    })
-}
-
-/// Returns the fixture temporary URL used by an upload assertion.
-#[must_use]
-pub fn fixture_temporary_url(filename: &str) -> Url {
-    Url::parse(&format!(
-        "https://cdn.briefcase.test/waveform/{filename}?fixture=1"
-    ))
-    .unwrap_or_else(|_| {
-        Url::parse("https://cdn.briefcase.test/waveform/fixture.mp3?fixture=1")
-            .unwrap_or_else(|_| unreachable!())
-    })
-}
-
-/// Fixture timestamp helper used to keep test records deterministic.
-#[must_use]
-pub fn fixture_expiry() -> OffsetDateTime {
-    OffsetDateTime::now_utc() + time::Duration::minutes(5)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        application::{
-            ports::{BriefcasePort, IdempotencyStore, IdempotencyStoreError, LeaseIdGenerator},
-            service::{ServicePolicy, SpeechRequestContext, WaveformService},
-        },
-        domain::{
-            auth::{
-                AuthorizationRequest, DelegationPurpose, DelegationRequest, InboundCredentials,
-            },
-            idempotency::{
-                IdempotencyClaim, IdempotencyCompletion, IdempotencyDecision, IdempotencyKey,
-                IdempotencyLease, IdempotencyLeaseId, IdempotencyRelease, RequestDigestKey,
-            },
-            identity::{ActorKind, OrganizationId},
-            media::{
-                BriefcaseFileUrl, BriefcaseOrigin, GeneratedAudioFileName, MediaSizeLimit,
-                SourceMediaType,
-            },
-            speech::{SpeechText, SttRequest, TtsRequest},
-        },
+    use crate::domain::{
+        media::{MediaSizeLimit, SourceMediaType},
+        speech::{SpeechText, TtsRequest},
     };
-    use async_trait::async_trait;
-    use std::str::FromStr as _;
-    use std::time::Duration;
-    use time::OffsetDateTime;
+    use sha2::Digest as _;
     use uuid::Uuid;
-
-    struct MemoryIdempotency;
-
-    #[async_trait]
-    impl IdempotencyStore for MemoryIdempotency {
-        async fn claim(
-            &self,
-            claim: IdempotencyClaim,
-        ) -> Result<IdempotencyDecision, IdempotencyStoreError> {
-            Ok(IdempotencyDecision::Acquired {
-                lease: IdempotencyLease {
-                    id: claim.lease_id,
-                    expires_at: OffsetDateTime::now_utc()
-                        + time::Duration::try_from(claim.lease_duration)
-                            .map_err(|_| IdempotencyStoreError::InvalidRecord)?,
-                },
-                request_id: claim.request_id,
-                operation_started_at: OffsetDateTime::now_utc(),
-            })
-        }
-
-        async fn complete(
-            &self,
-            _completion: IdempotencyCompletion,
-        ) -> Result<(), IdempotencyStoreError> {
-            Ok(())
-        }
-
-        async fn release(&self, _release: IdempotencyRelease) -> Result<(), IdempotencyStoreError> {
-            Ok(())
-        }
-
-        async fn check_ready(&self) -> Result<(), IdempotencyStoreError> {
-            Ok(())
-        }
-    }
-
-    struct FixedLeaseId;
-
-    impl LeaseIdGenerator for FixedLeaseId {
-        fn new_idempotency_lease_id(&self) -> IdempotencyLeaseId {
-            IdempotencyLeaseId::new(Uuid::from_u128(99)).unwrap_or_else(|_| unreachable!())
-        }
-    }
 
     fn request_id() -> RequestId {
         RequestId::new(Uuid::from_u128(1)).unwrap_or_else(|_| unreachable!())
@@ -714,7 +390,7 @@ mod tests {
                 )
                 .await?;
             let entry = &manifest["clips"][&profile.id];
-            let hash = crate::infrastructure::auth::test_digest(artifact.bytes());
+            let hash = format!("{:x}", sha2::Sha256::digest(artifact.bytes()));
             assert_eq!(entry["sha256"], hash);
             assert!(hashes.insert(hash));
             assert_eq!(entry["voice"], profile.gemini_voice);
@@ -740,6 +416,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixtures_accept_saved_and_request_keys_without_using_them() {
+        let (tts, stt) = provider_chains();
+        let key = || secrecy::SecretString::from("sk-never-used".to_owned());
+        for provider in &tts {
+            let keyed = provider
+                .with_api_key(key())
+                .unwrap_or_else(|| unreachable!());
+            assert_eq!(keyed.name(), provider.name());
+        }
+        for provider in &stt {
+            let keyed = provider
+                .with_api_key(key())
+                .unwrap_or_else(|| unreachable!());
+            assert_eq!(keyed.name(), provider.name());
+        }
+        let request = TtsRequest::new(
+            SpeechText::new("hello".to_owned()).unwrap_or_else(|_| unreachable!()),
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let keyed = tts[2].with_api_key(key()).unwrap_or_else(|| unreachable!());
+        assert!(
+            keyed
+                .synthesize(
+                    TtsProviderRequest::for_provider(&request, ProviderName::OpenAi),
+                    request_id(),
+                )
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn fixture_stt_returns_prescribed_text_for_any_nonempty_media() {
         let (_, stt) = provider_chains();
         let media = SourceMedia::new(
@@ -760,221 +469,5 @@ mod tests {
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(result.transcript.as_str(), TEST_STT_TEXT);
         assert_eq!(result.duration, Some(TEST_TTS_DURATION));
-    }
-
-    #[test]
-    fn fixture_urls_are_credential_free_and_upload_names_are_per_request() {
-        let first = fixture_permanent_url("tts-one.mp3");
-        let second = fixture_permanent_url("tts-two.mp3");
-        assert_eq!(first.origin(), second.origin());
-        assert_ne!(first.path(), second.path());
-        assert!(first.username().is_empty());
-        assert!(first.password().is_none());
-        assert!(fixture_temporary_url("tts-one.mp3").query().is_some());
-    }
-
-    #[tokio::test]
-    async fn fixture_request_boundary_records_each_tts_upload() {
-        let app = ApplicationId::from_str("briefcase").unwrap_or_else(|_| unreachable!());
-        let iam = FixtureIam::new(ActorKind::Carbon, Uuid::from_u128(9), app.clone())
-            .unwrap_or_else(|_| unreachable!());
-        let ledger = FixtureUploadLedger::default();
-        let permanent_origin =
-            Url::parse("https://briefcase.test").unwrap_or_else(|_| unreachable!());
-        let cdn_origin =
-            Url::parse("https://cdn.briefcase.test").unwrap_or_else(|_| unreachable!());
-        let briefcase = FixtureBriefcase::new(app, permanent_origin, cdn_origin, ledger.clone())
-            .unwrap_or_else(|_| unreachable!());
-        let org = OrganizationId::from_str("tos").unwrap_or_else(|_| unreachable!());
-        let request_id = request_id();
-        let authorization = iam
-            .authorize(AuthorizationRequest {
-                credentials: InboundCredentials::Bearer(
-                    crate::domain::auth::AccessToken::new("test-token".to_owned())
-                        .unwrap_or_else(|_| unreachable!()),
-                ),
-                organization_id: org,
-                action: crate::domain::auth::WaveformAction::SynthesizeSpeech,
-                request_id,
-            })
-            .await
-            .unwrap_or_else(|_| unreachable!());
-        let delegated = iam
-            .delegate(DelegationRequest {
-                authorization,
-                purpose: DelegationPurpose::StoreGeneratedAudio,
-                request_id,
-                subject_token: None,
-                upload: None,
-                manifest: None,
-            })
-            .await
-            .unwrap_or_else(|_| unreachable!());
-        let audio = NormalizedAudio::new(Bytes::from_static(b"fixture-mp3"), TEST_TTS_DURATION)
-            .unwrap_or_else(|_| unreachable!());
-        for suffix in ["one", "two"] {
-            let name = GeneratedAudioFileName::for_request(
-                OffsetDateTime::now_utc(),
-                RequestId::new(if suffix == "one" {
-                    Uuid::from_u128(10)
-                } else {
-                    Uuid::from_u128(11)
-                })
-                .unwrap_or_else(|_| unreachable!()),
-            );
-            let _ = briefcase
-                .store_generated_audio(StoreGeneratedAudioRequest {
-                    authorization: AuthorizedActor {
-                        actor: Actor::new(
-                            ActorKind::Carbon,
-                            ActorId::new(Uuid::from_u128(9)).unwrap_or_else(|_| unreachable!()),
-                        ),
-                        organization_id: OrganizationId::from_str("tos")
-                            .unwrap_or_else(|_| unreachable!()),
-                        originating_application: None,
-                        expires_at: None,
-                    },
-                    delegated_authorization: delegated.clone(),
-                    filename: name,
-                    audio: audio.clone(),
-                    idempotency_key: IdempotencyKey::from_str(&format!("fixture-{suffix}"))
-                        .unwrap_or_else(|_| unreachable!()),
-                    request_id,
-                })
-                .await
-                .unwrap_or_else(|_| unreachable!());
-        }
-        let uploads = ledger.uploads();
-        assert_eq!(uploads.len(), 2);
-        assert_ne!(uploads[0].filename, uploads[1].filename);
-        assert!(
-            uploads
-                .iter()
-                .all(|upload| upload.bytes == Bytes::from_static(b"fixture-mp3"))
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn fixture_service_runs_tts_and_stt_request_workflows_without_network() {
-        let application = ApplicationId::from_str("briefcase").unwrap_or_else(|_| unreachable!());
-        let iam = Arc::new(
-            FixtureIam::new(ActorKind::Silicon, Uuid::from_u128(12), application.clone())
-                .unwrap_or_else(|_| unreachable!()),
-        );
-        let ledger = FixtureUploadLedger::default();
-        let briefcase_origin =
-            Url::parse("https://briefcase.test").unwrap_or_else(|_| unreachable!());
-        let cdn_origin =
-            Url::parse("https://cdn.briefcase.test").unwrap_or_else(|_| unreachable!());
-        let briefcase = Arc::new(
-            FixtureBriefcase::new(
-                application,
-                briefcase_origin.clone(),
-                cdn_origin,
-                ledger.clone(),
-            )
-            .unwrap_or_else(|_| unreachable!()),
-        );
-        let (tts, stt) = provider_chains();
-        let origin = BriefcaseOrigin::new(briefcase_origin).unwrap_or_else(|_| unreachable!());
-        let policy = ServicePolicy::new(
-            Duration::from_secs(30),
-            MediaSizeLimit::default(),
-            origin,
-            4_096,
-            RequestDigestKey::new(b"fixture-service-request-digest-key-012345")
-                .unwrap_or_else(|_| unreachable!()),
-        )
-        .unwrap_or_else(|_| unreachable!());
-        let service = WaveformService::new(
-            iam.clone(),
-            briefcase,
-            Arc::new(MemoryIdempotency),
-            Arc::new(FixtureAudioNormalizer),
-            Arc::new(FixedLeaseId),
-            tts,
-            stt,
-            policy,
-        )
-        .unwrap_or_else(|_| unreachable!());
-        let organization = OrganizationId::from_str("tos").unwrap_or_else(|_| unreachable!());
-        let authorization = iam
-            .authorize(AuthorizationRequest {
-                credentials: InboundCredentials::Bearer(
-                    crate::domain::auth::AccessToken::new("test-token".to_owned())
-                        .unwrap_or_else(|_| unreachable!()),
-                ),
-                organization_id: organization.clone(),
-                action: crate::domain::auth::WaveformAction::SynthesizeSpeech,
-                request_id: request_id(),
-            })
-            .await
-            .unwrap_or_else(|_| unreachable!());
-        let tts_context = SpeechRequestContext {
-            request_id: RequestId::new(Uuid::from_u128(21)).unwrap_or_else(|_| unreachable!()),
-            plane_id: Uuid::nil(),
-            organization_id: organization.clone(),
-            credentials: InboundCredentials::Bearer(
-                crate::domain::auth::AccessToken::new("test-token".to_owned())
-                    .unwrap_or_else(|_| unreachable!()),
-            ),
-            idempotency_key: IdempotencyKey::from_str("fixture-tts-request")
-                .unwrap_or_else(|_| unreachable!()),
-        };
-        let tts_result = service
-            .synthesize_pre_authorized(
-                tts_context,
-                TtsRequest::new(
-                    SpeechText::new("arbitrary production text".to_owned())
-                        .unwrap_or_else(|_| unreachable!()),
-                    None,
-                )
-                .unwrap_or_else(|_| unreachable!()),
-                authorization,
-            )
-            .await
-            .unwrap_or_else(|_| unreachable!())
-            .result;
-        assert_eq!(tts_result.provider, TEST_FIXTURE_PROVIDER);
-        assert_eq!(tts_result.duration, TEST_TTS_DURATION);
-        assert_eq!(ledger.uploads().len(), 1);
-
-        let stt_context = SpeechRequestContext {
-            request_id: RequestId::new(Uuid::from_u128(22)).unwrap_or_else(|_| unreachable!()),
-            plane_id: Uuid::nil(),
-            organization_id: organization,
-            credentials: InboundCredentials::Bearer(
-                crate::domain::auth::AccessToken::new("test-token".to_owned())
-                    .unwrap_or_else(|_| unreachable!()),
-            ),
-            idempotency_key: IdempotencyKey::from_str("fixture-stt-request")
-                .unwrap_or_else(|_| unreachable!()),
-        };
-        let source_url = BriefcaseFileUrl::new(fixture_permanent_url("input.mp3"))
-            .unwrap_or_else(|_| unreachable!());
-        let stt_result = service
-            .transcribe_pre_authorized(
-                stt_context,
-                SttRequest::new(source_url, None).unwrap_or_else(|_| unreachable!()),
-                iam.authorize(AuthorizationRequest {
-                    credentials: InboundCredentials::Bearer(
-                        crate::domain::auth::AccessToken::new("test-token".to_owned())
-                            .unwrap_or_else(|_| unreachable!()),
-                    ),
-                    organization_id: OrganizationId::from_str("tos")
-                        .unwrap_or_else(|_| unreachable!()),
-                    action: crate::domain::auth::WaveformAction::TranscribeSpeech,
-                    request_id: RequestId::new(Uuid::from_u128(22))
-                        .unwrap_or_else(|_| unreachable!()),
-                })
-                .await
-                .unwrap_or_else(|_| unreachable!()),
-            )
-            .await
-            .unwrap_or_else(|_| unreachable!())
-            .result;
-        assert_eq!(stt_result.provider, TEST_FIXTURE_PROVIDER);
-        assert_eq!(stt_result.transcript.as_str(), TEST_STT_TEXT);
     }
 }

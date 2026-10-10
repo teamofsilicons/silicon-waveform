@@ -863,3 +863,45 @@ plaintext key is stored. Explicit legacy fallback without new controls/keys keep
 its original digest so completed operations can replay. Sandbox requests validate
 controls but use prerecorded profile clips for every TTS provider and never spend
 provider credentials. This source update is locally verified, not deployed.
+
+## 2026-10-10 — Silicon Accounts replaces IAM; data belongs to personal accounts
+
+**Status:** Accepted. Supersedes every entry above that relies on IAM sign-in, OBO tokens, org scoping, test
+planes or Honeycomb lifecycle (among them D-055 and the org/plane parts of D-056 and the 2026-09-20 entry).
+
+Waveform authenticates with Silicon Accounts only: bearer access tokens issued to `waveform` are verified locally,
+and other apps act for an account with User verification proofs (`waveform.tts`, `waveform.stt`) from an operator
+allow-list. Everything belongs to the account that made the request; a Carbon can manage the Waveform settings and
+history of the Silicons it is custodian of, but never acts as them. Briefcase is reached with User verification
+proofs for `briefcase`; when that is not possible the speech still completes and Waveform holds the MP3. Existing
+rows keep their private storage keys and are linked to Accounts uuids at cutover by `waveform-api link-identities`.
+The API keeps `/api/v1` with contract 2.0.0.
+
+The full record of the judgement calls, the old-to-new mapping and the configuration is
+[`docs/migration/decisions.md`](docs/migration/decisions.md).
+
+## 2026-10-10 — The client and the CLI sign in with Silicon Accounts
+
+**Status:** Accepted. Extends the entry above to `silicon-waveform-client` and `waveform` 0.6.0.
+
+The CLI is Waveform's public client at Silicon Accounts: Carbons sign in with the device flow (`waveform login`),
+Silicons hand over a short-lived token (`waveform login --slt-stdin`), and nothing in the CLI holds an app secret.
+Sign-ins live in private files per profile and Silicon Accounts origin and are refreshed one process at a time under
+a file lock; sign-ins saved by earlier versions are never used. Organization, test-environment, delegated-token and
+updater flags and commands are gone and fail with what replaced them; Silicon Apps installs and updates the CLI.
+The client drops every organization and actor parameter, adds `signin::SignIn` and proof credentials, and keeps the
+API-version handshake. Details: [`docs/migration/decisions.md`](docs/migration/decisions.md#client-and-cli-stage-2).
+
+## 2026-10-10 — Silicon Apps ships the CLI; the host moves to Silicon Accounts with a restoring cutover
+
+**Status:** Accepted. Supersedes the Honeycomb packaging, lifecycle and installation records above and in
+`docs/history/`.
+
+Each release packs one Silicon Apps archive per target (`apps.yaml` listing that target, `bin/waveform[.exe]`) on that
+target's own runner, after the three discovery commands answer correctly in an empty home; Linux binaries stay static
+musl builds. Nothing is published by the workflow. The production host moves once with
+`deploy/native/accounts_cutover.py`, which migrates and links earlier data before the new API starts and, on failure,
+restores the pre-cutover database (keeping the migrated one under another name) because the previous binary cannot
+start on the new schema. Account events are subscribed with every update picked, since Waveform needs custodian
+changes. Details: [`docs/migration/decisions.md`](docs/migration/decisions.md#ship-stage-packaging-ci-deployment-docs)
+and the runbook [`docs/migration/cutover.md`](docs/migration/cutover.md).

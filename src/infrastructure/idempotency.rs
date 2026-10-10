@@ -16,13 +16,13 @@ use crate::{
     application::ports::{IdempotencyStore, IdempotencyStoreError},
     domain::{
         idempotency::{
-            CompletedSpeechOperation, CompletedTtsOperation, IdempotencyClaim,
+            ACCOUNT_SCOPE, CompletedSpeechOperation, CompletedTtsOperation, IdempotencyClaim,
             IdempotencyCompletion, IdempotencyDecision, IdempotencyLease, IdempotencyLeaseId,
             IdempotencyRelease, IdempotencyScope, SpeechJobStart,
         },
         identity::{ActorKind, RequestId},
         language::LanguageHint,
-        media::{BriefcaseFileUrl, MediaDuration},
+        media::{AudioStorage, BriefcaseFileUrl, HeldReason, MediaDuration},
         provider::{ProviderName, STT_PROVIDER_CHAIN, TTS_PROVIDER_CHAIN},
         speech::{SttResult, Transcript},
     },
@@ -215,8 +215,8 @@ impl PostgresIdempotencyStore {
         hash.update(stored.request_id.as_uuid().as_bytes());
         let updated = sqlx::query(r"
             INSERT INTO waveform_jobs(id,plane_id,org_id,actor_id,actor_kind,operation,status,first_line,
-                request_digest,idempotency_key_hash,created_at,lease_token,lease_expires_at,voice_profile)
-            VALUES($1,$2,$3,$4,$5,$6,'running',$7,$8,$9,$10,$11,$12,$13)
+                request_digest,idempotency_key_hash,created_at,lease_token,lease_expires_at,voice_profile,issuing_app)
+            VALUES($1,$2,$3,$4,$5,$6,'running',$7,$8,$9,$10,$11,$12,$13,$14)
             ON CONFLICT(id) DO UPDATE SET status='running', voice_profile=EXCLUDED.voice_profile, first_line=EXCLUDED.first_line,
                 duration_ms=NULL,provider=NULL,error_code=NULL,finished_at=NULL,
                 lease_token=EXCLUDED.lease_token,lease_expires_at=EXCLUDED.lease_expires_at
@@ -226,11 +226,13 @@ impl PostgresIdempotencyStore {
                 AND waveform_jobs.request_digest=EXCLUDED.request_digest
                 AND waveform_jobs.idempotency_key_hash=EXCLUDED.idempotency_key_hash
         ").bind(stored.request_id.as_uuid()).bind(job.scope.plane_id)
-            .bind(job.scope.organization_id.as_str()).bind(job.scope.actor.id.as_uuid())
+            .bind(ACCOUNT_SCOPE).bind(job.scope.actor.id.as_uuid())
             .bind(actor_kind(job.scope.actor.kind)).bind(job.scope.operation.as_str())
             .bind(job.first_line.chars().take(512).collect::<String>()).bind(stored.digest)
             .bind(hash.finalize().to_vec()).bind(stored.created_at).bind(job.lease_id.as_uuid())
-            .bind(stored.lease_expires_at).bind(job.voice_profile.map(sqlx::types::Json)).execute(&mut *transaction).await.map_err(map_sqlx_error)?.rows_affected();
+            .bind(stored.lease_expires_at).bind(job.voice_profile.map(sqlx::types::Json))
+            .bind(job.issuing_app.as_ref().map(crate::domain::identity::ApplicationId::as_str))
+            .execute(&mut *transaction).await.map_err(map_sqlx_error)?.rows_affected();
         if updated != 1 {
             return Err(IdempotencyStoreError::LeaseLost);
         }
@@ -289,7 +291,7 @@ impl PostgresIdempotencyStore {
         )
         .bind(actor_kind(completion.scope.actor.kind))
         .bind(completion.scope.actor.id.as_uuid())
-        .bind(completion.scope.organization_id.as_str())
+        .bind(ACCOUNT_SCOPE)
         .bind(completion.scope.operation.as_str())
         .bind(completion.scope.key.as_str())
         .bind(completion.lease_id.as_uuid())
@@ -337,7 +339,7 @@ impl PostgresIdempotencyStore {
         )
         .bind(actor_kind(release.scope.actor.kind))
         .bind(release.scope.actor.id.as_uuid())
-        .bind(release.scope.organization_id.as_str())
+        .bind(ACCOUNT_SCOPE)
         .bind(release.scope.operation.as_str())
         .bind(release.scope.key.as_str())
         .bind(release.lease_id.as_uuid())
@@ -462,7 +464,7 @@ async fn insert_claim(
     )
     .bind(actor_kind(claim.scope.actor.kind))
     .bind(claim.scope.actor.id.as_uuid())
-    .bind(claim.scope.organization_id.as_str())
+    .bind(ACCOUNT_SCOPE)
     .bind(claim.scope.operation.as_str())
     .bind(claim.scope.key.as_str())
     .bind(claim.digest.as_bytes().as_slice())
@@ -511,7 +513,7 @@ async fn initialize_inserted_claim(
     )
     .bind(actor_kind(claim.scope.actor.kind))
     .bind(claim.scope.actor.id.as_uuid())
-    .bind(claim.scope.organization_id.as_str())
+    .bind(ACCOUNT_SCOPE)
     .bind(claim.scope.operation.as_str())
     .bind(claim.scope.key.as_str())
     .bind(claim.lease_id.as_uuid())
@@ -553,7 +555,7 @@ async fn load_claim(
     )
     .bind(actor_kind(scope.actor.kind))
     .bind(scope.actor.id.as_uuid())
-    .bind(scope.organization_id.as_str())
+    .bind(ACCOUNT_SCOPE)
     .bind(scope.operation.as_str())
     .bind(scope.key.as_str())
     .bind(scope.plane_id)
@@ -636,7 +638,7 @@ async fn delete_locked_claim(
     )
     .bind(actor_kind(scope.actor.kind))
     .bind(scope.actor.id.as_uuid())
-    .bind(scope.organization_id.as_str())
+    .bind(ACCOUNT_SCOPE)
     .bind(scope.operation.as_str())
     .bind(scope.key.as_str())
     .bind(scope.plane_id)
@@ -704,7 +706,7 @@ async fn reclaim_claim(
     )
     .bind(actor_kind(claim.scope.actor.kind))
     .bind(claim.scope.actor.id.as_uuid())
-    .bind(claim.scope.organization_id.as_str())
+    .bind(ACCOUNT_SCOPE)
     .bind(claim.scope.operation.as_str())
     .bind(claim.scope.key.as_str())
     .bind(claim.lease_id.as_uuid())
@@ -762,7 +764,16 @@ enum StoredResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         voice_profile: Option<crate::domain::voice::VoiceProfileRef>,
         request_id: RequestId,
-        file_url: String,
+        /// Briefcase permanent URL; absent when Waveform held the audio.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_url: Option<String>,
+        /// Why Waveform held the audio instead of storing it in Briefcase.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held_until: Option<i64>,
         provider: ProviderName,
         duration_ms: u64,
     },
@@ -780,10 +791,28 @@ fn encode_response(
 ) -> Result<JsonValue, IdempotencyStoreError> {
     let stored = match response {
         CompletedSpeechOperation::Tts(result) if TTS_PROVIDER_CHAIN.contains(&result.provider) => {
+            let (file_url, held_reason, audio_url, held_until) = match &result.storage {
+                AudioStorage::Briefcase { permanent_url } => {
+                    (Some(permanent_url.to_string()), None, None, None)
+                }
+                AudioStorage::Held {
+                    reason,
+                    audio_url,
+                    expires_at,
+                } => (
+                    None,
+                    Some(reason.as_str().to_owned()),
+                    Some(audio_url.to_string()),
+                    Some(expires_at.unix_timestamp()),
+                ),
+            };
             StoredResponse::Tts {
                 voice_profile: result.voice_profile.clone(),
                 request_id: result.request_id,
-                file_url: result.permanent_url.to_string(),
+                file_url,
+                held_reason,
+                audio_url,
+                held_until,
                 provider: result.provider,
                 duration_ms: result.duration.as_millis(),
             }
@@ -812,21 +841,36 @@ fn decode_response(value: JsonValue) -> Result<CompletedSpeechOperation, Idempot
             voice_profile,
             request_id,
             file_url,
+            held_reason,
+            audio_url,
+            held_until,
             provider,
             duration_ms,
         } => {
             if !TTS_PROVIDER_CHAIN.contains(&provider) {
                 return Err(IdempotencyStoreError::InvalidRecord);
             }
-            let permanent_url = BriefcaseFileUrl::new(parse_url(&file_url)?)
-                .map_err(|_| IdempotencyStoreError::InvalidRecord)?;
-            let duration = MediaDuration::from_millis(duration_ms);
+            let storage = match (file_url, held_reason, audio_url, held_until) {
+                (Some(file_url), None, None, None) => AudioStorage::Briefcase {
+                    permanent_url: BriefcaseFileUrl::new(parse_url(&file_url)?)
+                        .map_err(|_| IdempotencyStoreError::InvalidRecord)?,
+                },
+                (None, Some(reason), Some(audio_url), Some(held_until)) => AudioStorage::Held {
+                    reason: reason
+                        .parse::<HeldReason>()
+                        .map_err(|_| IdempotencyStoreError::InvalidRecord)?,
+                    audio_url: parse_url(&audio_url)?,
+                    expires_at: OffsetDateTime::from_unix_timestamp(held_until)
+                        .map_err(|_| IdempotencyStoreError::InvalidRecord)?,
+                },
+                _ => return Err(IdempotencyStoreError::InvalidRecord),
+            };
             Ok(CompletedSpeechOperation::Tts(CompletedTtsOperation {
                 voice_profile,
                 request_id,
-                permanent_url,
+                storage,
                 provider,
-                duration,
+                duration: MediaDuration::from_millis(duration_ms),
             }))
         }
         StoredResponse::Stt {
@@ -933,10 +977,11 @@ mod tests {
         idempotency::{CompletedSpeechOperation, CompletedTtsOperation},
         identity::RequestId,
         language::LanguageHint,
-        media::{BriefcaseFileUrl, MediaDuration},
+        media::{AudioStorage, BriefcaseFileUrl, HeldReason, MediaDuration},
         provider::ProviderName,
         speech::{SttResult, Transcript},
     };
+    use time::OffsetDateTime;
 
     #[derive(Debug)]
     struct TestDatabaseError {
@@ -1042,7 +1087,7 @@ mod tests {
         let legacy = json!({
             "operation": "tts",
             "request_id": expected_tts.request_id,
-            "file_url": expected_tts.permanent_url.to_string(),
+            "file_url": expected_tts.storage.permanent_url().map(ToString::to_string),
             "temporary_url": "https://cdn.example.test/generated?signature=legacy-secret",
             "provider": expected_tts.provider,
             "duration_ms": expected_tts.duration.as_millis(),
@@ -1150,11 +1195,44 @@ mod tests {
         Ok(CompletedSpeechOperation::Tts(CompletedTtsOperation {
             voice_profile: None,
             request_id: RequestId::new(Uuid::from_u128(42))?,
-            permanent_url: BriefcaseFileUrl::new(Url::parse(
-                "https://briefcase.example.test/files/generated",
-            )?)?,
+            storage: AudioStorage::Briefcase {
+                permanent_url: BriefcaseFileUrl::new(Url::parse(
+                    "https://briefcase.example.test/files/generated",
+                )?)?,
+            },
             provider: ProviderName::Gemini,
             duration: MediaDuration::from_millis(1_234),
         }))
+    }
+
+    #[test]
+    fn held_tts_response_round_trips_without_a_briefcase_url() -> Result<(), Box<dyn StdError>> {
+        let request_id = RequestId::new(Uuid::from_u128(43))?;
+        let held = CompletedSpeechOperation::Tts(CompletedTtsOperation {
+            voice_profile: None,
+            request_id,
+            storage: AudioStorage::Held {
+                reason: HeldReason::DelegatedCall,
+                audio_url: Url::parse(&format!(
+                    "https://backend.waveform.example.test/api/v1/audio/{request_id}"
+                ))?,
+                expires_at: OffsetDateTime::from_unix_timestamp(1_900_000_000)?,
+            },
+            provider: ProviderName::OpenAi,
+            duration: MediaDuration::from_millis(900),
+        });
+        let encoded = encode_response(&held)?;
+        assert!(encoded.get("file_url").is_none());
+        assert_eq!(encoded["held_reason"], "delegated_call");
+        assert_eq!(decode_response(encoded)?, held);
+        let ambiguous = json!({
+            "operation": "tts", "request_id": request_id, "provider": "gemini", "duration_ms": 1,
+            "file_url": "https://briefcase.example.test/files/generated", "held_reason": "delegated_call"
+        });
+        assert_eq!(
+            decode_response(ambiguous),
+            Err(IdempotencyStoreError::InvalidRecord)
+        );
+        Ok(())
     }
 }

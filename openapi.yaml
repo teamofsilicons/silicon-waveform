@@ -1,200 +1,71 @@
 openapi: 3.1.0
 info:
   title: Silicon Waveform API
-  version: 0.5.1
+  version: 2.0.0
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
   summary: Provider-independent text-to-speech and speech-to-text
   description: |
-    Synchronous speech operations for Carbons, Silicons, and IAM applications.
-    TTS automatic fallback defaults to off; STT retains automatic fallback. TTS output is normalized to
-    MP3 and stored in the selected Briefcase account and organization. Login and storage consent are separate.
-    Incoming OBO uses reusable access tokens and receiver verification through IAM 5.0.0; the approved graph
-    forwards the same token to declared Briefcase 3.0.0 dependencies. This contract is published ahead of the
-    coordinated runtime rollout. Test planes remain isolated and fail closed on mismatched downstream context.
+    Synchronous speech operations for Carbons and Silicons, and for apps acting for them.
+
+    **Authentication.** Every account route takes `Authorization: Bearer <access token>`, a Silicon
+    Accounts access token issued to app `waveform` (EdDSA JWT; `aud` = `waveform`, `iss` = the Silicon
+    Accounts URL). Carbons get one with `waveform login`; Silicons with
+    `silicon-accounts login --app waveform -q | waveform login --slt-stdin`. Another app acting for an
+    account sends `Authorization: Proof sap_…`, a User verification proof for `receiving_app` `waveform`,
+    on the routes that list `proofAuth`. Waveform honours the scopes `waveform.tts` (`/tts`, `/audio/{request_id}`)
+    and `waveform.stt` (`/stt`, `/stt/source-target`), from apps allowed for that scope by Waveform's
+    operator (`WAVEFORM_PROOF_ISSUERS`), and acts as the proof's account.
+
+    **Your account owns your data.** Everything belongs to the account that made the request. Account routes
+    accept `?account=c:…|si:…|<uuid>`: a Carbon may select a Silicon it is the custodian of, to read its
+    history and manage its settings, keys and Briefcase access. Nobody acts as another account.
+
+    **Storage.** TTS output is normalized to MP3 and stored in the account's own Briefcase files with a User
+    verification proof Waveform holds for the account. When Waveform cannot (Briefcase unavailable or
+    refusing, no Briefcase access, or a call from another app), the request still completes: the MP3 is
+    held by Waveform at `audio_url` until `storage.expires_at`, and `storage.reason` says why.
+
+    This is contract 2.0.0 of API v1 (`X-Waveform-Contract-Version`).
 servers:
-  - url: https://waveform.teamofsilicons.com/api/v1
+  - url: https://backend.waveform.teamofsilicons.com/api/v1
 security:
   - bearerAuth: []
 tags:
   - name: Speech
+    description: Text to speech, speech to text, and audio Waveform holds
   - name: Capabilities
-  - name: Authentication
+    description: What this Waveform supports, independent of live provider health
+  - name: Accounts
+    description: Who is signed in, and the Silicons a Carbon is custodian of
   - name: Jobs
-  - name: Testing environments
-  - name: Account
+    description: The account's speech history
+  - name: Settings
+    description: Provider order, voice, telemetry and provider keys for an account
+  - name: Briefcase access
+    description: The proof Waveform holds to store and read the account's Briefcase files
   - name: Webhooks
+    description: Events Silicon Accounts sends to Waveform
 
 paths:
-  /storage-authorizations:
-    post:
-      operationId: startStorageAuthorization
-      summary: Request separate Briefcase feature consent
-      tags: [Authentication]
-      security: [{bearerAuth: []}]
-      description: Returns an IAM consent URL and correlation state. No storage tokens leave Waveform. Reuse the same idempotency key after uncertain results. Approval is separate from login and never starts speech generation.
-      parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - name: Idempotency-Key
-          in: header
-          required: true
-          schema: {type: string, minLength: 16, maxLength: 255}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: {type: object, additionalProperties: false}
-      responses:
-        '200':
-          description: Pending or already completed authorization
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/StorageAuthorization'}
-        '401': {$ref: '#/components/responses/Unauthorized'}
-        '503': {$ref: '#/components/responses/ServiceUnavailable'}
-  /storage-authorizations/{authorization_id}:
-    get:
-      operationId: getStorageAuthorization
-      summary: Read this account's storage authorization status
-      tags: [Authentication]
-      security: [{bearerAuth: []}]
-      parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - name: authorization_id
-          in: path
-          required: true
-          schema: {type: string, format: uuid}
-      responses:
-        '200':
-          description: Account, organization and testing plane bound status
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/StorageAuthorization'}
-        '401': {$ref: '#/components/responses/Unauthorized'}
-        '404': {description: Authorization does not exist in the selected account and plane}
-  /storage-authorizations/{authorization_id}/complete:
-    post:
-      operationId: completeStorageAuthorization
-      summary: Exchange the manually supplied consent code
-      tags: [Authentication]
-      security: [{bearerAuth: []}]
-      description: Enter the IAM code and the state returned by start. Both are checked before exchanging the code. The same completed code and state safely replay; different values are rejected. Access and rotating refresh credentials are encrypted at rest and are never returned to the caller.
-      parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - name: authorization_id
-          in: path
-          required: true
-          schema: {type: string, format: uuid}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [code, state]
-              properties:
-                code: {type: string, maxLength: 16384, writeOnly: true}
-                state: {type: string, maxLength: 128, writeOnly: true}
-      responses:
-        '200':
-          description: Completed authorization, without credentials
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/StorageAuthorization'}
-        '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {description: State or code does not match}
-        '503': {$ref: '#/components/responses/ServiceUnavailable'}
-  /contracts:
-    get:
-      operationId: getApiContracts
-      summary: Read API versions, compatibility and deprecation policy
-      security: []
-      description: The unversioned /api/contracts endpoint stays available after a version sunsets. Optional X-Waveform-API-Version and X-Waveform-Protocol-Version request headers must match v1 and 1. Responses include selected API, protocol and contract headers. See the API compatibility guide for the seven-day quiet-period policy.
-      responses:
-        '200':
-          description: Contract catalog and compatibility matrix
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [service, default_api_version, protocol_versions, contracts, compatibility, policy]
-                properties:
-                  service: { type: string, const: silicon-waveform }
-                  default_api_version: { type: string, const: v1 }
-                  protocol_versions: { type: array, items: { type: string } }
-                  contracts: { type: array, items: { type: object } }
-                  compatibility: { type: array, items: { type: object } }
-                  policy: { type: object }
-        '406': { description: Unsupported API or protocol version }
-        '410': { description: The requested API version has sunset; use /api/contracts }
-  /telemetry:
-    post:
-      operationId: recordBrowserEvent
-      summary: Record an authenticated browser diagnostic
-      description: Test events and opted-out account events are discarded. No credentials or user content are accepted.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [event]
-              properties:
-                event: { type: string, enum: [speech_completed, speech_failed, settings_saved, page_view] }
-                elapsed_ms: { type: integer, minimum: 0, maximum: 86400000, default: 0 }
-      responses:
-        '204': { description: Event handled }
-  /reports:
-    post:
-      operationId: submitBugReport
-      summary: Submit a bug report with optional pull request
-      description: Authenticated, idempotent, ten reports per actor per hour. Testing simulates delivery.
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
-        - name: Idempotency-Key
-          in: header
-          required: true
-          schema: { type: string, minLength: 1, maxLength: 128 }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [message]
-              additionalProperties: false
-              properties:
-                message: { type: string, minLength: 1, maxLength: 60000 }
-                pr: { type: [string, 'null'], format: uri }
-                client_version: { type: string, maxLength: 100 }
-      responses:
-        '202':
-          description: Persisted report with queued, sent, or simulated notification status
-        '400': { description: Invalid report or credential content }
-        '401': { description: Missing or invalid authentication }
-        '409': { description: Idempotency key reused with different content }
-        '429': { description: Hourly report limit exceeded }
-        '503': { description: Postmark not configured }
-
   /tts:
     post:
       security:
         - bearerAuth: []
-        - oboAccess: []
+        - proofAuth: []
       tags: [Speech]
       operationId: synthesizeSpeech
-      summary: Convert text to speech and store the MP3 in Briefcase
+      summary: Convert text to speech
       description: |
-        Attempts Gemini 3.1 Flash TTS Preview, ElevenLabs Multilingual v2,
-        then OpenAI tts-1. Returns only after the normalized MP3 is stored and
-        both its permanent and temporary Briefcase URLs are available. A
-        completed idempotent retry re-authorizes the stored file and returns a
-        freshly issued temporary URL without rerunning synthesis.
+        Runs the account's provider order (Gemini 3.1 Flash TTS Preview, ElevenLabs Multilingual v2, then
+        OpenAI tts-1 by default; fallback is off unless `auto_fallback` is true), normalizes to MP3 and stores
+        it in the account's Briefcase files (`storage.status` = `stored`, `file_url`). If Waveform cannot store
+        it there, or another app called with a proof, the MP3 is held by Waveform (`storage.status` = `held`,
+        `audio_url`, `storage.reason`). A completed idempotent retry re-checks access to the stored file and
+        returns the same result without running a provider again. Proof scope: `waveform.tts`.
       parameters:
-        - $ref: '#/components/parameters/OrgId'
         - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/AppId'
         - $ref: '#/components/parameters/RequestId'
       requestBody:
         required: true
@@ -203,11 +74,10 @@ paths:
             schema: { $ref: '#/components/schemas/TTSRequest' }
       responses:
         '200':
-          description: Stored audio result, with a currently authorized temporary URL
+          description: Generated speech, stored in Briefcase or held by Waveform
           headers:
             X-Request-ID: { $ref: '#/components/headers/RequestId' }
             Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
-            Cache-Control: { $ref: '#/components/headers/CacheControl' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TTSResult' }
@@ -223,76 +93,23 @@ paths:
         '504': { $ref: '#/components/responses/GatewayTimeout' }
         default: { $ref: '#/components/responses/Error' }
 
-  /stt/source-target:
-    post:
-      security:
-        - bearerAuth: []
-      tags: [Speech]
-      operationId: prepareTranscriptionSourceTarget
-      summary: Resolve the current actor's private Waveform source folder
-      description: |
-        Requires current selected-organization STT and self.identity.read scopes.
-        Uses fresh, exact Briefcase entries.list proofs to materialize and verify
-        the caller's own reserved apps/<waveform-app>/private/<public-id> folder.
-        Returns no credentials and invokes no speech provider. Repeating the
-        request reauthorizes and verifies the same native folder; no authority
-        or successful response is cached. Upload a same-actor copy through the
-        normal Briefcase uploads endpoint, then transcribe the copied permanent
-        URL. The original file and Briefcase's application namespace fence remain.
-      parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
-        - $ref: '#/components/parameters/RequestId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { type: object, additionalProperties: false }
-      responses:
-        '200':
-          description: Verified current actor's private folder, not an upload or transcription receipt
-          headers:
-            Cache-Control: { $ref: '#/components/headers/CacheControl' }
-          content:
-            application/json:
-              schema:
-                type: object
-                additionalProperties: false
-                required: [org_id, app_id, actor_id, folder_id, folder_path, testing_environment_id]
-                properties:
-                  org_id: { type: string }
-                  app_id: { type: string }
-                  actor_id: { type: string, description: Current IAM public actor identifier }
-                  folder_id: { type: string, format: uuid }
-                  folder_path: { type: string }
-                  testing_environment_id: { type: [string, 'null'], format: uuid }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/SourceNotFound' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
-        default: { $ref: '#/components/responses/Error' }
   /stt:
     post:
       security:
         - bearerAuth: []
-        - oboAccess: []
+        - proofAuth: []
       tags: [Speech]
       operationId: transcribeSpeech
-      summary: Transcribe an authorized Briefcase file
+      summary: Transcribe a file in the account's Briefcase files
       description: |
-        The source must be within the originating Waveform application namespace.
-        Use /stt/source-target to prepare an owner-authorized copy when necessary.
-        Re-authorizes the permanent Briefcase reference as the represented
-        actor, then attempts Gemini 3.5 Transcribe, OpenAI gpt-transcribe, and
-        Deepgram Nova-3 Multilingual. Waveform never fetches the supplied URL
-        directly. A completed idempotent retry verifies current access to the
-        exact source before returning its cached transcript.
+        Reads the permanent Briefcase URL as the account (with Waveform's Briefcase proof for it), then runs
+        the account's STT order (Gemini 3.5 Transcribe, gpt-transcribe, Deepgram Nova-3 by default, with
+        automatic fallback). Waveform never fetches the supplied URL directly. A completed idempotent retry
+        re-checks current access to the source before returning the cached transcript. An app calling with a
+        proof (scope `waveform.stt`) can only use Briefcase access the account gave Waveform before; without
+        it the answer is `403 storage_authorization_required`.
       parameters:
-        - $ref: '#/components/parameters/OrgId'
         - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/AppId'
         - $ref: '#/components/parameters/RequestId'
       requestBody:
         required: true
@@ -301,11 +118,10 @@ paths:
             schema: { $ref: '#/components/schemas/STTRequest' }
       responses:
         '200':
-          description: Normalized transcript released after current source authorization
+          description: Transcript, released after current source authorization
           headers:
             X-Request-ID: { $ref: '#/components/headers/RequestId' }
             Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
-            Cache-Control: { $ref: '#/components/headers/CacheControl' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/STTResult' }
@@ -322,6 +138,78 @@ paths:
         '504': { $ref: '#/components/responses/GatewayTimeout' }
         default: { $ref: '#/components/responses/Error' }
 
+  /stt/source-target:
+    post:
+      security:
+        - bearerAuth: []
+        - proofAuth: []
+      tags: [Speech]
+      operationId: prepareTranscriptionSourceTarget
+      summary: Get the account's Waveform folder in Briefcase for STT sources
+      description: |
+        Makes sure Waveform's folder (`apps/waveform`) exists in the account's Briefcase drive and returns it.
+        Upload a source there with Briefcase, then transcribe its permanent URL. No speech provider runs.
+        Briefcase shows Waveform its folder only through the files in it, so while the folder is still empty
+        the answer is `404 briefcase_folder_not_found` (store one speech there first, or upload with your own
+        Briefcase access). Proof scope: `waveform.stt`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: The account's Waveform folder
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [app_id, account, folder_id, folder_path]
+                properties:
+                  app_id: { type: string, const: waveform }
+                  account: { $ref: '#/components/schemas/AccountRef' }
+                  folder_id: { type: string, format: uuid }
+                  folder_path: { type: string, example: apps/waveform }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /audio/{request_id}:
+    get:
+      security:
+        - bearerAuth: []
+        - proofAuth: []
+      tags: [Speech]
+      operationId: getHeldAudio
+      summary: Download an MP3 Waveform holds
+      description: |
+        Served only to the account that requested the speech (its own token, or an app's proof with
+        `waveform.tts` acting for it) until it expires. Another account's request id answers 404, like an
+        unknown or expired one.
+      parameters:
+        - in: path
+          name: request_id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The MP3
+          headers:
+            X-Waveform-Audio-Expires-At: { schema: { type: string, format: date-time } }
+          content:
+            audio/mpeg:
+              schema: { type: string, format: binary }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Error' }
+
   /capabilities:
     get:
       tags: [Capabilities]
@@ -335,137 +223,86 @@ paths:
           description: Normalized service capabilities, independent of live provider health
           headers:
             X-Request-ID: { $ref: '#/components/headers/RequestId' }
-            Cache-Control: { $ref: '#/components/headers/CacheControl' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Capabilities' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         default: { $ref: '#/components/responses/Error' }
 
-  /iam:
+  /accounts:
     get:
-      tags: [Authentication]
-      operationId: getIamInfo
-      summary: Discover public IAM application metadata
+      tags: [Accounts]
+      operationId: getAccountsDiscovery
+      summary: Where to sign in to Waveform
       security: []
-      parameters:
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
       responses:
         '200':
-          description: Public configuration for the selected environment, without secrets
-          headers:
-            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+          description: Waveform's app id, the Silicon Accounts URL and the docs
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/IamInfo' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+              schema:
+                type: object
+                required: [app_id, accounts_url, api_url, docs_url, proof_scopes, version]
+                properties:
+                  app_id: { type: string, example: waveform }
+                  accounts_url: { type: string, format: uri, example: https://accounts.teamofsilicons.com }
+                  api_url: { type: string, format: uri }
+                  docs_url: { type: string, format: uri }
+                  proof_scopes: { type: array, items: { type: string }, example: [waveform.tts, waveform.stt] }
+                  version: { type: string }
+        '406': { $ref: '#/components/responses/Error' }
 
-  /auth/login:
-    post:
-      tags: [Authentication]
-      operationId: login
-      summary: Exchange an IAM SLT for Waveform session tokens
-      security: []
-      parameters:
-        - $ref: '#/components/parameters/SessionIdempotencyKey'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/LoginRequest' }
+  /me:
+    get:
+      tags: [Accounts]
+      operationId: getMe
+      summary: The signed-in account (also at /auth/me)
       responses:
         '200':
-          description: IAM access and refresh tokens
-          headers:
-            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+          description: The account the access token belongs to
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/OAuthTokenResponse' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+              schema: { $ref: '#/components/schemas/Me' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
-
-  /auth/refresh:
-    post:
-      tags: [Authentication]
-      operationId: refresh
-      summary: Exchange an IAM refresh token for a new token pair
-      security: []
-      parameters:
-        - $ref: '#/components/parameters/SessionIdempotencyKey'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/RefreshRequest' }
-      responses:
-        '200':
-          description: Refreshed IAM access and refresh tokens
-          headers:
-            Cache-Control: { $ref: '#/components/headers/CacheControl' }
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/OAuthTokenResponse' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
-
-  /auth/logout:
-    post:
-      tags: [Authentication]
-      operationId: logout
-      summary: Revoke an IAM access or refresh token
-      security: []
-      parameters:
-        - $ref: '#/components/parameters/SessionIdempotencyKey'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/LogoutRequest' }
-      responses:
-        '204': { description: Token revoked successfully }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /auth/me:
     get:
-      tags: [Authentication]
-      operationId: getCurrentActor
-      summary: Return the current actor's verified IAM authority
-      parameters:
-        - in: header
-          name: X-Org-ID
-          required: false
-          description: Optional organization assertion; otherwise derived from IAM.
-          schema: { type: string }
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      tags: [Accounts]
+      operationId: getMeLegacyPath
+      summary: The signed-in account (same as /me)
       responses:
         '200':
-          description: Verified actor and organization authority
-          headers:
-            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+          description: The account the access token belongs to
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ApplicationAuthorization' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+              schema: { $ref: '#/components/schemas/Me' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /silicons:
+    get:
+      tags: [Accounts]
+      operationId: listMySilicons
+      summary: The Silicons the signed-in Carbon looks after (that Waveform knows)
+      responses:
+        '200':
+          description: Silicons whose custodian is the caller; empty for a Silicon
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Account' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   /jobs:
     get:
       tags: [Jobs]
       operationId: listJobs
-      summary: List actor-scoped speech job history
+      summary: List the account's speech history (first 512 characters retained)
       parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - $ref: '#/components/parameters/Account'
         - in: query
           name: operation
           schema: { type: string, enum: [tts, stt] }
@@ -485,16 +322,16 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Error' }
 
   /jobs/{job_id}:
     get:
       tags: [Jobs]
       operationId: getJob
-      summary: Get one actor-scoped speech job
+      summary: Get one of the account's speech jobs
       parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
         - $ref: '#/components/parameters/JobId'
+        - $ref: '#/components/parameters/Account'
       responses:
         '200':
           description: Speech job
@@ -507,27 +344,26 @@ paths:
 
   /preferences:
     get:
-      tags: [Account]
+      tags: [Settings]
       operationId: getPreferences
-      summary: Get effective provider order and account voice profile
+      summary: Get the account's provider order, default voice and telemetry choice
       parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - $ref: '#/components/parameters/Account'
       responses:
         '200':
-          description: Effective account provider preferences
+          description: Effective account preferences
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Preferences' }
-        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
     patch:
-      tags: [Account]
+      tags: [Settings]
       operationId: updatePreferences
-      summary: Set account provider order and/or default voice profile
+      summary: Change the account's provider order, default voice or telemetry choice
+      description: A custodian changing a Silicon's settings must have a live sign-in (checked with Silicon Accounts).
       parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - $ref: '#/components/parameters/Account'
       requestBody:
         required: true
         content:
@@ -535,21 +371,19 @@ paths:
             schema: { $ref: '#/components/schemas/PreferencesUpdate' }
       responses:
         '200':
-          description: Updated provider order preferences
+          description: Updated preferences
           content:
             application/json:
               schema: { $ref: '#/components/schemas/PreferencesUpdate' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /voice-profiles:
     get:
-      tags: [Account]
+      tags: [Settings]
       operationId: listVoiceProfiles
-      summary: List profiles and provider mappings in the selected environment
-      parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
+      summary: List voice profiles and their provider mappings
       responses:
         '200':
           description: Voice catalog; provisional mappings have auditioned=false
@@ -561,295 +395,288 @@ paths:
                 properties:
                   items: { type: array, items: { $ref: '#/components/schemas/VoiceProfile' } }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
 
   /provider-keys:
     get:
-      tags: [Account]
+      tags: [Settings]
       operationId: listProviderKeys
-      summary: List configured provider keys without revealing secrets
+      summary: List the account's saved provider keys without revealing them
       parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
+        - $ref: '#/components/parameters/Account'
       responses:
         '200':
-          description: Configured provider metadata
+          description: Configured providers
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
+                required: [account, items]
                 properties:
-                  items:
-                    type: array
-                    items: { $ref: '#/components/schemas/ProviderKeyInfo' }
+                  account: { $ref: '#/components/schemas/AccountRef' }
+                  items: { type: array, items: { $ref: '#/components/schemas/ProviderKeyInfo' } }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /provider-keys/{provider}:
     put:
-      tags: [Account]
+      tags: [Settings]
       operationId: setProviderKey
-      summary: Replace a personal provider API key
+      summary: Save (replace) a provider key; it is never returned
+      description: Needs a live sign-in (checked with Silicon Accounts).
       parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
         - $ref: '#/components/parameters/Provider'
+        - $ref: '#/components/parameters/Account'
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/ProviderKeyRequest' }
       responses:
-        '204': { description: Provider key stored }
+        '204': { description: Provider key saved }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
     delete:
-      tags: [Account]
+      tags: [Settings]
       operationId: deleteProviderKey
-      summary: Delete a personal provider API key
+      summary: Delete a saved provider key
+      description: Needs a live sign-in (checked with Silicon Accounts).
       parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
         - $ref: '#/components/parameters/Provider'
+        - $ref: '#/components/parameters/Account'
       responses:
         '204': { description: Provider key deleted }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
-  /testing-environment:
-    get:
-      tags: [Testing environments]
-      operationId: getCurrentTestingEnvironment
-      summary: Describe the selected isolated test plane
-      security: []
-      parameters:
-        - $ref: '#/components/parameters/TestingEnvironmentKey'
+  /storage-authorizations:
+    post:
+      tags: [Briefcase access]
+      operationId: approveBriefcaseAccess
+      summary: Give Waveform Briefcase access for this account (or replace it)
+      description: |
+        Waveform asks Silicon Accounts for a User verification proof for `receiving_app` `briefcase`
+        (scopes `briefcase.uploads.reserve`, `briefcase.uploads.commit`, `briefcase.entries.list`,
+        `briefcase.files.read`) from the caller's own access token, and keeps it encrypted. Only the account
+        itself can do this; a custodian cannot approve for a Silicon. A direct speech request does the same
+        when the account has no access yet, and replaces a proof that ended with the sign-in it was issued
+        under once Briefcase refuses it; after the account or its custodian revoked the access (`DELETE`, or
+        the account revoking the proof at Silicon Accounts), speech is held with `storage_not_authorized` until
+        the account approves again here.
       responses:
-        '200':
-          description: Selected testing environment metadata
+        '201':
+          description: Briefcase access is active
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/TestingEnvironment' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+              schema: { $ref: '#/components/schemas/BriefcaseAccess' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-
-  /testing-environment/clean:
-    post:
-      tags: [Testing environments]
-      operationId: cleanTestingEnvironment
-      deprecated: true
-      summary: Manage this environment through Honeycomb
-      responses:
-        '409':
-          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
-  /testing-environments:
-    post:
-      tags: [Testing environments]
-      operationId: createTestingEnvironment
-      deprecated: true
-      summary: Manage this environment through Honeycomb
-      responses:
-        '409':
-          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
     get:
-      tags: [Testing environments]
-      operationId: listTestingEnvironments
-      summary: List test planes in the current organization
+      tags: [Briefcase access]
+      operationId: getBriefcaseAccess
+      summary: Status of Waveform's Briefcase access for the account
       parameters:
-        - $ref: '#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/Account'
       responses:
         '200':
-          description: Plane metadata; root keys are never listed
+          description: Status (`active`, `revoked` or `missing`); never a token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BriefcaseAccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Briefcase access]
+      operationId: revokeBriefcaseAccess
+      summary: Revoke Waveform's Briefcase access for the account
+      parameters:
+        - $ref: '#/components/parameters/Account'
+      responses:
+        '200':
+          description: The access is revoked at Silicon Accounts and its tokens are wiped
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BriefcaseAccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /contracts:
+    get:
+      tags: [Capabilities]
+      operationId: getApiContracts
+      summary: Read API versions, compatibility and deprecation policy
+      security: []
+      description: Also at the unversioned /api/contracts, which stays available after a version sunsets. Optional X-Waveform-API-Version and X-Waveform-Protocol-Version request headers must match v1 and 1.
+      responses:
+        '200':
+          description: Contract catalog and compatibility matrix
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
+                required: [service, default_api_version, protocol_versions, contracts, compatibility, policy]
                 properties:
-                  items: { type: array, items: { $ref: '#/components/schemas/TestingEnvironment' } }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+                  service: { type: string, const: silicon-waveform }
+                  default_api_version: { type: string, const: v1 }
+                  protocol_versions: { type: array, items: { type: string } }
+                  contracts: { type: array, items: { type: object } }
+                  compatibility: { type: array, items: { type: object } }
+                  policy: { type: object }
+        '406': { description: Unsupported API or protocol version }
+        '410': { description: The requested API version has sunset; use /api/contracts }
 
-  /testing-environments/{environment_id}:
-    get:
-      tags: [Testing environments]
-      operationId: getTestingEnvironment
-      summary: Get test-plane metadata
-      parameters:
-        - $ref: '#/components/parameters/OrgId'
-        - $ref: '#/components/parameters/EnvironmentId'
-      responses:
-        '200':
-          description: Test-plane metadata
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/TestingEnvironment' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/Error' }
-
-  /testing-environments/{environment_id}/key:
-    get:
-      tags: [Testing environments]
-      operationId: getTestingEnvironmentKey
-      deprecated: true
-      summary: Manage this environment through Honeycomb
-      responses:
-        '409':
-          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
-  /testing-environments/{environment_id}/rotate-key:
+  /telemetry:
     post:
-      tags: [Testing environments]
-      operationId: rotateTestingEnvironmentKey
-      deprecated: true
-      summary: Manage this environment through Honeycomb
-      responses:
-        '409':
-          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
-  /testing-environments/{environment_id}/delete:
-    post:
-      tags: [Testing environments]
-      operationId: deleteTestingEnvironment
-      deprecated: true
-      summary: Manage this environment through Honeycomb
-      responses:
-        '409':
-          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
-  /testing-environments/{environment_id}/restore:
-    post:
-      tags: [Testing environments]
-      operationId: restoreTestingEnvironment
-      deprecated: true
-      summary: Manage this environment through Honeycomb
-      responses:
-        '409':
-          description: Environment lifecycle is owned by Honeycomb (manage_environment_in_honeycomb).
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
-  /webhooks/:
-    post:
-      tags: [Authentication]
-      operationId: receiveIamWebhook
-      summary: Receive a signed IAM event
-      description: Verifies exact request bytes and deduplicates by event ID. Payload content is never persisted.
-      servers:
-        - url: https://waveform.teamofsilicons.com
-      security: []
+      tags: [Accounts]
+      operationId: recordBrowserEvent
+      summary: Record a diagnostics event (dropped when the account opted out)
       requestBody:
         required: true
         content:
-          application/json: { schema: { type: object } }
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [event]
+              properties:
+                event: { type: string, enum: [speech_completed, speech_failed, settings_saved, page_view] }
+                elapsed_ms: { type: integer, minimum: 0, maximum: 86400000, default: 0 }
       responses:
-        '204': { description: Event accepted or already processed }
+        '204': { description: Event handled }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /reports:
+    post:
+      tags: [Accounts]
+      operationId: submitBugReport
+      summary: Submit a bug report with an optional pull request
+      description: Idempotent; ten reports per account per hour. Reports that contain tokens or secrets are refused.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              additionalProperties: false
+              properties:
+                message: { type: string, minLength: 1, maxLength: 60000 }
+                pr: { type: [string, 'null'], format: uri }
+                client_version: { type: string, maxLength: 100 }
+      responses:
+        '202': { description: Report saved and queued for delivery }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: Idempotency key reused with different content }
+        '429': { description: Hourly report limit reached }
+        '503': { description: Report delivery is not configured }
+
+  /webhooks/accounts:
+    servers:
+      - url: https://backend.waveform.teamofsilicons.com
+    post:
+      tags: [Webhooks]
+      operationId: receiveAccountsWebhook
+      summary: Silicon Accounts events about Waveform's members
+      security: []
+      description: |
+        Signed by Silicon Accounts: `X-Accounts-Signature: v1=<hex HMAC-SHA256(whsec, "{X-Accounts-Timestamp}.{raw body}")>`,
+        timestamp within 5 minutes. Deduplicated on `event_id`. Handles `account.id_changed`, `account.updated`,
+        `silicon.custodian_changed`, `membership.signed_out` (every reason except `app_revoked` refuses tokens
+        issued before the event and ends Waveform's Briefcase access), `membership.access_removed` (the same),
+        `account.deleted` (deletes the account's Waveform data) and `ping`. Unknown types answer 200.
+      parameters:
+        - { in: header, name: X-Accounts-Timestamp, required: true, schema: { type: string } }
+        - { in: header, name: X-Accounts-Signature, required: true, schema: { type: string } }
+        - { in: header, name: X-Accounts-Event-Id, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event_id, type, data]
+              properties:
+                event_id: { type: string }
+                type: { type: string }
+                occurred_at: { type: string, format: date-time }
+                app_id: { type: [string, 'null'] }
+                silicon: { type: [string, 'null'] }
+                data: { type: object }
+      responses:
+        '200':
+          description: Applied (or a duplicate of an event already applied)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { type: boolean }
+                  event_id: { type: string }
+                  outcome: { type: string }
+                  duplicate: { type: boolean }
+        '400': { description: The signed body is not a Silicon Accounts event }
+        '401': { description: 'Missing, stale or wrong signature' }
+        '503': { description: No webhook secret is configured }
 
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      bearerFormat: IAM access token
-      description: Opaque IAM access token for a Carbon or Silicon.
-    oboAccess:
+      bearerFormat: JWT
+      description: |
+        Silicon Accounts access token issued to app `waveform` (EdDSA JWT, `aud` = `waveform`,
+        `iss` = the Silicon Accounts URL, at most 30 minutes). Verified locally against the published key set;
+        sign-ins that ended (signed out, access removed, account deleted) are refused.
+    proofAuth:
       type: apiKey
       in: header
-      name: X-IAM-OBO-Access-Token
+      name: Authorization
       description: |
-        Reusable IAM access token for an approved endpoint graph, bound to the actor,
-        organization, and requested action. X-App-ID is also required.
+        `Proof sap_…`: a Silicon Accounts User verification proof issued by another app for `receiving_app`
+        `waveform`, verified with Silicon Accounts on every call. Needs the route's scope (`waveform.tts` or
+        `waveform.stt`) and an issuing app allowed for that scope. Waveform acts as the proof's account and
+        records the issuing app on the job.
 
   parameters:
-    OrgId:
-      name: X-Org-ID
-      in: header
-      required: true
-      description: Organization selected for this operation; it must match verified IAM state.
-      schema:
-        type: string
-        minLength: 1
-        maxLength: 64
-        pattern: '^[A-Za-z0-9_-]+$'
-    SessionIdempotencyKey:
-      name: Idempotency-Key
-      in: header
+    Account:
+      name: account
+      in: query
       required: false
       description: |
-        Send one stable key per login, refresh or logout operation and reuse it
-        for retries. Waveform forwards it unchanged to IAM so a retry can recover
-        the original result. Without this header a new key is generated per request.
-      schema:
-        type: string
-        minLength: 16
-        maxLength: 255
-        pattern: '^[!-~]+$'
+        Act on another account's data: `c:…`/`si:…` id or uuid. Allowed only for a Carbon selecting a Silicon
+        it is the custodian of (or for selecting yourself). Never allowed for speech.
+      schema: { type: string, minLength: 1, maxLength: 128 }
     IdempotencyKey:
       name: Idempotency-Key
       in: header
       required: true
       description: |
-        Scoped to actor, organization, and operation for at least 24 hours
-        (the default is 24 hours). Reusing a key with a different validated
+        Scoped to the account and operation for at least 24 hours. Reusing a key with a different validated
         request during retention returns 409.
       schema:
         type: string
         minLength: 8
         maxLength: 255
         pattern: '^[!-~]+$'
-    AppId:
-      name: X-App-ID
-      in: header
-      required: false
-      description: Required with X-IAM-OBO-Access-Token and omitted for Bearer requests.
-      schema:
-        type: string
-        minLength: 1
-        maxLength: 80
-        pattern: '^[A-Za-z0-9_-]+$'
     RequestId:
       name: X-Request-ID
       in: header
       required: false
       description: |
-        Optional attempt correlation UUID. Invalid values are replaced by
-        Waveform. A successful idempotent replay returns the stored canonical
-        operation UUID instead.
+        Optional attempt correlation UUID. Invalid values are replaced by Waveform. A successful idempotent
+        replay returns the stored canonical operation UUID instead.
       schema: { type: string, format: uuid }
-    TestingEnvironmentKey:
-      name: X-Testing-Environment-Key
-      in: header
-      required: false
-      description: IAM test app_secret selecting the Waveform sandbox. Validated live; no paired Briefcase key needed. Legacy root selectors remain accepted.
-      schema: { type: string, pattern: '^(ask_[A-Za-z0-9_-]{43}|[A-Za-z0-9]{32})$' }
     JobId:
       name: job_id
-      in: path
-      required: true
-      schema: { type: string, format: uuid }
-    EnvironmentId:
-      name: environment_id
       in: path
       required: true
       schema: { type: string, format: uuid }
@@ -862,107 +689,247 @@ components:
   headers:
     RequestId:
       description: |
-        Waveform request correlation ID. A successful speech replay uses the
-        stored canonical operation UUID; replay-time errors use the current
-        attempt UUID.
+        Waveform request correlation ID. A successful speech replay uses the stored canonical operation UUID;
+        replay-time errors use the current attempt UUID.
       schema: { type: string, format: uuid }
     IdempotencyReplayed:
-      description: |
-        True when stable completed-operation state was reused. Any TTS
-        temporary delivery URL in the response was freshly authorized and is
-        not loaded from the idempotency record.
+      description: True when stable completed-operation state was reused.
       schema: { type: boolean }
     CacheControl:
-      description: Prevents intermediaries from retaining private speech data or correlation IDs.
+      description: Prevents intermediaries from retaining private data.
       schema: { type: string, const: no-store }
 
   responses:
     BadRequest:
-      description: Malformed headers, credentials, URL, language hint, or JSON input
+      description: |
+        Malformed headers, URL, language hint, or JSON input; or `speech_runs_as_yourself` when a speech
+        route (`/tts`, `/stt`, `/stt/source-target`, `/audio/{request_id}`) is given `?account=`: speech
+        always runs as the caller, and a custodian never speaks as a Silicon.
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     Unauthorized:
-      description: IAM credentials are missing, invalid, expired, or inactive
+      description: |
+        The credential is missing, malformed, expired, issued to another app or by another Accounts
+        deployment, from an ended sign-in, or an invalid proof. `error.reason` says which; `error.hint` says
+        what to do.
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     Forbidden:
-      description: The represented actor cannot use this organization or resource
+      description: |
+        Authenticated but not allowed: not the Silicon's custodian, a proof without the route's scope or from
+        an app that is not allowed, a route that takes no proofs, or no Briefcase access for the account.
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     SourceNotFound:
-      description: Briefcase reports the exact STT source or completed TTS replay file as missing
+      description: Briefcase reports the STT source (or a replayed TTS file) as missing
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     Conflict:
-      description: Idempotency key mismatch or another request currently owns the key
+      description: Idempotency key mismatch, or another request currently owns the key
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
         Retry-After: { schema: { type: integer, minimum: 1 } }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     PayloadTooLarge:
       description: Text, request body, source media, or generated audio exceeds a synchronous limit
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     UnsupportedMediaType:
-      description: Briefcase source media is not accepted by the normalized STT contract
+      description: Briefcase source media is not accepted by the STT contract
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     TooManyRequests:
       description: Waveform admission control rejected the request
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
         Retry-After: { schema: { type: integer, minimum: 1 } }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     BadGateway:
-      description: Selected TTS provider failed with fallback off, or the enabled provider chain failed
+      description: The selected TTS provider failed with fallback off, or every enabled provider failed
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     ServiceUnavailable:
-      description: IAM, Briefcase, PostgreSQL, or a required contract capability is unavailable
+      description: Silicon Accounts, Briefcase, PostgreSQL or another dependency is unavailable (`error.reason` names it)
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
         Retry-After: { schema: { type: integer, minimum: 1 } }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     GatewayTimeout:
       description: The bounded synchronous operation exceeded its deadline
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     Error:
       description: Normalized Waveform error
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
-        Cache-Control: { $ref: '#/components/headers/CacheControl' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   schemas:
-    StorageAuthorization:
+    AccountRef:
       type: object
-      required: [authorization_id, consent_url, state, status, expires_at]
+      required: [uuid]
       properties:
-        authorization_id: {type: string, format: uuid}
-        consent_url: {type: [string, 'null'], format: uri}
-        state: {type: string}
-        status: {type: string, enum: [pending, completed]}
-        expires_at: {type: string, format: date-time}
+        uuid: { type: string, description: Permanent Silicon Accounts uuid (case-sensitive), example: zQo }
+        id: { type: [string, 'null'], description: Current public id, example: 'c:ada' }
+    Account:
+      type: object
+      required: [uuid, id, kind]
+      properties:
+        uuid: { type: string, example: K1E }
+        id: { type: [string, 'null'], example: 'si:scout' }
+        kind: { type: string, enum: [carbon, silicon] }
+        display_name: { type: [string, 'null'] }
+        pfp_url: { type: [string, 'null'], format: uri }
+        custodian:
+          oneOf:
+            - $ref: '#/components/schemas/AccountRef'
+            - { type: 'null' }
+    Me:
+      type: object
+      required: [authenticated, app_id, account, via]
+      properties:
+        authenticated: { type: boolean, const: true }
+        app_id: { type: string, const: waveform }
+        account: { $ref: '#/components/schemas/Account' }
+        via: { type: string, const: bearer }
+        expires_at: { type: [string, 'null'], format: date-time }
+    BriefcaseAccess:
+      type: object
+      required: [account, briefcase]
+      properties:
+        account: { $ref: '#/components/schemas/AccountRef' }
+        briefcase:
+          type: object
+          required: [status, receiving_app, scopes]
+          properties:
+            status: { type: string, enum: [active, revoked, missing] }
+            receiving_app: { type: string, const: briefcase }
+            scopes: { type: array, items: { type: string } }
+            proof_id: { type: [string, 'null'] }
+            token_expires_at: { type: [string, 'null'], format: date-time }
+            refresh_expires_at: { type: [string, 'null'], format: date-time }
+            updated_at: { type: [string, 'null'], format: date-time }
+            revoked_reason: { type: [string, 'null'], example: access_removed }
+    TTSResult:
+      type: object
+      additionalProperties: false
+      required: [request_id, file_url, temporary_url, audio_url, storage, media_type, provider, duration_ms]
+      properties:
+        voice_profile:
+          oneOf:
+            - $ref: '#/components/schemas/VoiceProfileRef'
+            - { type: 'null' }
+        request_id:
+          type: string
+          format: uuid
+          description: Canonical operation UUID, preserved on completed replay.
+        file_url:
+          type: [string, 'null']
+          format: uri
+          description: Permanent Briefcase URL; null when Waveform holds the audio instead.
+        temporary_url: { type: 'null', description: Always null; kept for older clients. }
+        audio_url:
+          type: [string, 'null']
+          format: uri
+          description: Waveform URL serving the MP3 while it is held (GET /audio/{request_id}); null when stored in Briefcase.
+        storage:
+          type: object
+          required: [status]
+          properties:
+            status: { type: string, enum: [stored, held] }
+            reason:
+              type: string
+              enum: [delegated_call, storage_not_authorized, briefcase_refused, briefcase_unavailable, briefcase_timeout, briefcase_contract_unavailable]
+            message: { type: string }
+            expires_at: { type: string, format: date-time }
+        media_type: { type: string, const: audio/mpeg }
+        provider:
+          type: string
+          enum: [gemini, elevenlabs, openai]
+          description: Provider that completed synthesis
+        duration_ms: { type: integer, format: int64, minimum: 0 }
+    Job:
+      type: object
+      required: [id, operation, status, first_line, created_at]
+      properties:
+        voice_profile:
+          oneOf:
+            - $ref: '#/components/schemas/VoiceProfileRef'
+            - { type: 'null' }
+        id: { type: string, format: uuid }
+        issuing_app: { type: [string, 'null'], description: App that called Waveform for the account with a proof }
+        operation: { type: string, enum: [tts, stt] }
+        status: { type: string, enum: [running, failed, completed] }
+        first_line: { type: string }
+        duration_ms: { type: [integer, 'null'], format: int64, minimum: 0 }
+        provider: { type: [string, 'null'] }
+        error_code: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+    JobPage:
+      type: object
+      required: [account, items, next_cursor]
+      properties:
+        account: { $ref: '#/components/schemas/AccountRef' }
+        items: { type: array, items: { $ref: '#/components/schemas/Job' } }
+        next_cursor: { type: [string, 'null'] }
+    Preferences:
+      type: object
+      required: [account, tts_order, stt_order, voice_profile, defaults]
+      properties:
+        account: { $ref: '#/components/schemas/AccountRef' }
+        telemetry_enabled: { type: boolean, default: true }
+        voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
+        tts_order: { type: array, items: { type: string, enum: [gemini, elevenlabs, openai] } }
+        stt_order: { type: array, items: { type: string, enum: [gemini, openai, deepgram] } }
+        defaults:
+          type: object
+          required: [tts_order, stt_order, voice_profile]
+          properties:
+            voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
+            tts_order: { type: array, items: { type: string } }
+            stt_order: { type: array, items: { type: string } }
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: |
+                invalid_request, speech_runs_as_yourself, unauthenticated, forbidden, not_custodian,
+                account_not_found, briefcase_folder_not_found, payload_too_large,
+                unsupported_media_type, source_not_found, storage_authorization_required, idempotency_key_reused,
+                request_in_progress, provider_failed, providers_exhausted, dependency_contract_unavailable,
+                dependency_unavailable, dependency_timeout, too_many_requests, request_timeout, not_ready,
+                not_found, route_retired, method_not_allowed, internal_error, unsupported_api_version,
+                api_version_mismatch, unsupported_protocol_version, api_version_sunset, and route-specific codes.
+            message: { type: string, minLength: 1, description: Exactly what failed and why }
+            hint: { type: string, description: What to do next }
+            reason:
+              type: string
+              description: |
+                Exact authentication reason (missing_credentials, malformed_authorization, retired_credentials,
+                invalid_token, token_expired, wrong_audience, wrong_issuer, unknown_signing_key, sign_in_ended,
+                account_deleted, token_inactive, invalid_proof, proof_without_account, proof_scope_missing,
+                proof_issuer_not_allowed, proof_not_accepted), the dependency that failed, or an allowlisted
+                provider reason.
+            provider: { type: string, enum: [gemini, elevenlabs, openai, deepgram] }
+            provider_status: { type: integer, minimum: 100, maximum: 599 }
+            request_id: { type: string, format: uuid }
     VoiceProfileRef:
       type: object
       required: [id, revision]
@@ -1106,8 +1073,11 @@ components:
         file_url:
           type: string
           format: uri
-          pattern: '^https://'
-          description: Permanent authenticated URL at the configured Silicon Briefcase origin.
+          pattern: '^https?://'
+          description: |
+            Permanent Briefcase URL of a file in the account's own Briefcase drive
+            (`{origin}/{owner uuid}/{path}`; permanent URLs issued before accounts still resolve), at the
+            configured Briefcase origin. HTTPS; plain http only for a loopback Briefcase in development.
         language:
           type: string
           minLength: 2
@@ -1122,31 +1092,6 @@ components:
           items:
             type: string
             enum: [gemini, openai, deepgram]
-
-    TTSResult:
-      type: object
-      additionalProperties: false
-      required: [request_id, file_url, temporary_url, media_type, provider, duration_ms]
-      properties:
-        voice_profile:
-          oneOf:
-            - $ref: '#/components/schemas/VoiceProfileRef'
-            - { type: 'null' }
-        request_id:
-          type: string
-          format: uuid
-          description: Canonical operation UUID, preserved on completed replay.
-        file_url: { type: string, format: uri, description: Permanent authenticated Briefcase URL }
-        temporary_url:
-          type: [string, 'null']
-          format: uri
-          description: Optional expiring delivery URL; null for published Briefcase one-shot uploads.
-        media_type: { type: string, const: audio/mpeg }
-        provider:
-          type: string
-          enum: [gemini, elevenlabs, openai]
-          description: Provider that completed synthesis
-        duration_ms: { type: integer, format: int64, minimum: 0 }
 
     STTResult:
       type: object
@@ -1165,106 +1110,6 @@ components:
           description: Provider that completed transcription
         duration_ms: { type: [integer, 'null'], format: int64, minimum: 0 }
 
-    LoginRequest:
-      type: object
-      additionalProperties: false
-      required: [slt]
-      properties:
-        slt: { type: string, minLength: 1, maxLength: 16384, description: 'Production requires an IAM SLT. A selected sandbox also accepts an existing active identity public ID.' }
-    RefreshRequest:
-      type: object
-      additionalProperties: false
-      required: [refresh_token]
-      properties:
-        refresh_token: { type: string, minLength: 5, maxLength: 16384, pattern: '^ort_[!-~]+$' }
-    LogoutRequest:
-      type: object
-      additionalProperties: false
-      required: [token]
-      properties:
-        token: { type: string, minLength: 5, maxLength: 16384, pattern: '^o(at|rt)_[!-~]+$' }
-    OAuthTokenResponse:
-      type: object
-      required: [access_token, refresh_token, token_type, expires_in, scope]
-      properties:
-        access_token: { type: string }
-        refresh_token: { type: string }
-        token_type: {}
-        expires_in: { type: integer, format: int64 }
-        scope: { type: string }
-        actor: { $ref: '#/components/schemas/ActorRef' }
-        org_id: { type: string }
-    ActorRef:
-      type: object
-      required: [type, public_id]
-      properties:
-        type: { type: string }
-        public_id: { type: string, description: Immutable canonical Carbon or Silicon identity., example: saket }
-    IamInfo:
-      type: object
-      additionalProperties: false
-      required: [app_id, iam_base_url, testing_environment_id]
-      properties:
-        app_id: { type: string }
-        iam_base_url: { type: string, format: uri }
-        testing_environment_id:
-          type: [string, 'null']
-          format: uuid
-          description: Upstream IAM test environment UUID, or null for production.
-    ApplicationAuthorization:
-      type: object
-      required: [actor_type, public_id, organization_id, org_id, membership_id, membership_version, authorization_epoch, audience, scopes]
-      properties:
-        actor_type: { type: string }
-        public_id: { type: string, description: Immutable canonical Carbon or Silicon identity., example: saket }
-        organization_id: { type: string, format: uuid }
-        org_id: { type: string }
-        membership_id: { type: string, description: Canonical actor membership in the selected organization., example: "c:saket[tos]" }
-        membership_version: { type: integer, format: int64 }
-        authorization_epoch: { type: integer, format: int64 }
-        audience: { type: string }
-        testing_environment_id: { type: [string, 'null'], format: uuid }
-        scopes: { type: array, items: { type: string } }
-        org_role: { type: [string, 'null'] }
-        tags: { type: [array, 'null'], items: { type: object } }
-    Job:
-      type: object
-      required: [id, operation, status, first_line, created_at]
-      properties:
-        voice_profile:
-          oneOf:
-            - $ref: '#/components/schemas/VoiceProfileRef'
-            - { type: 'null' }
-        id: { type: string, format: uuid }
-        operation: { type: string, enum: [tts, stt] }
-        status: { type: string, enum: [running, failed, completed] }
-        first_line: { type: string }
-        duration_ms: { type: [integer, 'null'], format: int64, minimum: 0 }
-        provider: { type: [string, 'null'] }
-        error_code: { type: [string, 'null'] }
-        created_at: { type: string, format: date-time }
-        finished_at: { type: [string, 'null'], format: date-time }
-    JobPage:
-      type: object
-      required: [items, next_cursor]
-      properties:
-        items: { type: array, items: { $ref: '#/components/schemas/Job' } }
-        next_cursor: { type: [string, 'null'] }
-    Preferences:
-      type: object
-      required: [tts_order, stt_order, voice_profile, defaults]
-      properties:
-        telemetry_enabled: { type: boolean, default: true }
-        voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
-        tts_order: { type: array, items: { type: string, enum: [gemini, elevenlabs, openai] } }
-        stt_order: { type: array, items: { type: string, enum: [gemini, openai, deepgram] } }
-        defaults:
-          type: object
-          required: [tts_order, stt_order, voice_profile]
-          properties:
-            voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
-            tts_order: { type: array, items: { type: string } }
-            stt_order: { type: array, items: { type: string } }
     PreferencesUpdate:
       type: object
       additionalProperties: false
@@ -1286,34 +1131,6 @@ components:
         provider: { type: string }
         configured: { type: boolean, const: true }
         updated_at: { type: string, format: date-time }
-    CreateTestingEnvironment:
-      type: object
-      additionalProperties: false
-      required: [name, iam_environment_id, iam_environment_key, app_secret, briefcase_environment_key]
-      properties:
-        name: { type: string, minLength: 1, maxLength: 128 }
-        description: { type: [string, 'null'], maxLength: 4096 }
-        iam_environment_id: { type: string, format: uuid }
-        iam_environment_key: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
-        app_secret: { type: string, minLength: 1, maxLength: 512 }
-        briefcase_environment_key: { type: string, minLength: 47, maxLength: 47, pattern: '^ask_[A-Za-z0-9_-]{43}$' }
-    CreatedTestingEnvironment:
-      allOf:
-        - $ref: '#/components/schemas/TestingEnvironment'
-        - type: object
-          required: [key]
-          properties:
-            key: { type: string, minLength: 32, maxLength: 32, pattern: '^[A-Za-z0-9]+$' }
-    TestingEnvironment:
-      type: object
-      required: [id, name, created_at, last_activity_at]
-      properties:
-        id: { type: string, format: uuid }
-        name: { type: string }
-        description: { type: [string, 'null'] }
-        created_at: { type: string, format: date-time }
-        last_activity_at: { type: string, format: date-time }
-
     Capabilities:
       type: object
       additionalProperties: false
@@ -1457,40 +1274,3 @@ components:
                   - video/mpeg
                   - video/webm
 
-    Error:
-      type: object
-      additionalProperties: false
-      required: [error]
-      properties:
-        error:
-          type: object
-          additionalProperties: false
-          required: [code, message, request_id]
-          properties:
-            code:
-              type: string
-              enum:
-                - invalid_request
-                - unauthenticated
-                - forbidden
-                - payload_too_large
-                - unsupported_media_type
-                - source_not_found
-                - idempotency_key_reused
-                - request_in_progress
-                - provider_failed
-                - providers_exhausted
-                - dependency_contract_unavailable
-                - dependency_unavailable
-                - dependency_timeout
-                - too_many_requests
-                - request_timeout
-                - not_ready
-                - not_found
-                - method_not_allowed
-                - internal_error
-            provider: { type: string, enum: [gemini, elevenlabs, openai, deepgram] }
-            reason: { type: string, description: Safe failure category or allowlisted provider reason }
-            provider_status: { type: integer, minimum: 100, maximum: 599 }
-            message: { type: string, minLength: 1 }
-            request_id: { type: string, format: uuid }

@@ -1,5 +1,6 @@
-//! Durable bug reports. Sandbox reports simulate delivery and never send mail.
+//! Durable bug reports, mailed to the Team inbox through Postmark.
 use super::{ControlError, ControlState};
+use crate::domain::{auth::WaveformAction, idempotency::ACCOUNT_SCOPE};
 use axum::{Json, extract::State};
 use http::{HeaderMap, StatusCode};
 use secrecy::{ExposeSecret as _, SecretString};
@@ -45,6 +46,25 @@ pub(super) struct Report {
     #[serde(default)]
     client_version: String,
 }
+/// Credential prefixes refused in reports (Silicon Accounts tokens and secrets,
+/// webhook secrets, JWT headers, common provider keys). Matched at word starts.
+const CREDENTIAL_PREFIXES: [&str; 12] = [
+    "slt_", "sar_", "sap_", "sapr_", "sarq_", "stk-", "whsec_", "sa_app_", "eyJhbGci", "eyJ0eXAi",
+    "sk-", "AIza",
+];
+
+fn contains_credential(text: &str) -> bool {
+    CREDENTIAL_PREFIXES.iter().any(|prefix| {
+        text.match_indices(prefix).any(|(index, _)| {
+            index == 0
+                || !text[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|before| before.is_ascii_alphanumeric() || before == '_')
+        })
+    })
+}
+
 fn validate(report: &Report) -> Result<(), ControlError> {
     if report.message.trim().is_empty()
         || report.message.len() > 60_000
@@ -52,6 +72,7 @@ fn validate(report: &Report) -> Result<(), ControlError> {
     {
         return Err(ControlError::bad_request(
             "report_requires_1_to_60000_bytes",
+            "message must be 1 to 60000 bytes and client_version at most 100.",
         ));
     }
     if let Some(pr) = &report.pr
@@ -69,14 +90,15 @@ fn validate(report: &Report) -> Result<(), ControlError> {
     {
         return Err(ControlError::bad_request(
             "pr_must_reference_silicon_waveform_pull_request",
+            "pr must be https://github.com/teamofsilicons/silicon-waveform/pull/<number>.",
         ));
     }
-    // Refuse common credentials before any durable write or delivery.
-    if ["ask_", "oac_", "oat_", "ort_", "obo_", "sk-"]
-        .iter()
-        .any(|prefix| report.message.contains(prefix) || report.client_version.contains(prefix))
-    {
-        return Err(ControlError::bad_request("remove_credentials_from_report"));
+    // Refuse credentials before any durable write or delivery.
+    if contains_credential(&report.message) || contains_credential(&report.client_version) {
+        return Err(ControlError::bad_request(
+            "remove_credentials_from_report",
+            "The report contains what looks like a token, secret or API key. Remove it and send the report again.",
+        ));
     }
     Ok(())
 }
@@ -86,52 +108,61 @@ pub(super) async fn submit(
     Json(report): Json<Report>,
 ) -> Result<(StatusCode, Json<Value>), ControlError> {
     validate(&report)?;
-    let identity = state
-        .identity_for_org(&headers, super::single_header(&headers, "x-org-id")?)
+    let caller = state
+        .caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let key = super::single_header(&headers, "idempotency-key")?
-        .ok_or_else(|| ControlError::bad_request("idempotency_key_required"))?;
+    let storage_key = caller.record.storage_key;
+    let key = super::single_header(&headers, "idempotency-key")?.ok_or_else(|| {
+        ControlError::bad_request(
+            "idempotency_key_required",
+            "Send an Idempotency-Key header (1 to 128 letters, digits, hyphens or underscores).",
+        )
+    })?;
     if key.is_empty()
         || key.len() > 128
         || !key
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
     {
-        return Err(ControlError::bad_request("invalid_idempotency_key"));
+        return Err(ControlError::bad_request(
+            "invalid_idempotency_key",
+            "Idempotency-Key must be 1 to 128 letters, digits, hyphens or underscores.",
+        ));
     }
-    let simulated = !identity.plane.id.is_nil();
-    if !simulated && state.mail.is_none() {
-        return Err(ControlError::unavailable("postmark_not_configured"));
+    if state.mail.is_none() {
+        return Err(ControlError::unavailable(
+            "postmark_not_configured",
+            "Bug reports cannot be delivered: WAVEFORM_POSTMARK_TOKEN is not configured.",
+        ));
     }
     let payload = json!(report);
     let mut tx = state.pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,29))")
-        .bind(format!(
-            "report:{}:{}",
-            identity.plane.id, identity.storage_actor_id
-        ))
+        .bind(format!("report:{}:{storage_key}", Uuid::nil()))
         .execute(&mut *tx)
         .await?;
-    let old = sqlx::query("SELECT id,payload,status FROM waveform_bug_reports WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3 AND idempotency_key=$4").bind(identity.plane.id).bind(&identity.authority.org_id).bind(identity.storage_actor_id).bind(key).fetch_optional(&mut *tx).await?;
+    let old = sqlx::query("SELECT id,payload,status FROM waveform_bug_reports WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3 AND idempotency_key=$4").bind(Uuid::nil()).bind(ACCOUNT_SCOPE).bind(storage_key).bind(key).fetch_optional(&mut *tx).await?;
     let (id, status): (Uuid, String) = if let Some(old) = old {
         if old.get::<Value, _>("payload") != payload {
-            return Err(ControlError {
-                status: StatusCode::CONFLICT,
-                code: "report_idempotency_conflict",
-            });
+            return Err(ControlError::new(
+                StatusCode::CONFLICT,
+                "report_idempotency_conflict",
+                "This Idempotency-Key was already used for a different report; use a new key.",
+            ));
         }
         (old.get("id"), old.get("status"))
     } else {
-        let count:i64=sqlx::query_scalar("SELECT count(*) FROM waveform_bug_reports WHERE plane_id=$1 AND actor_id=$2 AND created_at>now()-interval '1 hour'").bind(identity.plane.id).bind(identity.storage_actor_id).fetch_one(&mut *tx).await?;
+        let count:i64=sqlx::query_scalar("SELECT count(*) FROM waveform_bug_reports WHERE plane_id=$1 AND actor_id=$2 AND created_at>now()-interval '1 hour'").bind(Uuid::nil()).bind(storage_key).fetch_one(&mut *tx).await?;
         if count >= 10 {
-            return Err(ControlError {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                code: "report_hourly_limit",
-            });
+            return Err(ControlError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "report_hourly_limit",
+                "An account can send at most 10 bug reports per hour; try again later.",
+            ));
         }
         let id = Uuid::new_v4();
-        let status = if simulated { "simulated" } else { "queued" };
-        sqlx::query("INSERT INTO waveform_bug_reports(id,plane_id,org_id,actor_id,idempotency_key,payload,status) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(id).bind(identity.plane.id).bind(&identity.authority.org_id).bind(identity.storage_actor_id).bind(key).bind(payload).bind(status).execute(&mut *tx).await?;
+        let status = "queued";
+        sqlx::query("INSERT INTO waveform_bug_reports(id,plane_id,org_id,actor_id,idempotency_key,payload,status) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(id).bind(Uuid::nil()).bind(ACCOUNT_SCOPE).bind(storage_key).bind(key).bind(payload).bind(status).execute(&mut *tx).await?;
         (id, status.into())
     };
     tx.commit().await?;
@@ -156,7 +187,9 @@ impl ControlState {
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|_| ControlError::unavailable("postmark_unavailable"))?;
+            .map_err(|_| {
+                ControlError::unavailable("postmark_unavailable", "Postmark is unavailable.")
+            })?;
         let response=client.post(mail.endpoint.clone()).header("X-Postmark-Server-Token",mail.token.expose_secret()).json(&json!({"From":"waveform@teamofsilicons.com","To":"saketdev12@gmail.com,shubhastro2@gmails.com,bugs@teamofsilicons.com","Subject":format!("Waveform bug report {id}"),"TextBody":format!("Report: {id}\nVersion: {}\n\n{}\n\nPR: {}",payload["client_version"].as_str().unwrap_or_default(),payload["message"].as_str().unwrap_or_default(),payload["pr"].as_str().unwrap_or("No PR attached")),"MessageStream":"outbound","TrackOpens":false,"TrackLinks":"None","Metadata":{"report_id":id.to_string()}})).send().await;
         let sent = match response {
             Ok(r) if r.status().is_success() => r
@@ -177,6 +210,155 @@ impl ControlState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one concurrent report lifecycle exercises queue, quota and delivery atomically"
+    )]
+    async fn reports_are_idempotent_rate_limited_and_delivered_once()
+    -> super::super::tests::TestResult {
+        use super::super::tests::{ADA, BOB, Harness, bearer, database, send, sign_in};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+        let mail = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/email"))
+            .and(header("X-Postmark-Server-Token", "fixture-mail-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ErrorCode":0,"MessageID":"fixture-accepted"})),
+            )
+            .mount(&mail)
+            .await;
+        let (pool, schema) = database().await?;
+        let harness = Harness::over_with_mail(
+            pool,
+            schema,
+            "",
+            Some(Mail {
+                token: "fixture-mail-token".into(),
+                endpoint: format!("{}/email", mail.uri()).parse()?,
+            }),
+        )
+        .await?;
+        for account in [ADA, BOB] {
+            sign_in(&harness, account).await?;
+        }
+        let auth = bearer(&harness.token(ADA));
+        let headers = [
+            ("authorization", auth.as_str()),
+            ("idempotency-key", "browser-report"),
+        ];
+        let payload =
+            json!({"message":"The voice selector needs attention.","client_version":"test"});
+        let (first, replay) = tokio::join!(
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &headers,
+                Some(payload.clone())
+            ),
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &headers,
+                Some(payload.clone())
+            )
+        );
+        let (status, first) = first?;
+        let (again, replay) = replay?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+        assert_eq!(again, StatusCode::ACCEPTED, "{replay}");
+        assert_eq!(first["id"], replay["id"]);
+        assert_eq!(
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &headers,
+                Some(json!({"message":"Changed payload"}))
+            )
+            .await?
+            .0,
+            StatusCode::CONFLICT
+        );
+        for i in 1..10 {
+            let key = format!("report-{i}");
+            assert_eq!(
+                send(
+                    &harness.app,
+                    "POST",
+                    "/api/v1/reports",
+                    &[("authorization", &auth), ("idempotency-key", &key)],
+                    Some(payload.clone())
+                )
+                .await?
+                .0,
+                StatusCode::ACCEPTED
+            );
+        }
+        assert_eq!(
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &[
+                    ("authorization", &auth),
+                    ("idempotency-key", "report-eleven")
+                ],
+                Some(payload.clone())
+            )
+            .await?
+            .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // A replay still succeeds at quota, and another account has its own quota.
+        assert_eq!(
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &headers,
+                Some(payload.clone())
+            )
+            .await?
+            .0,
+            StatusCode::ACCEPTED
+        );
+        let bob = bearer(&harness.token(BOB));
+        assert_eq!(
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &[
+                    ("authorization", &bob),
+                    ("idempotency-key", "browser-report")
+                ],
+                Some(payload)
+            )
+            .await?
+            .0,
+            StatusCode::ACCEPTED
+        );
+        for _ in 0..12 {
+            assert!(harness.state.deliver_report().await.is_ok());
+        }
+        let requests = mail.received_requests().await.ok_or("mail requests")?;
+        assert_eq!(requests.len(), 11);
+        let sent: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM waveform_bug_reports WHERE status='sent'")
+                .fetch_one(&harness.pool)
+                .await?;
+        assert_eq!(sent, 11);
+        harness.finish().await
+    }
+
     #[test]
     fn validates_reports_before_storage() {
         let report = |message: &str, pr: Option<&str>| Report {
@@ -192,7 +374,11 @@ mod tests {
             .is_ok()
         );
         assert!(validate(&report("", None)).is_err());
-        assert!(validate(&report("token oat_secret", None)).is_err());
+        assert!(validate(&report("token sar_secret", None)).is_err());
+        assert!(validate(&report("proof sap_secret", None)).is_err());
+        assert!(validate(&report("hook whsec_secret", None)).is_err());
+        // A prefix inside a word is not a credential.
+        assert!(validate(&report("the task_id field and disk-usage", None)).is_ok());
         assert!(
             validate(&report(
                 "Broken speech",

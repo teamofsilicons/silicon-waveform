@@ -1,22 +1,20 @@
-//! Provider-free preparation of a private, same-actor STT source destination.
+//! Provider-free preparation of the account's Waveform folder in Briefcase,
+//! where a caller puts STT source audio before calling `/api/v1/stt`.
 
 use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{RawQuery, State},
     response::{IntoResponse as _, Response},
 };
-use http::{HeaderMap, header};
-use secrecy::ExposeSecret as _;
+use http::{HeaderMap, StatusCode, header};
 use serde::Deserialize;
 
 use super::{ControlError, ControlState};
 use crate::{
-    api::headers::SpeechHeaders,
-    application::ports::BriefcaseError,
-    domain::auth::InboundCredentials,
-    infrastructure::{auth::SourceStorageDelegator, briefcase_reader::BriefcaseSdkReader},
+    application::ports::{BriefcaseError, StorageAuthorityError, StorageAuthorityPort as _},
+    domain::auth::WaveformAction,
 };
 
 #[derive(Deserialize)]
@@ -25,80 +23,96 @@ pub(super) struct Prepare {}
 
 pub(super) async fn prepare(
     State(state): State<Arc<ControlState>>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     Json(_body): Json<Prepare>,
 ) -> Result<Response, ControlError> {
-    let parsed = SpeechHeaders::parse(&headers)
-        .map_err(|_| ControlError::bad_request("invalid_speech_headers"))?;
-    let InboundCredentials::Bearer(token) = parsed.credentials else {
-        return Err(ControlError::bad_request("unsupported_authentication_mode"));
-    };
-    // This is the same selected-plane, current-membership authority used by
-    // account/speech APIs. A root key alone cannot identify or authorize anyone.
-    let identity = state.identity(&headers).await?;
-    if !identity.authority.scopes.contains(&state.source_stt_action)
-        || !identity
-            .authority
-            .scopes
-            .iter()
-            .any(|scope| scope == "self.identity.read")
-        || identity.authority.org_id != parsed.organization_id.as_str()
-    {
-        return Err(ControlError::forbidden());
+    if crate::api::headers::names_an_account(query.as_deref()) {
+        return Err(ControlError::speech_runs_as_yourself());
     }
-    let actor = ControlState::authorized_actor_from_identity(&identity)?;
-    let public_id = identity
-        .authority
-        .public_id
-        .as_deref()
-        .ok_or_else(ControlError::forbidden)?;
-    let environment = if identity.plane.id.is_nil() {
+    let caller = state
+        .caller(&headers, WaveformAction::TranscribeSpeech)
+        .await?;
+    // A direct caller's own token can create Waveform's Briefcase access; an
+    // app calling with a proof can only use access the account gave before.
+    let subject = if caller.actor.is_delegated() {
         None
     } else {
-        let id = identity.plane.id;
-        let cipher: Vec<u8> = sqlx::query_scalar("SELECT briefcase_key_cipher FROM waveform_environments WHERE id=$1 AND deleted_at IS NULL")
-            .bind(id).fetch_one(&state.pool).await?;
-        if cipher.is_empty() {
-            None
-        } else {
-            let key = state
-                .vault()?
-                .open(&cipher, &format!("{id}/briefcase-key"))
-                .map_err(ControlError::internal)?;
-            Some(
-                briefcase_client::EnvironmentKey::new(key.expose_secret())
-                    .map_err(|_| ControlError::unavailable("invalid_environment_binding"))?,
-            )
-        }
+        caller.credentials.subject_token()
     };
-    let testing_environment_id = identity.plane.iam_environment_id;
-    let iam = Arc::new(SourceStorageDelegator {
-        testing: testing_environment_id.is_some(),
-        store: state.storage_grants()?,
-        plane: identity.plane.id,
-        sdk: identity.plane.iam,
-        application_id: state
-            .app_id
-            .parse()
-            .map_err(|_| ControlError::unavailable("invalid_application"))?,
-        audience: state.briefcase_settings.audience.clone(),
-    });
-    let target = BriefcaseSdkReader::new(state.briefcase_settings.clone(), iam)
-        .prepare_source_target(&actor, public_id, token, parsed.request_id, environment)
+    let proof = state
+        .storage_proofs()?
+        .briefcase_proof(&caller.actor, subject)
         .await
         .map_err(|error| match error {
-            BriefcaseError::Unauthorized | BriefcaseError::StorageAuthorizationRequired => {
-                ControlError {
-                    status: http::StatusCode::FORBIDDEN,
-                    code: "storage_authorization_required",
-                }
+            StorageAuthorityError::NotAuthorized | StorageAuthorityError::Refused => {
+                ControlError::forbidden(
+                    "storage_authorization_required",
+                    "Waveform has no Briefcase access for this account.",
+                )
+                .with_hint("The account gives it with `waveform storage approve`; its first direct Waveform request also gives it, unless the account or its custodian revoked it.")
             }
-            BriefcaseError::Forbidden => ControlError::forbidden(),
-            BriefcaseError::NotFound => ControlError::not_found(),
-            _ => ControlError::unavailable("briefcase_unavailable"),
+            StorageAuthorityError::Unavailable => ControlError::unavailable(
+                "dependency_unavailable",
+                "Silicon Accounts is temporarily unavailable.",
+            ),
+            StorageAuthorityError::Timeout => ControlError::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "dependency_timeout",
+                "Silicon Accounts did not answer in time.",
+            ),
         })?;
-    let mut result = serde_json::to_value(target)
-        .map_err(|_| ControlError::unavailable("briefcase_unavailable"))?;
-    result["testing_environment_id"] = serde_json::json!(testing_environment_id);
-    Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)).into_response())
+    let request_id = crate::api::headers::request_id(&headers);
+    let target = match state
+        .briefcase
+        .prepare_source_target(&proof, request_id)
+        .await
+    {
+        // The stored proof ended (with the sign-in it stood on) or was revoked:
+        // renew it once, as speech does, and look again.
+        Err(BriefcaseError::Unauthorized) => {
+            match state
+                .storage_proofs()?
+                .renew_refused_proof(&caller.actor, subject, &proof)
+                .await
+            {
+                Ok(renewed) => {
+                    state
+                        .briefcase
+                        .prepare_source_target(&renewed, request_id)
+                        .await
+                }
+                Err(_) => Err(BriefcaseError::Unauthorized),
+            }
+        }
+        other => other,
+    }
+    .map_err(|error| match error {
+        BriefcaseError::Unauthorized | BriefcaseError::Forbidden => ControlError::forbidden(
+            "storage_authorization_required",
+            "Briefcase refused Waveform's access for this account.",
+        )
+        .with_hint("The account can give it again with `waveform storage approve`."),
+        BriefcaseError::NotFound => ControlError::not_found(
+            "briefcase_folder_not_found",
+            "Briefcase did not show Waveform its folder (apps/waveform) for this account: Briefcase shows an app its folder only through the files in it, and it is still empty.",
+        )
+        .with_hint("Store one speech there first (`waveform tts …`), or upload the source into apps/waveform with your own Briefcase access and pass its permanent URL to `waveform stt`."),
+        BriefcaseError::Timeout => ControlError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "dependency_timeout",
+            "Briefcase did not answer in time.",
+        ),
+        _ => ControlError::unavailable("briefcase_unavailable", "Briefcase is unavailable."),
+    })?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "app_id": state.app_id,
+            "account": {"uuid": caller.record.uuid, "id": caller.record.current_id},
+            "folder_id": target.folder_id,
+            "folder_path": target.folder_path,
+        })),
+    )
+        .into_response())
 }

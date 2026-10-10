@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Install a verified native bundle on the existing Waveform host (run as root)."""
+"""Move an existing container-run Waveform API to the native systemd service (run as root, once per host).
+
+Later releases use upgrade.py. The host's api.env must already be the Silicon Accounts configuration that
+deploy/aws/install.py writes.
+"""
 import argparse
-import base64
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,6 +18,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+_spec = importlib.util.spec_from_file_location("upgrade", Path(__file__).with_name("upgrade.py"))
+upgrade = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(upgrade)
 
 
 def run(*args, **kwargs):
@@ -58,18 +66,14 @@ def main():
     assert hashlib.sha256(a.archive.read_bytes()).hexdigest() == a.sha256, "Archive checksum mismatch"
     config = Path("/etc/waveform")
     old_env = env_file(config / "api.env")
-    assert old_env["WAVEFORM_IAM_APP_ID"] == "waveform"
     secret = json.loads(json.loads(subprocess.check_output([
         "aws", "secretsmanager", "get-secret-value", "--region", a.region,
         "--secret-id", a.secret_arn, "--output", "json"]))["SecretString"])
-    new_key = secret["WAVEFORM_IAM_APP_SECRET"]
-    # Read-only credential preflight; the deliberately unknown token is inactive.
-    basic = base64.b64encode(("waveform:" + new_key).encode()).decode()
-    request = urllib.request.Request(old_env["WAVEFORM_IAM_BASE_URL"].rstrip("/") + "/api/v1/oauth/introspect",
-        data=urllib.parse.urlencode({"token": "oat_" + "A" * 43}).encode(),
-        headers={"authorization": "Basic " + basic, "content-type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        assert response.status == 200, "IAM rejected configured application credential"
+    new_key = secret["WAVEFORM_APP_SECRET"]
+    candidate = "".join(f"{key}={value}\n" for key, value in {**old_env, "WAVEFORM_APP_SECRET": new_key}.items())
+    # Silicon Accounts configuration only, then a read-only credential preflight (an unknown token is inactive).
+    upgrade.accounts_identity(candidate.encode())
+    upgrade.accounts_preflight(candidate.encode())
     release = Path("/opt/waveform/releases") / a.source_revision
     assert not release.exists(), "Release already staged; inspect existing state before retrying"
     release.mkdir(parents=True, mode=0o755)
@@ -110,7 +114,7 @@ def main():
     gateway = json.loads(subprocess.check_output(["docker", "network", "inspect", "waveform"]))[0]["IPAM"]["Config"][0]["Gateway"]
     assert gateway.startswith("172."), "Unexpected private bridge; review bind address"
     native_env = dict(old_env)
-    native_env["WAVEFORM_IAM_APP_SECRET"] = new_key
+    native_env["WAVEFORM_APP_SECRET"] = new_key
     native_env["WAVEFORM_BIND_ADDR"] = gateway + ":8080"
     native_env["WAVEFORM_FFMPEG_PATH"] = "/opt/waveform/current/bin/ffmpeg"
     native_env["SPACE_STATION_HOME"] = "/var/lib/waveform-native/telemetry"
@@ -136,7 +140,7 @@ def main():
     run("aws", "s3", "cp", str(backup / "postgres.dump"),
         f"s3://{a.backup_bucket}/backups/native-{stamp}.dump", "--region", a.region, "--only-show-errors")
     # Retain the valid credential even if the native rollout must revert to the old image.
-    old_env["WAVEFORM_IAM_APP_SECRET"] = new_key
+    old_env["WAVEFORM_APP_SECRET"] = new_key
     write_env(config / "api.env", old_env)
     write_env(config / "native.env", native_env)
     current = Path("/opt/waveform/current")

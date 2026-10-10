@@ -9,7 +9,11 @@ use axum::{
 use http::{HeaderValue, StatusCode, header::RETRY_AFTER};
 use serde::Serialize;
 
-use crate::domain::{error::WaveformError, identity::RequestId};
+use crate::domain::{
+    auth::AuthFailure,
+    error::{Dependency, WaveformError},
+    identity::RequestId,
+};
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
@@ -19,6 +23,7 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: Cow<'static, str>,
+    hint: Option<&'static str>,
     provider: Option<&'static str>,
     reason: Option<&'static str>,
     provider_status: Option<u16>,
@@ -35,6 +40,13 @@ impl ApiError {
                 StatusCode::BAD_REQUEST
             }
             WaveformError::Unauthenticated => StatusCode::UNAUTHORIZED,
+            WaveformError::AuthenticationFailed(failure) => {
+                if failure.is_forbidden() {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            }
             WaveformError::Forbidden | WaveformError::StorageAuthorizationRequired => {
                 StatusCode::FORBIDDEN
             }
@@ -52,6 +64,7 @@ impl ApiError {
             WaveformError::DependencyTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
             WaveformError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        let mut hint = None;
         let (message, provider, reason, provider_status) = match error {
             WaveformError::ProviderFailed { failure } => (
                 Cow::Owned(format!(
@@ -66,6 +79,36 @@ impl ApiError {
             WaveformError::InvalidProviderOptions(message) => {
                 (Cow::Borrowed(message), None, None, None)
             }
+            WaveformError::AuthenticationFailed(failure) => {
+                hint = Some(failure.hint());
+                (
+                    Cow::Borrowed(failure.message()),
+                    None,
+                    Some(failure.reason()),
+                    None,
+                )
+            }
+            WaveformError::StorageAuthorizationRequired => {
+                hint = Some(STORAGE_HINT);
+                (
+                    Cow::Borrowed(message_for_code(error.code().as_str())),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            WaveformError::DependencyContractUnavailable { dependency }
+            | WaveformError::DependencyUnavailable { dependency }
+            | WaveformError::DependencyTimeout { dependency } => (
+                Cow::Owned(format!(
+                    "{} ({})",
+                    message_for_code(error.code().as_str()),
+                    dependency_name(dependency)
+                )),
+                None,
+                Some(dependency_reason(dependency)),
+                None,
+            ),
             _ => (
                 Cow::Borrowed(message_for_code(error.code().as_str())),
                 None,
@@ -80,6 +123,7 @@ impl ApiError {
             status,
             code: error.code().as_str(),
             message,
+            hint,
             provider,
             reason,
             provider_status,
@@ -132,15 +176,26 @@ impl ApiError {
         )
     }
 
-    /// Constructs an authentication failure.
+    /// Constructs an authentication failure with its exact reason and hint.
     #[must_use]
-    pub const fn unauthenticated(request_id: RequestId) -> Self {
-        Self::new(
-            StatusCode::UNAUTHORIZED,
-            "unauthenticated",
-            "Valid IAM authentication is required.",
+    pub fn authentication(failure: AuthFailure, request_id: RequestId) -> Self {
+        Self::from_waveform(WaveformError::AuthenticationFailed(failure), request_id)
+    }
+
+    /// Refuses `?account=` on a speech route: speech always runs as the caller,
+    /// and a custodian never speaks as the Silicon it looks after.
+    #[must_use]
+    pub fn speech_runs_as_yourself(request_id: RequestId) -> Self {
+        let mut error = Self::new(
+            StatusCode::BAD_REQUEST,
+            "speech_runs_as_yourself",
+            "Speech always runs as the account that calls Waveform, so `account` cannot be given here: a custodian manages a Silicon's history, settings, keys and Briefcase access, but never speaks as it.",
             request_id,
-        )
+        );
+        error.hint = Some(
+            "Remove ?account= and call as the account itself (a Silicon signs in with `silicon-accounts login --app waveform -q | waveform login --slt-stdin`).",
+        );
+        error
     }
 
     /// Constructs a bounded-body or domain-limit response.
@@ -210,6 +265,7 @@ impl ApiError {
             status,
             code,
             message: Cow::Borrowed(message),
+            hint: None,
             provider: None,
             reason: None,
             provider_status: None,
@@ -230,6 +286,7 @@ impl IntoResponse for ApiError {
             error: ErrorBody {
                 code: self.code,
                 message: self.message,
+                hint: self.hint,
                 request_id: self.request_id.to_string(),
                 provider: self.provider,
                 reason: self.reason,
@@ -259,6 +316,8 @@ struct ErrorEnvelope {
 struct ErrorBody {
     code: &'static str,
     message: Cow<'static, str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
     request_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<&'static str>,
@@ -268,14 +327,42 @@ struct ErrorBody {
     provider_status: Option<u16>,
 }
 
+const STORAGE_HINT: &str = "The account gives it with `waveform storage approve` (or POST /api/v1/storage-authorizations with its own access token). Its first direct Waveform request also gives it, unless the account or its custodian revoked it.";
+
+const fn dependency_name(dependency: Dependency) -> &'static str {
+    match dependency {
+        Dependency::VoiceProfiles => "voice profiles",
+        Dependency::ProviderKeys => "saved provider keys",
+        Dependency::Accounts => "Silicon Accounts",
+        Dependency::Briefcase => "Briefcase",
+        Dependency::AudioStore => "Waveform audio store",
+        Dependency::IdempotencyStore => "Waveform database",
+        Dependency::AudioNormalizer => "audio normalizer",
+    }
+}
+
+const fn dependency_reason(dependency: Dependency) -> &'static str {
+    match dependency {
+        Dependency::VoiceProfiles => "voice_profiles",
+        Dependency::ProviderKeys => "provider_keys",
+        Dependency::Accounts => "accounts",
+        Dependency::Briefcase => "briefcase",
+        Dependency::AudioStore => "audio_store",
+        Dependency::IdempotencyStore => "database",
+        Dependency::AudioNormalizer => "audio_normalizer",
+    }
+}
+
 fn message_for_code(code: &str) -> &'static str {
     match code {
         "invalid_request" => "The request is malformed or contains an invalid value.",
-        "unauthenticated" => "Valid IAM authentication is required.",
-        "storage_authorization_required" => {
-            "Authorize Briefcase storage to continue. Your Waveform login is still valid."
+        "unauthenticated" => {
+            "Sign in with Silicon Accounts (Authorization: Bearer) or send a valid proof (Authorization: Proof sap_…)."
         }
-        "forbidden" => "The represented actor is not permitted to perform this action.",
+        "storage_authorization_required" => {
+            "Waveform has no Briefcase access for this account, so it cannot read the source file."
+        }
+        "forbidden" => "The account is not permitted to perform this action.",
         "payload_too_large" => "The request exceeds a synchronous service limit.",
         "unsupported_media_type" => "The Briefcase source media type is not supported.",
         "source_not_found" => "The referenced Briefcase file was not found.",
@@ -329,7 +416,46 @@ mod tests {
     use uuid::Uuid;
 
     use super::ApiError;
-    use crate::domain::{error::WaveformError, identity::RequestId};
+    use crate::domain::{
+        auth::AuthFailure,
+        error::{Dependency, WaveformError},
+        identity::RequestId,
+    };
+
+    #[tokio::test]
+    async fn authentication_failures_carry_reason_message_and_hint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id = RequestId::new(Uuid::from_u128(44))?;
+        for (failure, status) in [
+            (AuthFailure::SignInEnded, StatusCode::UNAUTHORIZED),
+            (AuthFailure::ProofIssuerNotAllowed, StatusCode::FORBIDDEN),
+        ] {
+            let response = ApiError::authentication(failure, id).into_response();
+            assert_eq!(response.status(), status);
+            let json: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
+            assert_eq!(json["error"]["reason"], failure.reason());
+            assert_eq!(json["error"]["message"], failure.message());
+            assert_eq!(json["error"]["hint"], failure.hint());
+        }
+        let response = ApiError::from_waveform(
+            WaveformError::DependencyUnavailable {
+                dependency: Dependency::Accounts,
+            },
+            id,
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(json["error"]["reason"], "accounts");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Silicon Accounts"))
+        );
+        Ok(())
+    }
 
     #[test]
     fn missing_briefcase_files_have_a_distinct_not_found_contract()

@@ -20,3 +20,5 @@ coverage/
 
 /dist/
 **/__pycache__/
+
+/.mig/

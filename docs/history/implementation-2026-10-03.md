@@ -1,0 +1,39 @@
+# Implementation and validation
+
+The human-owned `UNDERSTANDING.md` defines the product requirements. The current source implements IAM app-secret discovery, test-only public-ID login, isolated sessions and user permissions, downstream Briefcase testing credentials from explicit feature consent, deterministic speech clips, durable report submission, diagnostic opt-outs, and Honeycomb-owned CLI installation and updates.
+
+## What the sandbox integration verifies
+
+Local integration tests run the actual Waveform router, PostgreSQL migrations, and official IAM/Briefcase SDKs against controlled upstream HTTP servers. They cover automatic discovery without IAM/Briefcase root keys, live revocation, clean generations, subject and plane authorization, exact-byte delegated uploads, per-voice clips, authorized replay, file reads, signed webhook routing and duplicate delivery.
+
+Production and sandbox credentials remain separate. Test reports simulate delivery. Reports persist before acknowledgment and use scoped idempotency keys; mail retries happen in a background worker. Postmark delivery is at least once: a transport failure after acceptance may cause a duplicate notification. Account and machine telemetry preferences are independent.
+
+The website gateway keeps tokens server-side and preserves production/test sessions. Its regressions cover app-secret selection, public-ID restrictions, cross-origin rejection, stale-tab protection, token refresh, settings and voice profiles. CLI tests exercise the compiled binary and separate session files.
+
+## Deployment and verification boundaries
+
+The backend and matching frontend were deployed on September 13, 2026. Migration `0010_iam_discovery.sql` is applied and readiness checks pass. Production browser login, sandbox app-secret discovery, test public-ID login and simulated reports were verified live. Space Station event delivery is verified. The existing Team of Silicons Postmark server is configured and its credential and sending domain are verified; no production test email was sent.
+
+Live speech storage remains blocked by an upstream IAM/Briefcase contract mismatch: IAM proof verification returns only the delegated endpoint scope and no role/tag disclosure, which Briefcase requires. Controlled-fixture speech tests pass, but they do not establish live speech success. See [deployment evidence](verification-2026-09-13.md).
+
+The compatibility installer delegates to Honeycomb. Rust client requests never update dependencies. The release workflow builds six native CLIs and validates one Honeycomb archive; local checks do not establish that every cross-platform binary has been built or published.
+
+The September 16 source changes add the [Honeycomb participant](honeycomb-lifecycle.md), remove autonomous environment retirement and public lifecycle mutations, and add [API contracts](../api-contracts.md). These changes are included in the September 20 native release. Live lifecycle coordination still requires the corresponding Honeycomb participant registration and credentials; this release did not change them.
+
+Historical [2026-09-08 test evidence](test-report-2026-09-08.md) applies to the older explicitly paired environment protocol. Current deployment evidence is recorded separately. The October source update adds repeatable incoming OBO verification and shared-token downstream chaining; this is a local change pending coordinated deployment.
+
+## September 20 TTS controls and BYOK source update
+
+TTS now defaults to one selected provider, with explicit automatic fallback.
+Provider-specific controls, actionable safe failure details, and request-only BYOK
+are available in the API, Rust client, CLI and website. Existing encrypted saved
+keys remain supported with request → saved → deployment precedence. STT retains
+automatic fallback. Version 0.2.0 was deployed and published on September 20;
+see the [production verification](deployment-verification-2026-09-20.md) for
+service, package, backup and validation evidence.
+
+## October 3 OBO source cutover
+
+Separate manual-code storage approval is available in the website, CLI and client. Credentials remain encrypted in PostgreSQL, isolated by plane/account/org/endpoint; near-expiry refresh uses a stable retry identity and row locking. TTS checks consent before paid provider work, then reserves exact normalized bytes and publishes through a separately authorized commit. STT source lookup, read and cached-response revalidation use approved reusable tokens. Per-provider selected actor/org and test secret propagate downstream. Incoming OBO repeatedly verifies Waveform's endpoint and forwards the same chain token; retired proof headers fail closed.
+
+Release gates: IAM's complete ordered cutover including selected-provider delegation metadata, current Briefcase recipient and client, Waveform migration0015, encryption key, ordinary login scope removal, endpoint dependency registration, and live production/test-plane consent + upload/read/revocation checks. Historical deployment paragraphs above describe their dated releases, not this source update.

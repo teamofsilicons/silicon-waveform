@@ -7,7 +7,7 @@ use thiserror::Error;
 /// Stable machine-readable error code independent of HTTP status mapping.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ErrorCode {
-    /// The Briefcase feature needs separate consent.
+    /// Waveform has no Briefcase access for this account.
     StorageAuthorizationRequired,
     /// The selected provider failed with automatic fallback disabled.
     ProviderFailed,
@@ -70,10 +70,12 @@ pub enum Dependency {
     VoiceProfiles,
     /// Encrypted account provider credentials.
     ProviderKeys,
-    /// Silicon IAM.
-    Iam,
+    /// Silicon Accounts (token keys, proofs, account lookups).
+    Accounts,
     /// Silicon Briefcase.
     Briefcase,
+    /// Waveform's own store for audio it holds when Briefcase cannot.
+    AudioStore,
     /// Shared idempotency store.
     IdempotencyStore,
     /// Audio inspection and normalization runtime.
@@ -83,9 +85,12 @@ pub enum Dependency {
 /// Cohesive service failure consumed by the delivery layer.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum WaveformError {
-    /// The Briefcase feature needs separate consent.
-    #[error("Briefcase authorization is required")]
+    /// Waveform has no Briefcase access for this account.
+    #[error("Briefcase access is required")]
     StorageAuthorizationRequired,
+    /// Silicon Accounts did not accept the credential (exact reason inside).
+    #[error("authentication failed: {}", .0.reason())]
+    AuthenticationFailed(crate::domain::auth::AuthFailure),
     /// A validated provider control is incompatible with the request.
     #[error("{0}")]
     InvalidProviderOptions(&'static str),
@@ -157,6 +162,13 @@ impl WaveformError {
             Self::StorageAuthorizationRequired => ErrorCode::StorageAuthorizationRequired,
             Self::ProviderFailed { .. } => ErrorCode::ProviderFailed,
             Self::Unauthenticated => ErrorCode::Unauthenticated,
+            Self::AuthenticationFailed(failure) => {
+                if failure.is_forbidden() {
+                    ErrorCode::Forbidden
+                } else {
+                    ErrorCode::Unauthenticated
+                }
+            }
             Self::Forbidden => ErrorCode::Forbidden,
             Self::PayloadTooLarge => ErrorCode::PayloadTooLarge,
             Self::UnsupportedMediaType => ErrorCode::UnsupportedMediaType,
