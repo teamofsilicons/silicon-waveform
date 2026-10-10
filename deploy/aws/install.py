@@ -5,6 +5,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import secrets
 import shlex
 import subprocess
 import time
@@ -55,21 +56,25 @@ for line in Path(__file__).with_name('defaults.env').read_text().splitlines():
     if line and not line.startswith('#') and '=' in line:
         k, v = line.split('=', 1)
         env[k] = v
-env.update({k: str(v) for k, v in secret.items() if k.startswith('WAVEFORM_')})
+# Settings of the earlier sign-in system may still sit in the secret record; the service no longer reads them.
+RETIRED = {'WAVEFORM_IAM_BASE_URL', 'WAVEFORM_IAM_APP_ID', 'WAVEFORM_IAM_APP_SECRET', 'WAVEFORM_IAM_AUDIENCE',
+           'WAVEFORM_IAM_TOKEN_INTROSPECTION_PATH', 'WAVEFORM_IAM_OBO_VERIFY_PATH', 'WAVEFORM_IAM_TTS_ACTION',
+           'WAVEFORM_IAM_STT_ACTION', 'WAVEFORM_IAM_TIMEOUT_SECONDS', 'WAVEFORM_WEBHOOK_SIGNING_SECRET',
+           'WAVEFORM_WEBHOOK_KEY_VERSION', 'WAVEFORM_WEBHOOK_PUBLIC_URL', 'WAVEFORM_HONEYCOMB_SERVICE_TOKEN',
+           'WAVEFORM_BRIEFCASE_CDN_ORIGIN', 'WAVEFORM_BRIEFCASE_AUDIENCE'}
+env.update({k: str(v) for k, v in secret.items() if k.startswith('WAVEFORM_') and k not in RETIRED})
 env.update({
     'WAVEFORM_ENVIRONMENT': 'production',
     'WAVEFORM_BIND_ADDR': '0.0.0.0:8080',
     'WAVEFORM_DATABASE_URL': 'postgres://waveform:' + urllib.parse.quote(secret['WAVEFORM_POSTGRES_PASSWORD'], safe='') + '@postgres/waveform?sslmode=verify-full&sslrootcert=/etc/waveform/db-ca.crt',
     'WAVEFORM_DATABASE_MAX_CONNECTIONS': '8',
-    'WAVEFORM_IAM_BASE_URL': 'https://backend.iam.teamofsilicons.com',
-    'WAVEFORM_IAM_APP_ID': 'waveform',
-    'WAVEFORM_IAM_AUDIENCE': 'waveform',
+    'ACCOUNTS_URL': 'https://accounts.teamofsilicons.com',
+    'WAVEFORM_APP_ID': 'waveform',
+    'WAVEFORM_PUBLIC_URL': 'https://backend.waveform.teamofsilicons.com',
     'WAVEFORM_BRIEFCASE_BASE_URL': 'https://backend.briefcase.teamofsilicons.com',
     'WAVEFORM_BRIEFCASE_PERMANENT_ORIGIN': 'https://briefcase.teamofsilicons.com',
-    'WAVEFORM_BRIEFCASE_CDN_ORIGIN': 'https://briefcase.teamofsilicons.com',
-    'WAVEFORM_BRIEFCASE_APP_ID': 'waveform',
-    'WAVEFORM_BRIEFCASE_AUDIENCE': 'briefcase',
-    'WAVEFORM_WEBHOOK_PUBLIC_URL': 'https://backend.waveform.teamofsilicons.com/webhook/',
+    'WAVEFORM_BRIEFCASE_APP_ID': 'briefcase',
+    'WAVEFORM_BRIEFCASE_APP_FOLDER': 'apps/waveform',
     'WAVEFORM_REQUIRE_FULL_PROVIDER_CHAIN': 'true',
     'WAVEFORM_LOG_JSON': 'true',
     'WAVEFORM_MAX_IN_FLIGHT': '8',
@@ -79,12 +84,13 @@ env.update({
     'WAVEFORM_OPENAI_MAX_CONCURRENCY': '2',
     'WAVEFORM_DEEPGRAM_MAX_CONCURRENCY': '2',
     'SPACE_STATION_HOME': '/tmp/waveform-telemetry',
-    'SILICON_IAM_CLIENT_AUTO_UPDATE': 'false',
-    'BRIEFCASE_CLIENT_AUTO_UPDATE': 'false',
+    'WAVEFORM_SPEECH_FIXTURES': 'false',
 })
-for key in ['WAVEFORM_' + s for s in ['IAM_APP_SECRET', 'WEBHOOK_SIGNING_SECRET', 'ENCRYPTION_KEY', 'IDEMPOTENCY_DIGEST_KEY', 'GEMINI_API_KEY', 'ELEVENLABS_API_KEY', 'OPENAI_API_KEY', 'DEEPGRAM_API_KEY']]:
+for key in ['WAVEFORM_' + s for s in ['APP_SECRET', 'ACCOUNTS_WEBHOOK_SECRET', 'ENCRYPTION_KEY', 'IDEMPOTENCY_DIGEST_KEY', 'GEMINI_API_KEY', 'ELEVENLABS_API_KEY', 'OPENAI_API_KEY', 'DEEPGRAM_API_KEY']]:
     if not env.get(key):
         raise ValueError('Required configuration is absent: ' + key)
+if not env.get('WAVEFORM_PROOF_ISSUERS'):
+    print('warning: WAVEFORM_PROOF_ISSUERS is empty, so other apps (the Silicon Interface) cannot call Waveform for an account')
 write(config / 'api.env', env_text(env))
 write(config / 'postgres.env', env_text({
     'POSTGRES_DB': 'waveform', 'POSTGRES_USER': 'postgres',
@@ -190,21 +196,22 @@ commands={
      '-v',str(data/'caddy-config')+':/config',*common,pinned['proxy']],
 }
 if frontend_image:
-    frontend_sessions = data/'frontend-sessions'
-    frontend_sessions.mkdir(mode=0o700, exist_ok=True)
-    if frontend_sessions.is_symlink():
-        raise RuntimeError('Frontend session directory must not be a symlink')
-    os.chown(frontend_sessions, 1000, 1000)
-    frontend_sessions.chmod(0o700)
-    commands['frontend'] = ['docker','run','--name','waveform-frontend','--memory','192m',
+    # The website keeps sessions in sealed cookies: no state on the host. Its secrets reach it through --env-file;
+    # SESSION_SECRET is generated once and kept (a new one signs every browser out).
+    web_env = {}
+    if (config/'web.env').exists():
+        web_env = dict(line.split('=', 1) for line in (config/'web.env').read_text().splitlines() if '=' in line)
+    web_env['APP_SECRET'] = env['WAVEFORM_APP_SECRET']
+    web_env.setdefault('SESSION_SECRET', secrets.token_urlsafe(48))
+    write(config/'web.env', env_text(web_env))
+    commands['frontend'] = ['docker','run','--name','waveform-frontend','--memory','256m',
         '--read-only','--cap-drop','ALL','--pids-limit','128',
-        '--tmpfs','/tmp:rw,nosuid,noexec,size=16m',
-        '--mount',f'type=bind,src={frontend_sessions},dst=/var/lib/waveform/sessions',
-        '-e','WAVEFORM_SESSION_DIRECTORY=/var/lib/waveform/sessions',
-        '-e','WAVEFORM_FRONTEND_ORIGIN=https://waveform.teamofsilicons.com',
-        '-e','WAVEFORM_BACKEND_URL=https://backend.waveform.teamofsilicons.com',
-        '-e','WAVEFORM_IAM_AUTH_ORIGIN=https://auth.iam.teamofsilicons.com',
-        '-e','WAVEFORM_APP_ID=waveform',*common,pinned['frontend']]
+        '--tmpfs','/tmp:rw,nosuid,noexec,size=16m','--tmpfs','/app/.next/cache:rw,nosuid,noexec,size=64m',
+        '--env-file',str(config/'web.env'),
+        '-e','NODE_ENV=production','-e','PORT=4325','-e','HOSTNAME=0.0.0.0','-e','APP_ID=waveform',
+        '-e','ACCOUNTS_URL='+env['ACCOUNTS_URL'],
+        '-e','APP_API_URL=https://backend.waveform.teamofsilicons.com',
+        '-e','PUBLIC_URL=https://waveform.teamofsilicons.com',*common,pinned['frontend']]
 for name,command in commands.items():
     unit=f'''[Unit]
 Description=Waveform {name}
@@ -241,14 +248,17 @@ run(['systemctl','start','waveform-postgres'])
 run(['/usr/local/sbin/waveform-wait-postgres'])
 run(['systemctl','restart','waveform-proxy'])
 if a.start_api:
-    # Reject invalid application credentials before reporting the public API ready.
-    encoded=base64.b64encode((env['WAVEFORM_IAM_APP_ID']+':'+env['WAVEFORM_IAM_APP_SECRET']).encode()).decode()
-    request=urllib.request.Request(env['WAVEFORM_IAM_BASE_URL']+'/api/v1/oauth/introspect',data=urllib.parse.urlencode({'token':'oat_'+'A'*43}).encode(),headers={'authorization':'Basic '+encoded,'content-type':'application/x-www-form-urlencoded','x-org-id':'tos'})
+    # Reject invalid app credentials before reporting the public API ready: Silicon Accounts answers an unknown
+    # token with exactly {"active": false} when Waveform's credentials are right, and 401 when they are not.
+    encoded=base64.b64encode((env['WAVEFORM_APP_ID']+':'+env['WAVEFORM_APP_SECRET']).encode()).decode()
+    accounts_api=env.get('ACCOUNTS_API_URL') or env['ACCOUNTS_URL']
+    request=urllib.request.Request(accounts_api.rstrip('/')+'/v1/oauth/introspect',data=urllib.parse.urlencode({'token':'waveform-deploy-preflight'}).encode(),headers={'authorization':'Basic '+encoded,'content-type':'application/x-www-form-urlencoded'})
     try:
         with urllib.request.urlopen(request,timeout=20) as response:
-            assert response.status==200
+            if json.loads(response.read() or b'null')!={'active':False}:
+                raise SystemExit('Silicon Accounts answered the credential check unexpectedly; API was not activated')
     except urllib.error.HTTPError as error:
-        raise SystemExit(f'IAM application authentication rejected ({error.code}); API was not activated') from None
+        raise SystemExit(f'Silicon Accounts refused Waveform\'s app credentials ({error.code}); API was not activated') from None
     run(['systemctl','enable','waveform-api'])
     run(['systemctl','restart','waveform-api'])
     ready=False
@@ -269,7 +279,7 @@ if a.start_api:
         frontend_ready = False
         for _ in range(30):
             probe = subprocess.run(['docker','exec','waveform-proxy','wget','-T','3','-q','-O','/dev/null',
-                'http://waveform-frontend:4325/'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                'http://waveform-frontend:4325/auth/session'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             if probe.returncode == 0:
                 frontend_ready = True
                 break
@@ -281,4 +291,4 @@ if a.start_api:
     run(['systemctl','start','waveform-backup.timer'])
     print('Waveform application activated; verify public readiness and authentication')
 else:
-    print('Database and HTTPS proxy installed; API activation is waiting for valid production IAM credentials')
+    print('Database and HTTPS proxy installed; API activation waits for --start-api with valid Silicon Accounts credentials')

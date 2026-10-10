@@ -1,147 +1,114 @@
 # Standalone Waveform on AWS
 
-This deployment uses one `t4g.small` ARM64 EC2 instance in `us-east-1`, a fixed
-Elastic IP, and direct Caddy HTTPS. It has no load balancer, target group,
-autoscaling group, or public database port. The server has 2 vCPUs, 2 GiB RAM,
-32 GiB encrypted gp3 storage, and 2 GiB swap. AWS Systems Manager provides
-administration; SSH is not exposed.
+This deployment uses one `t4g.small` ARM64 EC2 instance in `us-east-1`, a fixed Elastic IP, and direct Caddy HTTPS.
+It has no load balancer, target group, autoscaling group, or public database port. The server has 2 vCPUs, 2 GiB RAM,
+32 GiB encrypted gp3 storage, and 2 GiB swap. AWS Systems Manager provides administration; SSH is not exposed.
 
-Public endpoint: https://backend.waveform.teamofsilicons.com
+API: https://backend.waveform.teamofsilicons.com · Website: https://waveform.teamofsilicons.com
 
-Frontend endpoint: https://waveform.teamofsilicons.com
+Production runs the API natively under systemd (see [`deploy/native`](../native/README.md)); use that directory for
+releases. `install.py` here builds a host from scratch with every service in a container (for example after
+recreating the CloudFormation stack) and refuses a host that already runs the native API. The current resource IDs,
+image references and secret ARN are recorded in `deployment.json`, which holds no credentials. The CloudFormation
+definition is `standalone.json`.
 
-The SolidJS frontend and its Node session gateway run in a separate, unprivileged
-container on the same instance. Caddy routes each hostname directly to its service;
-neither application container publishes a host port. The frontend has a 192 MiB
-memory limit and keeps sessions in one process. Restarting it signs users out.
+## Services
 
-Build `frontend/Dockerfile` using `frontend` as its build context for `linux/arm64`.
-Push its image to the existing application ECR repository with a distinct immutable
-tag, then pass `--frontend-image <image>` to the installer along with the backend
-image. The installer waits for both applications before activating the proxy.
-Subsequent runs retain the installed frontend image when that option is omitted,
-and retain the PostgreSQL and Caddy image digests. Back up the database before
-applying an application release. Keep the previous application image references
-for rollback; schema migrations are forward-only.
+Systemd manages `waveform-postgres`, `waveform-api`, `waveform-frontend` and `waveform-proxy`. Caddy routes each
+hostname to its service; no application container publishes a host port. The website is the Next.js web built from
+`web/` (a standalone Next.js server on port 4325). It signs Carbons in with Silicon Accounts and keeps each session in
+a sealed cookie, so it keeps no state on the host and a restart signs nobody out. It runs unprivileged and read-only
+with a 256 MiB memory limit.
 
-The current resource IDs, immutable application image reference, and secret
-ARN are recorded in `deployment.json`. That file contains no credentials.
-The CloudFormation definition is `standalone.json`.
-
-## First deployment status
-
-The backend voice-profile release and frontend were published on 2026-09-08.
-Production IAM sign-in, the 30-profile selector, live Gemini generation with
-Puck, Briefcase storage, and profile revision history are verified. Transcription
-currently awaits two delegated-read registrations in Briefcase's IAM catalog;
-see the [publication report](../../docs/deployment-verification-2026-09-08.md).
-The following notes describe the initial server activation before that release.
-
-Infrastructure, DNS, a trusted HTTPS certificate, PostgreSQL, and all four
-user-supplied provider keys were installed on 2026-09-08. Production IAM accepts the existing `tos>waveform` application credentials
-after correcting a deployment import that retained dotenv quotation marks.
-The API is active and public liveness, readiness, and capabilities checks return
-200. Protected account, jobs, and provider-key routes reject unauthenticated
-requests with 401 when the required organization header is present. A malformed
-login code returns 400. All three services and the backup timer are active, and
-the first database dumps were verified in S3. ElevenLabs also returned
-`payment_required` for a short synthesis check. Its account-read permission is
-restricted; successful synthesis remains unverified until the billing issue is resolved. Gemini, OpenAI and Deepgram credential checks succeeded.
-
-The initial production readiness check exposed an FFmpeg stdin pipe that was
-left open. Closing the pipe before waiting for FFmpeg fixed readiness; a real
-FFmpeg regression test now covers the behavior. Validation after the fix passed
-141 backend unit tests (5 database-dependent tests excluded from this run),
-formatting, and Clippy. Earlier full integration results are recorded separately
-in `docs/test-report-2026-09-08.md`. A successful real-user production login and
-paid end-to-end provider generation have not been verified in this deployment.
+Build the API image from the repository root and the website image from `web/` for `linux/arm64`. Push each to the
+application ECR repository with a distinct immutable tag, then pass `--image` and `--frontend-image` to the installer.
+The installer waits for both applications before activating the proxy. Later runs keep the installed website image
+when `--frontend-image` is omitted, and keep the PostgreSQL and Caddy image digests. Back up the database before an
+application release and keep the previous image references for rollback; schema migrations are forward-only.
 
 ## Configuration and activation
 
-Secrets live in AWS Secrets Manager at `silicon-waveform/production`. The EC2
-role may read only this application secret and pull only this application's
-ECR images. It may write database backups only to its dedicated backup prefix.
-Host configuration is in `/etc/waveform`, mode 0700, with API and PostgreSQL env
-files mode 0600. Secrets are fetched on the host, not placed in the image,
-CloudFormation user data, SSM command text, or this repository.
+Secrets live in AWS Secrets Manager at `silicon-waveform/production`. The EC2 role may read only this secret and pull
+only this application's ECR images, and may write database backups only to its dedicated backup prefix. Host
+configuration is in `/etc/waveform` (mode 0700), with the env files mode 0600. Secrets are fetched on the host, never
+placed in an image, CloudFormation user data, SSM command text or this repository.
 
-Preserve the existing encryption key, idempotency digest key, and both generated
-database passwords across deployments. Replacing those independently of their
-persisted data breaks authentication/decryption. Update only the intended fields
-in the current Secrets Manager JSON, using a private JSON file and
-`--secret-string file://...`. Never expand secret values into shell arguments.
-The local `.env` and `.local-deploy` directory are excluded from Git and Docker.
+The secret holds, as JSON:
 
-`install.py` fetches the secret, generates private runtime configuration, installs
-systemd services, and pins the downloaded container images by digest. A copy of
-the repository's `.env.example` must be beside it as `defaults.env`. Installation
-without `--start-api` prepares PostgreSQL and HTTPS while returning public 503.
+| Key | What it is |
+| --- | --- |
+| `WAVEFORM_APP_SECRET` | Waveform's app secret at Silicon Accounts (`sa_app_…`). The website receives it too, through `/etc/waveform/web.env`. |
+| `WAVEFORM_ACCOUNTS_WEBHOOK_SECRET` | The `whsec_…` secret Silicon Accounts signs webhook deliveries with. |
+| `WAVEFORM_PROOF_ISSUERS` | Apps allowed to call Waveform for an account, per scope (for example `waveform.tts=interface;waveform.stt=interface`). |
+| `WAVEFORM_ENCRYPTION_KEY`, `WAVEFORM_IDEMPOTENCY_DIGEST_KEY` | Keep these across deployments: saved provider keys, Briefcase access and idempotency records depend on them. |
+| `WAVEFORM_GEMINI_API_KEY`, `WAVEFORM_ELEVENLABS_API_KEY`, `WAVEFORM_OPENAI_API_KEY`, `WAVEFORM_DEEPGRAM_API_KEY` | The speech providers. |
+| `WAVEFORM_POSTGRES_PASSWORD`, `POSTGRES_PASSWORD` | The application role's and the PostgreSQL superuser's passwords. |
+| `WAVEFORM_POSTMARK_TOKEN`, `WAVEFORM_TELEMETRY_KEY` | Optional: bug-report mail and Space Station telemetry. |
 
-To deploy an updated immutable image, upload the current public installer and
-defaults through SSM and run on the instance:
+Settings of the earlier sign-in system that may still be in the record are ignored by the installer. Update only the
+intended fields of the secret, using a private JSON file and `--secret-string file://...`; never expand secret values
+into shell arguments. The local `.env` and `.local-deploy` directory are excluded from Git and Docker.
+
+`install.py` fetches the secret, generates the private runtime configuration (a copy of the repository's
+`.env.example` must be beside it as `defaults.env`), installs the systemd services and pins the container images by
+digest. Without `--start-api` it prepares PostgreSQL and HTTPS while the public API answers 503:
 
 ```sh
 python3 /opt/waveform-deploy/install.py \
   --secret-arn '<SecretArn from deployment.json>' \
-  --image '<ImageUri from deployment.json>' \
+  --image '<API image digest>' \
+  --frontend-image '<website image digest>' \
   --backup-bucket '<BackupBucket from deployment.json>' \
   --region us-east-1 \
   --start-api
 ```
 
-Activation verifies the IAM application credentials, waits for the API readiness
-route, and only then changes the HTTPS proxy from 503 to the application.
-Confirm `/health/live`, `/health/ready`, capabilities, and authentication rejection
-at the public hostname after every deployment. Use a real IAM SLT for an
-authenticated production smoke test when one is available. Login uses an IAM `oac_` short-lived code. The webhook
-registration must point to `https://backend.waveform.teamofsilicons.com/webhook/`
-and use the same signing secret as the server. Approval of a new IAM webhook
-is an IAM control-plane operation requiring the appropriate organization actor.
+Activation first proves Silicon Accounts accepts Waveform's app credentials (introspecting a token that does not
+exist must answer `{"active": false}`), waits for the API's readiness route, then switches the HTTPS proxy from 503 to
+the application. Afterwards check `/health/live`, `/health/ready`, `/api/v1/capabilities` and that
+`/api/v1/me` refuses a request without a token, at the public hostname. For an authenticated check, sign in with the
+CLI (`waveform login`) and run `waveform me`.
 
-Use `ssm.py --instance <InstanceId> --script <file>` to dispatch a shell script,
-and `ssm.py --instance <InstanceId> --status <CommandId>` to read its result.
-Only send scripts without embedded credentials: SSM records command text/output.
+Silicon Accounts posts account events to `https://backend.waveform.teamofsilicons.com/webhooks/accounts`. Register it
+with `PUT /v1/apps/waveform/webhook` and `{"url": "…/webhooks/accounts", "events": null}` (app credentials), and store
+the `whsec_…` secret the first save shows as `WAVEFORM_ACCOUNTS_WEBHOOK_SECRET`. `"events": null` picks every update:
+Waveform needs `custodian_change`, which the recommended picks of `silicon-apps webhook waveform set` leave out. The
+exact commands are in [`docs/migration/cutover.md`](../../docs/migration/cutover.md).
+
+Use `ssm.py --instance <InstanceId> --script <file>` to dispatch a shell script, and `ssm.py --instance <InstanceId>
+--status <CommandId>` to read its result. Send only scripts without embedded credentials: SSM records command text and
+output.
 
 ## Runtime and storage
 
-Systemd manages `waveform-postgres`, `waveform-api`, and `waveform-proxy`.
-The API runs as the image's unprivileged user with a read-only filesystem,
-dropped capabilities, bounded memory and request concurrency, and a temporary
-filesystem. Only Caddy publishes ports 80/443. Containers cannot use the host's
+The API runs as the image's unprivileged user with a read-only filesystem, dropped capabilities, bounded memory and
+request concurrency, and a temporary filesystem. Only Caddy publishes ports 80/443. Containers cannot use the host's
 IMDS credentials: IMDSv2 is required with a response hop limit of one.
 
-PostgreSQL stores its data in `/var/lib/waveform/postgres`. Its network accepts
-TLS connections only. Waveform connects with `sslmode=verify-full` and a
-private CA; its database owner has no PostgreSQL superuser privileges. The
-application performs its existing forward-only schema migrations at startup.
-The internal server certificate expires after 825 days; renew it under the
-retained private CA before expiration and restart PostgreSQL. Public HTTPS
-certificate renewal is handled by Caddy.
+PostgreSQL stores its data in `/var/lib/waveform/postgres` and accepts TLS connections only. Waveform connects with
+`sslmode=verify-full` and a private CA; its database owner has no PostgreSQL superuser privileges. The application
+applies its forward-only schema migrations at startup. The internal server certificate expires after 825 days; renew it
+under the retained private CA before then and restart PostgreSQL. Caddy renews the public HTTPS certificates.
 
-`waveform-backup.timer` runs a daily compressed `pg_dump` to
-the private encrypted backup bucket. Dumps expire after 14 days. Verify a first
-backup manually with `systemctl start waveform-backup` and an AWS S3 listing.
-A restore should be rehearsed in a separate database before relying on backups.
-The initial root EBS volume is retained on instance termination, and the backup
-bucket is retained on stack deletion. Removing the stack does not automatically
-erase those data resources.
+`waveform-backup.timer` runs a daily compressed `pg_dump` to the private encrypted backup bucket. Dumps expire after 14
+days. Verify a first backup manually with `systemctl start waveform-backup` and an S3 listing, and rehearse a restore
+in a separate database before relying on backups. The root EBS volume is retained on instance termination, and the
+backup bucket is retained on stack deletion.
 
-This is a small, single-server deployment. API or PostgreSQL restarts cause
-brief downtime; there is no failover. TTS audio lives in Briefcase, not on this
-server. Production IAM and Briefcase remain external dependencies.
+This is a small, single-server deployment: API or PostgreSQL restarts cause brief downtime and there is no failover.
+Generated speech lives in each account's Briefcase files, or for up to the idempotency retention in Waveform's own
+database when Briefcase could not take it. Silicon Accounts and Briefcase are external dependencies.
 
 ## Updates and rollback
 
-Build the current source for `linux/arm64` and push an immutable ECR tag. Do not
-reuse a tag; retain the previous image digest. Re-run the installer with the new
-image and `--start-api`, preserving the secret, database, and Caddy data. Check
-readiness and authentication after each update. For an application rollback,
-restore the previous image reference; do not roll migrations backward.
+Build the current source for `linux/arm64` and push an immutable ECR tag. Never reuse a tag; keep the previous image
+digest. Re-run the installer with the new image and `--start-api`, preserving the secret, database and Caddy data.
+Check readiness and authentication after each update. For an application rollback restore the previous image
+reference; never roll migrations backward.
 
-Namecheap CLI created an A record named `backend.waveform` with TTL 300 pointing
-to the Elastic IP. The DNS update was checked to preserve every unrelated
-record. Keep that IP fixed when updating the application.
+Namecheap holds the A record `backend.waveform` (TTL 300) pointing to the Elastic IP. Keep that IP fixed when
+updating the application.
 
-Useful references: [Caddy automatic HTTPS](https://caddyserver.com/docs/automatic-https),
+References: [Caddy automatic HTTPS](https://caddyserver.com/docs/automatic-https),
 [PostgreSQL TLS configuration](https://www.postgresql.org/docs/current/ssl-tcp.html),
 [AWS instance metadata](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html).
