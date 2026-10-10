@@ -112,7 +112,9 @@ provider call, so malformed media never reaches a paid provider.
 ### `POST /stt/source-target`
 
 Makes sure the account's Waveform folder exists in Briefcase and returns `{app_id, account, folder_id, folder_path}`.
-Upload sources there with Briefcase, then transcribe their permanent URLs.
+Upload sources there with Briefcase, then transcribe their permanent URLs. Briefcase shows Waveform its folder
+(`apps/waveform`) only through the files in it: while it is still empty the answer is `404 briefcase_folder_not_found`
+with a hint (store one speech there first, or upload with your own Briefcase access).
 
 - **Credential:** Bearer, or Proof with `waveform.stt`. **Body:** `{}`.
 
@@ -177,7 +179,10 @@ value. Keys are encrypted per account. Saving and deleting are checked with Sili
 `POST` gives Waveform Briefcase access for the calling account: Waveform asks Silicon Accounts for a User verification
 proof for `receiving_app` `briefcase` with the scopes `briefcase.uploads.reserve`, `briefcase.uploads.commit`,
 `briefcase.entries.list` and `briefcase.files.read`, made from the caller's own access token, and keeps it encrypted.
-Only the account itself can give it (a direct speech request does it automatically when needed). `GET` shows it
+Only the account itself can give it. A direct speech request gives it when the account has none yet, and replaces a
+proof that ended with the sign-in it was issued under (another machine's `waveform logout`, the website's sign-out)
+when Briefcase refuses it; after the account or its custodian revoked it (`DELETE`, or the account revoking the proof
+at Silicon Accounts), speech is held with `storage_not_authorized` until the account gives it again. `GET` shows it
 (`active`, `revoked` or `missing`, with the scopes and expiries, never a token) and `DELETE` revokes it at Silicon
 Accounts; a custodian may do both for a Silicon it looks after. Waveform also revokes it when the account signs out
 everywhere, removes Waveform's access or is deleted.
@@ -221,7 +226,8 @@ id in both the header and body; replay-time errors use the current attempt's id.
 `wrong_audience`, `wrong_issuer`, `sign_in_ended`, `invalid_proof`, `proof_scope_missing`, `proof_issuer_not_allowed`,
 …) or the dependency or provider that failed. The status classes:
 
-- `400` malformed request, URL or language hint.
+- `400` malformed request, URL or language hint; `speech_runs_as_yourself` for `?account=` on a speech route (`/tts`,
+  `/stt`, `/stt/source-target`, `/audio/{request_id}`), which always runs as the caller.
 - `401` missing, malformed, expired, revoked or foreign credential (see `reason`).
 - `403` a valid credential that is not enough: a proof without the route's scope or from an app not allowed for it,
   `not_custodian`, or `storage_authorization_required`.

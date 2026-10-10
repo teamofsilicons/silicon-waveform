@@ -49,8 +49,13 @@ account (or the same app with its proof) until `expires_at` (header `X-Waveform-
 
 STT reads `file_url` from the account's own Briefcase files. `POST /stt/source-target` with `{}` makes sure the
 account's Waveform folder exists and returns `{app_id, account, folder_id, folder_path}`; upload sources there with
-Briefcase and transcribe their permanent URLs. Without Briefcase access STT answers
+Briefcase and transcribe their permanent URLs. Briefcase shows Waveform its folder (`apps/waveform`) only through the
+files in it, so while the folder is still empty the answer is `404 briefcase_folder_not_found` (store one speech
+there first, or upload with your own Briefcase access). Without Briefcase access STT answers
 `403 storage_authorization_required`.
+
+The speech routes (`/tts`, `/stt`, `/stt/source-target`, `/audio/{request_id}`) always run as the caller: a query
+naming an `account` is refused with `400 speech_runs_as_yourself` instead of being ignored.
 
 ### Request ids and retries
 
@@ -64,15 +69,18 @@ becomes `failed` with `request_interrupted` once its lease expires.
 
 `POST /storage-authorizations` gives Waveform Briefcase access for the calling account (a User verification proof for
 `receiving_app` `briefcase`, made from the caller's own access token and kept encrypted). `GET` shows it (`active`,
-`revoked` or `missing`, never a token) and `DELETE` revokes it. A direct speech request creates the access
-automatically when needed; a proof caller can only use access the account gave before.
+`revoked` or `missing`, never a token) and `DELETE` revokes it. A direct speech request creates the access when the
+account has none yet, and replaces a proof that ended with the sign-in it was issued under (for example after another
+machine's `waveform logout`) once Briefcase refuses it. After the account or its custodian revokes the access (here, or
+the account revokes the proof at Silicon Accounts), speech is held with `storage_not_authorized` until the account
+approves again with `POST`. A proof caller can only use access the account gave before.
 
 ## Accounts, history and settings
 
 | Route | What it does |
 | --- | --- |
 | `GET /accounts` | public discovery: `{app_id, accounts_url, api_url, docs_url, proof_scopes, version}` |
-| `GET /me` (alias `/auth/me`) | the signed-in account: `{authenticated, app_id, account{uuid,id,kind,display_name,pfp_url,custodian}, via, expires_at}` |
+| `GET /me` (alias `/auth/me`) | the signed-in account: `{authenticated, app_id, account{uuid,id,kind,display_name,pfp_url,custodian}, via, expires_at}`; the name and photo come from Silicon Accounts (read once with the account's own token, then kept current by `account.updated`) |
 | `GET /silicons` | the Silicons the signed-in Carbon looks after that Waveform knows |
 | `GET /jobs`, `GET /jobs/{id}` | content-free history, newest first (`operation`, `limit` 1-100, `cursor`); jobs called by another app carry `issuing_app` |
 | `GET`/`PATCH /preferences` | `tts_order`, `stt_order`, `voice_profile`, `telemetry_enabled`, with Waveform's `defaults` |

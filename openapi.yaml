@@ -149,7 +149,9 @@ paths:
       description: |
         Makes sure Waveform's folder (`apps/waveform`) exists in the account's Briefcase drive and returns it.
         Upload a source there with Briefcase, then transcribe its permanent URL. No speech provider runs.
-        Proof scope: `waveform.stt`.
+        Briefcase shows Waveform its folder only through the files in it, so while the folder is still empty
+        the answer is `404 briefcase_folder_not_found` (store one speech there first, or upload with your own
+        Briefcase access). Proof scope: `waveform.stt`.
       requestBody:
         required: true
         content:
@@ -171,6 +173,7 @@ paths:
                   account: { $ref: '#/components/schemas/AccountRef' }
                   folder_id: { type: string, format: uuid }
                   folder_path: { type: string, example: apps/waveform }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/Error' }
@@ -202,6 +205,7 @@ paths:
           content:
             audio/mpeg:
               schema: { type: string, format: binary }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/Error' }
@@ -456,7 +460,10 @@ paths:
         (scopes `briefcase.uploads.reserve`, `briefcase.uploads.commit`, `briefcase.entries.list`,
         `briefcase.files.read`) from the caller's own access token, and keeps it encrypted. Only the account
         itself can do this; a custodian cannot approve for a Silicon. A direct speech request does the same
-        automatically when needed.
+        when the account has no access yet, and replaces a proof that ended with the sign-in it was issued
+        under once Briefcase refuses it; after the account or its custodian revoked the access (`DELETE`, or
+        the account revoking the proof at Silicon Accounts), speech is held with `storage_not_authorized` until
+        the account approves again here.
       responses:
         '201':
           description: Briefcase access is active
@@ -694,7 +701,10 @@ components:
 
   responses:
     BadRequest:
-      description: Malformed headers, URL, language hint, or JSON input
+      description: |
+        Malformed headers, URL, language hint, or JSON input; or `speech_runs_as_yourself` when a speech
+        route (`/tts`, `/stt`, `/stt/source-target`, `/audio/{request_id}`) is given `?account=`: speech
+        always runs as the caller, and a custodian never speaks as a Silicon.
       headers:
         X-Request-ID: { $ref: '#/components/headers/RequestId' }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -900,7 +910,8 @@ components:
             code:
               type: string
               description: |
-                invalid_request, unauthenticated, forbidden, not_custodian, account_not_found, payload_too_large,
+                invalid_request, speech_runs_as_yourself, unauthenticated, forbidden, not_custodian,
+                account_not_found, briefcase_folder_not_found, payload_too_large,
                 unsupported_media_type, source_not_found, storage_authorization_required, idempotency_key_reused,
                 request_in_progress, provider_failed, providers_exhausted, dependency_contract_unavailable,
                 dependency_unavailable, dependency_timeout, too_many_requests, request_timeout, not_ready,

@@ -132,8 +132,10 @@ Providers fall back automatically (Gemini, then gpt-transcribe, then Deepgram).
 ## Briefcase access
 
 Waveform stores speech and reads transcription sources in your Briefcase files with a proof Silicon Accounts issues
-for you. Your first speech request made while signed in gives it automatically; an app calling Waveform for you with a
-proof can only use access you gave before.
+for you. Your first speech request made while signed in gives it automatically, and Waveform replaces it by itself
+when it ended with the sign-in it was made from (for example after `waveform logout` on another machine). After you or
+your custodian revoke it, speech is held until you approve again. An app calling Waveform for you with a proof can only
+use access you gave before.
 
 ```sh
 waveform storage approve     # give it now (signed in as the account itself)

@@ -12,7 +12,8 @@ The service's PostgreSQL tests run with `WAVEFORM_TEST_DATABASE_URL` pointing at
 `python3 scripts/local_database.py` starts an isolated PostgreSQL and writes `.local-test/environment`; source it, then
 run `cargo test --locked --lib -- --ignored --test-threads=1` and
 `cargo test --locked --test postgres_idempotency -- --ignored --test-threads=1`. To run Waveform itself against a
-development Silicon Accounts with deterministic speech fixtures, follow [testing](testing.md).
+development Silicon Accounts with deterministic speech fixtures, follow [testing](testing.md):
+`scripts/dev-accounts.sh start` starts everything, and `scripts/e2e-accounts.sh` runs the end-to-end checks.
 
 The backend is a Rust library and an API process. The client is a stateless Rust library; the CLI owns local sign-ins
 and is built only on the client, so it has no feature the client lacks. Silicon Apps installs and updates the CLI.

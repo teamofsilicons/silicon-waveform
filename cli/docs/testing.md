@@ -40,6 +40,35 @@ waveform tts 'Test speech'
 Plain `http://` is accepted only for this machine. Sign-ins are kept per Silicon Accounts origin, so a development
 sign-in never replaces your production one. Use `--profile NAME` to keep several test accounts side by side.
 
+## Everything on one machine, end to end
+
+In a checkout of the repository, `scripts/dev-accounts.sh` runs Waveform against a development Silicon Accounts with
+one command, and `scripts/e2e-accounts.sh` proves the whole product against it with real tokens:
+
+```sh
+export WAVEFORM_DEV_STACK=/path/to/stack.json   # the development Silicon Accounts (below)
+scripts/dev-accounts.sh start                   # API on 127.0.0.1:4161, a Briefcase stand-in on :4162
+eval "$(scripts/dev-accounts.sh env)"           # WAVEFORM_URL and ACCOUNTS_URL for the CLI
+waveform login
+scripts/dev-accounts.sh stop
+```
+
+The stack description is JSON: `accounts_public_url`, `accounts_api_url`, optionally `fake_apps_url`, and
+`apps.waveform.app_secret` and `apps.briefcase.app_secret` (development secrets only; the script refuses a Silicon
+Accounts that is not on this machine). `start` is idempotent: it creates and migrates the database (`waveform_e2e` on
+`127.0.0.1:5460`), keeps encryption keys in `.mig/dev/`, makes Waveform's sign-in setup there offer email codes, the
+device flow, the CLI as a public client and the local callbacks, points Waveform's webhook at the API with a fresh
+secret (kept in `.mig/dev/`, never in the repository), starts a stand-in Briefcase that verifies every proof with
+Briefcase's own development credentials (or uses the Briefcase at `WAVEFORM_BRIEFCASE_BASE_URL`), starts the API
+with speech fixtures, and waits until a signed test event arrives. `restart-api`, `status` and `stop` do what they say.
+
+`scripts/e2e-accounts.sh` starts a fresh stack and checks, with new Carbons and Silicons on every run: a Carbon on the
+API, a Silicon on the CLI, the device flow, custodians and outsiders, account events (an id change, access removed, a
+custodian transfer, forged and replayed deliveries), proofs from other apps and Waveform's own proofs to Briefcase
+(refresh, recovery and revocation), discovery from a packaged archive, and a restart. It prints PASS or FAIL for every
+check, keeps a transcript without secrets in `.mig/e2e/`, and exits 1 when anything failed (`--help` lists what it
+needs).
+
 ## Automated tests
 
 - `cargo test --manifest-path cli/Cargo.toml` runs the real `waveform` binary in empty homes against a stub Silicon

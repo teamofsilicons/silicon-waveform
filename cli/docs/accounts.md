@@ -71,7 +71,11 @@ Waveform stores generated MP3s in the account's own Briefcase files (folder `app
 sources from them. For that, Waveform asks Silicon Accounts for a User verification proof for `receiving_app`
 `briefcase` with the scopes `briefcase.uploads.reserve`, `briefcase.uploads.commit`, `briefcase.entries.list` and
 `briefcase.files.read`, made from the account's own Waveform sign-in. A speech request made while signed in is the
-account's agreement, so the first one gives Waveform this access automatically.
+account's agreement, so the first one gives Waveform this access automatically. A proof stands on the sign-in it was
+made from, so when that sign-in ends (one machine's `waveform logout`, the website's sign-out) Briefcase refuses it;
+Waveform then asks Silicon Accounts why and, on the account's next direct request, replaces it. A revocation is
+different: after the account revokes the access (`waveform storage revoke`, or the proof on the Silicon Accounts site)
+or its custodian revokes it, speech is held until the account approves again.
 
 | Action | CLI | API |
 | --- | --- | --- |
@@ -82,6 +86,10 @@ account's agreement, so the first one gives Waveform this access automatically.
 Waveform keeps the proof encrypted, refreshes it one request at a time, and revokes it when the account revokes it,
 signs out everywhere, removes Waveform's access, or is deleted. When Briefcase is down or refuses, or no access was
 given, speech still completes and Waveform holds the MP3 for 24 hours; `storage.reason` says why.
+
+Briefcase shows Waveform only what is in `apps/waveform`, so `waveform stt-folder` (`POST /api/v1/stt/source-target`)
+learns the folder from the files in it: for a folder that is still empty it answers `briefcase_folder_not_found` and
+says to store one speech there first or upload with your own Briefcase access.
 
 ## The Silicons you look after
 
