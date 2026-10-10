@@ -81,6 +81,16 @@ def accounts_identity(content):
     require(env_value(content, "WAVEFORM_APP_SECRET"), "native.env has no WAVEFORM_APP_SECRET")
 
 
+class AccountsNoRedirect(urllib.request.HTTPRedirectHandler):
+    """App credentials must only reach the configured Accounts origin."""
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        return None
+
+
+def accounts_open(request, timeout=20):
+    return urllib.request.build_opener(AccountsNoRedirect()).open(request, timeout=timeout)
+
+
 def accounts_preflight(content, timeout=20):
     """Prove Silicon Accounts accepts Waveform's app credentials before anything stops: introspecting a token that
     does not exist must answer exactly {"active": false}; wrong credentials answer 401 invalid_client."""
@@ -92,7 +102,7 @@ def accounts_preflight(content, timeout=20):
                                      headers={"authorization": "Basic " + basic,
                                               "content-type": "application/x-www-form-urlencoded"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with accounts_open(request, timeout=timeout) as response:
             answer = json.loads(response.read() or b"null")
             require(response.status == 200 and answer == {"active": False},
                     f"Silicon Accounts answered the credential check unexpectedly ({response.status})")

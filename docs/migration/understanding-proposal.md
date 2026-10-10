@@ -125,3 +125,5 @@ with:
 
 > Every account also has a permanent uuid, a short case-sensitive string such as `zQo`. Waveform keys everything on
 > the uuid and shows the id, because an id can change.
+
+Review clarification: a custodian can read the first 512 characters of each Silicon speech text or transcript in job history. Deleted accounts have their stored bug reports removed alongside speech data. The existing report destination `shubhastro2@gmails.com` appears to be a typo; a Carbon must confirm the intended destination before production release.

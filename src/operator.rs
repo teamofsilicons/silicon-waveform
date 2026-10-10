@@ -369,6 +369,18 @@ async fn link_one(
                 row.line, row.principal
             )));
         }
+        let used_since_link: bool = sqlx::query_scalar("WITH linked AS (SELECT min(linked_at) AS at FROM waveform_identity_links WHERE storage_actor_id=$1 AND accounts_uuid=$2) SELECT EXISTS(SELECT 1 FROM waveform_jobs, linked WHERE actor_id=$1 AND created_at>linked.at) OR EXISTS(SELECT 1 FROM waveform_account_preferences, linked WHERE actor_id=$1 AND updated_at>linked.at) OR EXISTS(SELECT 1 FROM waveform_provider_keys, linked WHERE actor_id=$1 AND updated_at>linked.at) OR EXISTS(SELECT 1 FROM waveform_idempotency_records, linked WHERE actor_id=$1 AND updated_at>linked.at) OR EXISTS(SELECT 1 FROM waveform_storage_proofs, linked WHERE storage_actor_id=$1 AND updated_at>linked.at) OR EXISTS(SELECT 1 FROM waveform_held_audio, linked WHERE storage_actor_id=$1 AND created_at>linked.at) OR EXISTS(SELECT 1 FROM waveform_accounts, linked WHERE account_uuid=$2 AND (id_changed_at>linked.at OR custodian_changed_at>linked.at))")
+            .bind(storage_key).bind(&other).fetch_one(&mut **transaction).await?;
+        if used_since_link {
+            return Ok(Err(format!(
+                "line {}: account {other} has used its linked data; --relink is only for corrections before use and cannot transfer that activity",
+                row.line
+            )));
+        }
+        // Keep the old identity's revocation/deletion fence even though its storage
+        // mapping is being corrected. A later first sighting folds it back in.
+        sqlx::query("INSERT INTO waveform_account_pending_events(account_uuid, revoked_before, revoked_reason, deleted_at) SELECT account_uuid, COALESCE(revoked_before, deleted_at), COALESCE(revoked_reason, 'account_deleted'), deleted_at FROM waveform_accounts WHERE account_uuid=$1 AND (revoked_before IS NOT NULL OR deleted_at IS NOT NULL) ON CONFLICT(account_uuid) DO UPDATE SET revoked_before=GREATEST(waveform_account_pending_events.revoked_before, EXCLUDED.revoked_before), deleted_at=COALESCE(waveform_account_pending_events.deleted_at, EXCLUDED.deleted_at)")
+            .bind(&other).execute(&mut **transaction).await?;
         sqlx::query("DELETE FROM waveform_accounts WHERE account_uuid=$1")
             .bind(&other)
             .execute(&mut **transaction)

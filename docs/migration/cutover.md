@@ -333,3 +333,5 @@ IAM `oac_…` token is refused before anything is sent (`slt_not_a_short_lived_t
   [decisions](decisions.md#briefcase-waveform--briefcase); the end-to-end run checked them against a stand-in built
   from Briefcase's Accounts-era branch (proof checks, `apps/{app}/` confinement, `{origin}/{owner id}/{path}` URLs),
   and the integration run checks them against Briefcase itself.
+
+Review correction: identity mappings are verified online for existence and kind even on dry runs. Review every source-to-target identity manually; matching mutable handles alone does not establish ownership. `--merge` cannot merge two different legacy identities. `--relink` is only a pre-use cutover correction: it refuses activity written after the previous link and preserves the old account's sign-out/deletion fence.

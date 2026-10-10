@@ -635,3 +635,9 @@ Remaining review work includes identity-mapping ambiguity and relink safety, pro
 The operator now verifies every mapped target's existence and Carbon/Silicon kind against Silicon Accounts before a dry run or apply. Resolved storage-key checks refuse two legacy identities assigned to one account, two aliases of one storage key assigned to different accounts, and an attempt to use `--merge` against an account already linked to another legacy identity. Ambiguity rolls the transaction back.
 
 Validation: the PostgreSQL upgrade/linking regression now explicitly tries a many-to-one mapping with `--merge` and proves no account keys persist; the full upgrade/relink/idempotency test passes. `cargo clippy --all-targets --all-features --locked -- -D warnings` and formatting pass. Relink activity/tombstone preservation remains a separate review item.
+
+## Follow-up authorization and deployment review — 10 October 2026
+
+Relinking is refused after the linked account has created or changed app data or identity events; a permitted pre-use correction preserves the old account revocation/deletion fence. PostgreSQL upgrade regression proves the fence survives and a post-link change blocks correction. Wrong receiving app and wrong proof kind are explicitly rejected in speech route tests. Native deployment credential checks and cutover requests no longer follow HTTP redirects; a local HTTP redirect server regression proves no request reaches its redirect target. Deployment Python suite: 26 passed. PostgreSQL control suite: 12 passed, then corrected the new relink fixture and that test passed separately.
+
+Public history copy now accurately states that first-line text is retained; human-owned UNDERSTANDING remains untouched. Full Next.js frontend implementation is in progress in web/.

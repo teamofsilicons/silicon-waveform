@@ -162,10 +162,39 @@ class AccountsIdentityTests(unittest.TestCase):
 
 
 class AccountsPreflightTests(unittest.TestCase):
+    def test_credentials_never_follow_redirects(self):
+        import http.server
+        import threading
+        paths = []
+        class Redirect(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                paths.append(self.path)
+                self.send_response(302)
+                self.send_header("Location", "/unexpected-target")
+                self.end_headers()
+            def do_GET(self):
+                paths.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            env = f"ACCOUNTS_URL=http://127.0.0.1:{server.server_port}\nWAVEFORM_APP_SECRET=private\n".encode()
+            with self.assertRaisesRegex(RuntimeError, "302"):
+                upgrade.accounts_preflight(env)
+            self.assertEqual(paths, ["/v1/oauth/introspect"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join()
+
     ENV = b"ACCOUNTS_URL=https://accounts.example\nACCOUNTS_API_URL=https://api.accounts.example/\nWAVEFORM_APP_SECRET=sa_app_s3cret\n"
 
     def test_inactive_answer_proves_the_credentials(self):
-        with patch.object(upgrade.urllib.request, "urlopen", return_value=FakeResponse(200, b'{"active":false}')) as call:
+        with patch.object(upgrade, "accounts_open", return_value=FakeResponse(200, b'{"active":false}')) as call:
             upgrade.accounts_preflight(self.ENV)
         request = call.call_args.args[0]
         self.assertEqual(request.full_url, "https://api.accounts.example/v1/oauth/introspect")
@@ -180,7 +209,7 @@ class AccountsPreflightTests(unittest.TestCase):
                  (urllib.error.URLError("connection refused"), "could not be reached")]
         for outcome, message in cases:
             with self.subTest(message=message), \
-                 patch.object(upgrade.urllib.request, "urlopen", side_effect=[outcome] if isinstance(outcome, Exception) else None,
+                 patch.object(upgrade, "accounts_open", side_effect=[outcome] if isinstance(outcome, Exception) else None,
                               return_value=outcome), \
                  self.assertRaisesRegex(RuntimeError, message):
                 upgrade.accounts_preflight(self.ENV)

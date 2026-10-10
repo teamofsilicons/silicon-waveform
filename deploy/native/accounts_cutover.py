@@ -207,7 +207,7 @@ def accounts_request(content, method, path, body=None, idempotency_key=None):
     request = urllib.request.Request(base + path, method=method, headers=headers,
                                      data=None if body is None else json.dumps(body).encode())
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with upgrade.accounts_open(request, timeout=20) as response:
             return response.status, json.loads(response.read() or b"{}")
     except urllib.error.HTTPError as error:
         try:

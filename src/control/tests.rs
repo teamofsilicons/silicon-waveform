@@ -1459,6 +1459,25 @@ async fn speech_runs_for_accounts_and_for_apps_with_proofs() -> TestResult {
         .valid_proof("sap_from-dm", ADA, "dm", &["waveform.tts", "waveform.stt"])
         .await;
     harness.accounts.invalid_proof("sap_revoked").await;
+    for (token, receiver, kind) in [
+        ("sap_wrong-receiver", "briefcase", "user_verification"),
+        ("sap_wrong-kind", "waveform", "app_verification"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/proofs/verify"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"proof_token":token}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "valid":true,"proof_id":token,"kind":kind,"expires_at":"2099-01-01T00:00:00Z",
+                "issuing_app":{"app_id":"interface","name":"Interface"},
+                "receiving_app":{"app_id":receiver,"name":receiver},
+                "user":{"uuid":ADA.0,"id":ADA.2,"kind":ADA.1,"membership_id":"interface:zQo"},
+                "scopes":["waveform.tts"]
+            })))
+            .mount(&harness.accounts.server)
+            .await;
+    }
     for (proof, status, reason) in [
         (
             "Proof sap_stt-only",
@@ -1474,6 +1493,16 @@ async fn speech_runs_for_accounts_and_for_apps_with_proofs() -> TestResult {
             "Proof sap_revoked",
             StatusCode::UNAUTHORIZED,
             "invalid_proof",
+        ),
+        (
+            "Proof sap_wrong-receiver",
+            StatusCode::UNAUTHORIZED,
+            "invalid_proof",
+        ),
+        (
+            "Proof sap_wrong-kind",
+            StatusCode::FORBIDDEN,
+            "proof_without_account",
         ),
     ] {
         let (got, body) = send(
@@ -1932,6 +1961,10 @@ async fn iam_era_data_upgrades_and_links_to_accounts_without_loss() -> TestResul
         .await?,
         0
     );
+    // A corrected identity must keep its earlier sign-out fence even when its
+    // storage key is removed. It must not gain a new unrevoked first-use identity.
+    sqlx::query("UPDATE waveform_accounts SET revoked_before=now()-interval '1 minute', revoked_reason='signed_out' WHERE account_uuid='K1E'")
+        .execute(&pool).await?;
     // ...unless the operator explicitly relinks a link this command made.
     let report = link_identities(
         &pool,
@@ -1944,6 +1977,7 @@ async fn iam_era_data_upgrades_and_links_to_accounts_without_loss() -> TestResul
     )
     .await?;
     assert_eq!((report.linked, report.conflicts.len()), (1, 0));
+    assert_eq!(count(&pool, "SELECT count(*) FROM waveform_account_pending_events WHERE account_uuid='K1E' AND revoked_before IS NOT NULL").await?, 1);
     let back = parse_mapping("si:scout,K1E\n").map_err(|errors| errors.join("; "))?;
     link_identities(
         &pool,
@@ -2029,6 +2063,25 @@ async fn iam_era_data_upgrades_and_links_to_accounts_without_loss() -> TestResul
     .fetch_one(&pool)
     .await?;
     assert_eq!(merged, gone);
+    // Once the linked identity changes its public id, correcting its ownership
+    // would transfer new data. Refuse it and retain the current mapping.
+    sqlx::query("UPDATE waveform_accounts SET id_changed_at=clock_timestamp()+interval '1 second' WHERE account_uuid='K1E'").execute(&pool).await?;
+    let refused = link_identities(
+        &pool,
+        Some(&vault),
+        &conflicting,
+        LinkOptions {
+            relink: true,
+            ..LinkOptions::default()
+        },
+    )
+    .await?;
+    assert!(
+        refused
+            .conflicts
+            .iter()
+            .any(|message| message.contains("has used its linked data"))
+    );
     harness.finish().await
 }
 
