@@ -2264,6 +2264,38 @@ async fn a_proof_briefcase_refuses_is_replaced_when_it_ended_but_an_account_revo
 
 #[tokio::test]
 #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn me_shows_the_accounts_profile_from_userinfo_once() -> TestResult {
+    let harness = Harness::new("").await?;
+    Mock::given(method("GET"))
+        .and(path("/v1/userinfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"uuid":"zQo","membership_id":"waveform:zQo",
+            "kind":"carbon","id":"c:ada","display_name":"Ada King","pfp_url":"https://accounts.example.test/pfp/zQo",
+            "version":3,"sub":"zQo","name":"Ada King"})))
+        .expect(1)
+        .mount(&harness.accounts.server)
+        .await;
+    let ada = bearer(&harness.token(ADA));
+    for _ in 0..2 {
+        let (status, body) = send(
+            &harness.app,
+            "GET",
+            "/api/v1/me",
+            &[("authorization", &ada)],
+            None,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["account"]["display_name"], "Ada King");
+        assert_eq!(
+            body["account"]["pfp_url"],
+            "https://accounts.example.test/pfp/zQo"
+        );
+    }
+    harness.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
 async fn speech_never_takes_an_account_selector() -> TestResult {
     let harness = Harness::new("").await?;
     let ada = bearer(&harness.token(ADA));

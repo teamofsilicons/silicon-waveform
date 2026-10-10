@@ -11,7 +11,10 @@ use http::{HeaderMap, header};
 use serde_json::{Value, json};
 
 use super::{ControlError, ControlState};
-use crate::{domain::auth::WaveformAction, infrastructure::directory::AccountRecord};
+use crate::{
+    domain::auth::{InboundCredentials, WaveformAction},
+    infrastructure::directory::AccountRecord,
+};
 
 /// Where to sign in and where the docs are. Public, no credentials.
 pub(super) async fn discovery(State(state): State<Arc<ControlState>>) -> Response {
@@ -48,12 +51,21 @@ pub(super) async fn me(
     let caller = state
         .caller(&headers, WaveformAction::ManageAccount)
         .await?;
+    let record = match &caller.credentials {
+        InboundCredentials::Bearer(token) => {
+            state
+                .directory()
+                .complete_profile(caller.record.clone(), token.expose_secret())
+                .await
+        }
+        InboundCredentials::Proof(_) => caller.record.clone(),
+    };
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
             "authenticated": true,
             "app_id": state.app_id,
-            "account": account_json(&caller.record),
+            "account": account_json(&record),
             "via": "bearer",
             "expires_at": caller.actor.expires_at.and_then(|at| at.format(&time::format_description::well_known::Rfc3339).ok()),
         })),

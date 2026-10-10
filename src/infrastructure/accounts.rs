@@ -234,6 +234,21 @@ impl AccountsGateway {
         }
     }
 
+    /// The account behind an access token, as Accounts shows it to Waveform
+    /// (`GET /v1/userinfo`): display name, photo and profile version.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable`/`Timeout` when Accounts cannot answer or refuses the token.
+    pub async fn userinfo(
+        &self,
+        token: &str,
+    ) -> Result<silicon_accounts_client::UserInfo, AccountsError> {
+        self.bounded(self.app().userinfo(token))
+            .await?
+            .map_err(|_| AccountsError::Unavailable)
+    }
+
     /// Asks Accounts whether a token is still active (sees revocation at once).
     /// Answers are cached for 30 seconds per token.
     ///

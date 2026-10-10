@@ -33,6 +33,8 @@ const FIRST_LOOKUP_BACKOFF: Duration = Duration::from_secs(60);
 /// A webhook change this close to a lookup's start (or later) wins over the lookup's
 /// answer, which may have been read before the change (allows for clock skew).
 const LOOKUP_SKEW: time::Duration = time::Duration::seconds(5);
+/// An account whose name and photo are unknown asks Accounts' userinfo at most this often.
+const PROFILE_RECHECK: Duration = Duration::from_secs(600);
 
 /// How an account first became known to Waveform.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +90,7 @@ pub struct AccountDirectory {
     pool: PgPool,
     gateway: Arc<AccountsGateway>,
     first_lookup_failures: Arc<Mutex<HashMap<String, Instant>>>,
+    profile_checks: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 const SELECT_RECORD: &str = "SELECT k.account_uuid, k.storage_actor_id, k.kind, a.current_id, a.display_name, a.pfp_url, a.custodian_uuid, a.custodian_id, a.custodian_checked_at, a.revoked_before, a.revoked_reason, a.deleted_at FROM waveform_account_keys k LEFT JOIN waveform_accounts a ON a.account_uuid = k.account_uuid";
@@ -100,6 +103,50 @@ impl AccountDirectory {
             pool,
             gateway,
             first_lookup_failures: Arc::new(Mutex::new(HashMap::new())),
+            profile_checks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Fills a missing display name and photo from Accounts' userinfo, read with
+    /// the account's own access token (app lookups carry neither; later changes
+    /// arrive as `account.updated`). At most once per [`PROFILE_RECHECK`] per
+    /// account; a profile older than the cached version is ignored. Best effort:
+    /// on any failure the record is answered as it was.
+    pub async fn complete_profile(&self, record: AccountRecord, token: &str) -> AccountRecord {
+        if record.deleted_at.is_some()
+            || (record.display_name.is_some() && record.pfp_url.is_some())
+        {
+            return record;
+        }
+        if let Ok(mut checks) = self.profile_checks.lock() {
+            checks.retain(|_, checked| checked.elapsed() < PROFILE_RECHECK);
+            if checks.contains_key(record.uuid.as_str()) {
+                return record;
+            }
+            checks.insert(record.uuid.as_str().to_owned(), Instant::now());
+        }
+        let Ok(info) = self.gateway.userinfo(token).await else {
+            tracing::debug!("userinfo unavailable; the profile is filled on a later request");
+            return record;
+        };
+        if info.account.uuid != record.uuid.as_str() {
+            return record;
+        }
+        let updated = sqlx::query("UPDATE waveform_accounts SET display_name = COALESCE(NULLIF($2, ''), display_name), pfp_url = COALESCE(NULLIF($3, ''), pfp_url), profile_version = GREATEST(profile_version, $4), updated_at = now() WHERE account_uuid = $1 AND deleted_at IS NULL AND profile_version <= $4")
+            .bind(record.uuid.as_str())
+            .bind(&info.account.display_name)
+            .bind(&info.account.pfp_url)
+            .bind(info.account.version)
+            .execute(&self.pool)
+            .await;
+        match updated {
+            Ok(_) => self
+                .load(&record.uuid)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(record),
+            Err(_) => record,
         }
     }
 
