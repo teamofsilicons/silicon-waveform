@@ -129,6 +129,10 @@ async fn link_identities(arguments: &[String]) -> ExitCode {
             .map(silicon_waveform::infrastructure::vault::Vault::new)
             .transpose()
             .map_err(|error| format!("WAVEFORM_ENCRYPTION_KEY: {error}"))?;
+        let gateway =
+            silicon_waveform::infrastructure::accounts::AccountsGateway::new(&settings.accounts)
+                .map_err(str::to_owned)?;
+        operator::verify_mapping_accounts(&pool, &gateway, &rows).await?;
         let report = operator::link_identities(&pool, vault.as_ref(), &rows, options)
             .await
             .map_err(|error| format!("database error: {error}"))?;

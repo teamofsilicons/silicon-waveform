@@ -1829,6 +1829,26 @@ async fn iam_era_data_upgrades_and_links_to_accounts_without_loss() -> TestResul
         "iam_principal_id,accounts_uuid\nc:ada,zQo\nsi:scout,K1E\n{legacy},L3g\nc:nobody,N0b\n"
     ))
     .map_err(|errors| errors.join("; "))?;
+    // Different legacy identities must never collapse into the same account,
+    // even with --merge and even before either account has used the app.
+    let ambiguous =
+        parse_mapping("c:ada,Same1\nsi:scout,Same1\n").map_err(|errors| errors.join("; "))?;
+    let refused = link_identities(
+        &pool,
+        Some(&vault),
+        &ambiguous,
+        LinkOptions {
+            merge: true,
+            ..LinkOptions::default()
+        },
+    )
+    .await?;
+    assert!(!refused.conflicts.is_empty());
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM waveform_account_keys").await?,
+        0
+    );
+
     // Dry run: a full report, nothing applied.
     let report = link_identities(
         &pool,

@@ -629,3 +629,9 @@ Completed and verified the inherited account-cache change. Webhook sign-outs and
 Validation against the restarted local PostgreSQL instance (`waveform_fix_test`): `cargo fmt --all --check`; `cargo clippy --all-targets --all-features --locked -- -D warnings`; `WAVEFORM_TEST_DATABASE_URL=… cargo test --lib account_tests -- --ignored --test-threads=1` (9 passed). These tests include stale custodians, out-of-order identity evidence, deletion without a webhook, first-use tombstones and bounded selector lookup. Rust builds used 2 jobs, no debug symbols or incremental compilation.
 
 Remaining review work includes identity-mapping ambiguity and relink safety, proof contract negative tests, documentation corrections, and the Next.js frontend.
+
+### Identity-mapping validation checkpoint
+
+The operator now verifies every mapped target's existence and Carbon/Silicon kind against Silicon Accounts before a dry run or apply. Resolved storage-key checks refuse two legacy identities assigned to one account, two aliases of one storage key assigned to different accounts, and an attempt to use `--merge` against an account already linked to another legacy identity. Ambiguity rolls the transaction back.
+
+Validation: the PostgreSQL upgrade/linking regression now explicitly tries a many-to-one mapping with `--merge` and proves no account keys persist; the full upgrade/relink/idempotency test passes. `cargo clippy --all-targets --all-features --locked -- -D warnings` and formatting pass. Relink activity/tombstone preservation remains a separate review item.

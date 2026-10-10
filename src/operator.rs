@@ -130,6 +130,57 @@ pub fn parse_mapping(text: &str) -> Result<Vec<MappingRow>, Vec<String>> {
     }
 }
 
+/// Confirms every target exists and has the legacy identity's kind before an
+/// operator applies or previews a mapping. Public ids may have changed and are
+/// never used as ownership evidence.
+///
+/// # Errors
+/// Database failures and unavailable or contradictory Accounts lookups.
+pub async fn verify_mapping_accounts(
+    pool: &PgPool,
+    gateway: &crate::infrastructure::accounts::AccountsGateway,
+    rows: &[MappingRow],
+) -> Result<(), String> {
+    use crate::infrastructure::accounts::{Lookup, LookupPurpose};
+    let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
+    for row in rows {
+        let legacy = legacy_key(&mut transaction, &row.principal)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Legacy::Found(_, kind, _) = legacy else {
+            continue;
+        };
+        match gateway
+            .lookup(row.account.as_str(), LookupPurpose::Authorization)
+            .await
+        {
+            Ok(Lookup::Found(account)) if account.kind.as_str() == kind.as_str() => {}
+            Ok(Lookup::Found(_)) => {
+                return Err(format!(
+                    "line {}: {} and account {} have different kinds; nothing changed",
+                    row.line, row.principal, row.account
+                ));
+            }
+            Ok(Lookup::Deleted | Lookup::NotFound) => {
+                return Err(format!(
+                    "line {}: account {} is missing or deleted; nothing changed",
+                    row.line, row.account
+                ));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "line {}: Silicon Accounts could not verify {}; retry before applying the mapping",
+                    row.line, row.account
+                ));
+            }
+        }
+    }
+    transaction
+        .rollback()
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Applies a mapping (see the module docs).
 ///
 /// # Errors
@@ -152,6 +203,8 @@ pub async fn link_identities(
         .execute(&mut *transaction)
         .await?;
     let mut linked_keys = Vec::new();
+    let mut account_sources: BTreeMap<&str, (Uuid, usize)> = BTreeMap::new();
+    let mut key_targets: BTreeMap<Uuid, (&str, usize)> = BTreeMap::new();
     for row in rows {
         let (storage_key, kind, public_id) = match legacy_key(&mut transaction, &row.principal)
             .await?
@@ -169,6 +222,20 @@ pub async fn link_identities(
                 continue;
             }
         };
+        if let Some((previous, line)) =
+            account_sources.insert(row.account.as_str(), (storage_key, row.line))
+            && previous != storage_key
+        {
+            report.conflicts.push(format!("lines {line} and {} map different legacy identities to account {}; nothing changed", row.line, row.account));
+            continue;
+        }
+        if let Some((previous, line)) =
+            key_targets.insert(storage_key, (row.account.as_str(), row.line))
+            && previous != row.account.as_str()
+        {
+            report.conflicts.push(format!("lines {line} and {} map the same legacy storage key to different accounts; nothing changed", row.line));
+            continue;
+        }
         match link_one(
             &mut transaction,
             row,
@@ -322,6 +389,14 @@ async fn link_one(
     if let Some(fresh_key) = existing
         && fresh_key != storage_key
     {
+        let earlier_link: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM waveform_identity_links WHERE accounts_uuid=$1 AND storage_actor_id<>$2)")
+            .bind(account).bind(storage_key).fetch_one(&mut **transaction).await?;
+        if earlier_link {
+            return Ok(Err(format!(
+                "line {}: account {account} is already linked to a different legacy identity; --merge cannot combine distinct identities",
+                row.line
+            )));
+        }
         if !options.merge {
             return Ok(Err(format!(
                 "line {}: account {account} already has its own Waveform key (it signed in after the cutover started); re-run with --merge to point it at {}'s data",
