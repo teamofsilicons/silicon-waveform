@@ -879,3 +879,15 @@ The API keeps `/api/v1` with contract 2.0.0.
 
 The full record of the judgement calls, the old-to-new mapping and the configuration is
 [`docs/migration/decisions.md`](docs/migration/decisions.md).
+
+## 2026-10-10 — The client and the CLI sign in with Silicon Accounts
+
+**Status:** Accepted. Extends the entry above to `silicon-waveform-client` and `waveform` 0.6.0.
+
+The CLI is Waveform's public client at Silicon Accounts: Carbons sign in with the device flow (`waveform login`),
+Silicons hand over a short-lived token (`waveform login --slt-stdin`), and nothing in the CLI holds an app secret.
+Sign-ins live in private files per profile and Silicon Accounts origin and are refreshed one process at a time under
+a file lock; sign-ins saved by earlier versions are never used. Organization, test-environment, delegated-token and
+updater flags and commands are gone and fail with what replaced them; Silicon Apps installs and updates the CLI.
+The client drops every organization and actor parameter, adds `signin::SignIn` and proof credentials, and keeps the
+API-version handshake. Details: [`docs/migration/decisions.md`](docs/migration/decisions.md#client-and-cli-stage-2).
