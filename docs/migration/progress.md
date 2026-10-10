@@ -294,3 +294,146 @@ Discovery in an empty, scrubbed environment (`env -i HOME=$E SILICON_HOME=$E`): 
   fixed across restarts in local runs.
 - Tool-call JSON decodes `\uXXXX` escapes: writing a test that needs a literal `\ud83d` through a heredoc produced the
   emoji instead. Build such strings with `chr(92)` (Python) or check the result with `cat -v`.
+
+## 2026-10-10 — Stage 3 (ship): packaging, CI, deployment and documentation
+
+Everything around the code now says and does Silicon Accounts and Silicon Apps. Nothing was pushed, released or
+deployed. Decisions: [`decisions.md`](decisions.md#ship-stage-packaging-ci-deployment-docs); production runbook:
+[`cutover.md`](cutover.md); proposed contract text: [`understanding-proposal.md`](understanding-proposal.md).
+
+### What changed
+
+- **Packaging:** `packaging/apps.yaml.in`, `scripts/package-apps.sh` (entry point) + `scripts/package_apps.py`
+  (unit-tested). One archive per target with `apps.yaml` for that target and `bin/waveform[.exe]`; refuses
+  non-native or dynamically linked Linux binaries, a version other than `cli/Cargo.toml`, and wrong discovery answers
+  when the binary can run here; hermetic `silicon-apps validate`/`pack`; re-validates the extracted archive.
+  `honeycomb.yaml` (and its frontend copy), `sync-honeycomb.py`, `package-release.py` and `install.sh` deleted; the
+  docs site no longer copies them, and publishes neither `docs/history/` nor `docs/migration/`.
+- **CI:** `release.yml` (tag check, same six targets and toolchains, per-target packing on each runner with
+  `PACKAGE_DISCOVERY=require`, aggregate `SHA256SUMS`, artifact `waveform-silicon-apps-release`); `ci.yml` (new
+  `silicon-apps-package` job, Python tooling tests, manifest checks removed, no CLI build before DB tests);
+  `backend-release.yml` (manifest checks removed); `linux-cli-smoke.yml` (runs the three commands from the archive).
+- **Deployment:** new `deploy/native/accounts_cutover.py` (+ tests) for the one-time move with a database-restoring
+  rollback; `upgrade.py` requires an Accounts-era `native.env` and checks the app credentials first; `install.py`,
+  `deploy/aws/install.py` and `install-frontend.py` moved to `WAVEFORM_APP_SECRET`, the webhook secret, the proof
+  issuers and the Next.js website's settings; both deploy READMEs rewritten. IAM 3 cutover tooling, the IAM identity
+  scripts and the mock-IAM e2e scripts retired (in git history).
+- **Docs:** README, `API_DOCS.md`, `docs/{releases,development,api-contracts,voice-profiles}.md` rewritten;
+  `docs/client.md` and `docs/configuration.md` touched (bundled copies synced); 19 dated reports, the IAM/Honeycomb
+  guides, the 0.5 implementation record, the earlier release notes and 3 dated deploy records moved to
+  `docs/history/` (index in `docs/history/README.md`, links repointed); root `decisions.md` entry appended;
+  `cutover.md` completed; `understanding-proposal.md` written.
+
+### Commits
+
+`56069b7` build: package the CLI for Silicon Apps instead of Honeycomb · `f62c191` ci: build Silicon Apps archives
+per target and drop the Honeycomb steps · `8c7d3ec` chore: retire the one-time IAM-era cutover and test tooling ·
+`6495602` deploy: run the API and website on Silicon Accounts · `c833309` docs: describe Waveform on Silicon Accounts
+and Silicon Apps · `812046e` docs(migration): write the cutover runbook and the UNDERSTANDING proposal · the commit
+that adds this section.
+
+### Tests (Rust env from stage 1; Postgres 16 on 5460; logs in `.mig/logs/ship/`)
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all -- --check`; `cargo clippy --all-targets --all-features -- -D warnings` | pass; pass |
+| `cargo test --all-targets --all-features` | pass: lib 174 passed / 9 ignored, `postgres_idempotency` 8 ignored |
+| `WAVEFORM_TEST_DATABASE_URL=…/waveform_test cargo test --lib -- --ignored --test-threads=1` | pass: 9 passed |
+| `WAVEFORM_TEST_DATABASE_URL=…/waveform_idem_test cargo test --test postgres_idempotency -- --ignored --test-threads=1` | pass: 8 passed |
+| `cargo fmt --check` / `clippy -D warnings` / `test` for `client/` | pass / pass / 5 unit + 13 `api` + 9 `signin` + 4 doctests |
+| `cargo fmt --check` / `clippy -D warnings` / `test` for `cli/` | pass / pass / 15 unit + 9 `discovery` + 12 `signin` + 6 `speech` |
+| `cargo deny --offline check licenses sources bans` | bans ok, licenses ok, sources ok |
+| `python3 scripts/test_package_apps.py` | 11 passed |
+| `python3 deploy/native/test_upgrade.py` | 13 passed (8 before, 5 new) |
+| `python3 deploy/native/test_accounts_cutover.py` | 12 passed; two mutations (no database restore; retired keys kept) each failed it, then reverted |
+| `python3 scripts/sync-cli-docs.py --check` | pass |
+| `cd docs-site && npm ci && npm run build && npm run check` | 11 pages built; links, anchors and canonical URLs verified; no IAM/Honeycomb/org words in `dist` except the deliberate `X-Org-ID` note |
+| `cd frontend && npm ci && npm test && npm run build` (CI's old-website job, after the manifest removal) | 74/74 passed; built without `dist/honeycomb.yaml`; outputs removed afterwards |
+| PyYAML `safe_load` of every workflow; `actionlint 1.7.7` (labels `windows-11-arm`, `macos-15-intel` declared, as they post-date its list) | all parse; actionlint clean |
+
+### Packaging, proved on this Mac
+
+- `cargo build --release --locked --manifest-path cli/Cargo.toml` → Mach-O arm64 `waveform` 0.6.0.
+- `PACKAGE_DISCOVERY=require scripts/package-apps.sh 0.6.0 macos-aarch64 target/mig/release/waveform` → discovery
+  passed, `dist/apps/waveform-0.6.0-macos-aarch64.tar.gz` (4,502,869 bytes, sha256 `caecb6de…5113b30`) and `.sha256`.
+- The archive holds exactly `apps.yaml` (0644) and `bin/waveform` (0755). Extracted into a scratch directory:
+  `~/.apps/bin/silicon-apps validate <dir> --json --home <empty>` → `"valid": true`, `"errors": []`;
+  `env -i HOME=$E SILICON_HOME=$E PATH=/usr/bin:/bin bin/waveform --help` → exit 0, 14,769 bytes;
+  `accounts --json` → exit 0, `"app_id": "waveform"`, `"version": "0.6.0"`, production URLs;
+  `login status --json` → exit 0, `{"authenticated": false}`; nothing written to the empty home.
+- Packing twice gives the same sha256 (deterministic). Refusals: the Mac binary as `linux-x86_64` ("needs a
+  little-endian ELF executable"), version 0.5.1 ("differs from cli/Cargo.toml"), a non-PE file as `windows-x86_64`, and
+  a native Mach-O compiled to print `{"app_id":"remind"}` (`waveform accounts --json must contain "app_id":"waveform"`);
+  no archive was written in any of them.
+
+### Deployment tooling, proved where it can be off the host
+
+- **Database restore** (the cutover's rollback): on 5460, role `waveform_ship_owner` and database `waveform_ship_rt`,
+  `waveform-api migrate` (17 migrations) as that role, one row, `pg_dump -Fc`, then a second row and an extra table,
+  then `restore_database(dump, "20261010T091500Z", database="waveform_ship_rt", owner="waveform_ship_owner", …)`.
+  Result: the restored database has only the first row, 17 migrations, no extra table, tables and database owned by
+  `waveform_ship_owner`; `waveform_ship_rt_cutover_20261010t091500z` holds both rows and the table; `waveform-api
+  migrate` on the restored database exits 0. Both databases and the role were dropped afterwards.
+- **Credential preflight** against the shared stack (`http://127.0.0.1:9589`, Waveform's dev credentials):
+  right secret → accepted (`{"active":false}`); wrong secret → "Silicon Accounts refused Waveform's app credentials
+  (401)"; unreachable port → "could not be reached".
+- **Webhook test helper** against the shared stack: Waveform's webhook (`http://127.0.0.1:9593/waveform/webhooks`,
+  `active`) → `POST /v1/apps/waveform/webhook/test` + polling the delivery → `delivered` after 3 s. (Only Waveform's
+  own webhook was pinged; nothing was changed.)
+- Not runnable here: the host steps (systemd, Docker, SSM, S3) of `accounts_cutover.py`, `upgrade.py`,
+  `install.py`, `install-frontend.py` and `deploy/aws/install.py`; they are covered by the mocked transaction tests
+  and Python parsing only. `release.yml`'s cross-target builds need GitHub's runners.
+
+### Sweep
+
+`git grep -n -i -E 'iam|honeycomb|org_id|organi[sz]ation|\borg\b|tenant'` outside `docs/history/` and
+`docs/migration/` (both deliberate records). Every remaining hit is intentional:
+
+| Where | Why it stays |
+| --- | --- |
+| `migrations/0001`–`0015` | Applied migrations are never edited. |
+| `migrations/0016`, `0017` comments; `src/operator.rs`; `src/bin/waveform_api.rs`; `deploy/native/README.md` line 61 | `link-identities` and its mapping file format (`iam_principal_id,accounts_uuid`), which re-keys IAM-era data at cutover. |
+| `src/control/accounts.rs`, `reporting.rs`, `voices.rs`, `src/infrastructure/idempotency.rs`, `src/domain/idempotency.rs`, `tests/postgres_idempotency.rs`, `src/control/tests.rs` (SQL) | The retained legacy `org_id` columns (never dropped; new rows write the sentinel `@`). |
+| `src/config.rs`, `src/infrastructure/runtime.rs` | The list of obsolete IAM/Honeycomb variables the service warns about at boot. |
+| `src/api/headers.rs`, `src/api/mod.rs`, `src/domain/auth.rs`, `src/infrastructure/briefcase*.rs` | Refusing and redacting IAM-era credential headers. |
+| `src/control/mod.rs`, `src/control/tests.rs` | Retired routes answering `410 route_retired`, and their tests; the IAM-era data upgrade test. |
+| `cli/src/{args,main,retired,session}.rs`, `cli/tests/discovery.rs`, `client/tests/api.rs` | The hidden `waveform iam` transition alias, retired-flag refusals (`organizations_removed`), legacy-session detection, and tests asserting the help has none of these words. |
+| `deploy/native/{upgrade,accounts_cutover,install-frontend}.py` and their tests, `deploy/aws/install.py` | Lists of retired settings the tools remove or refuse, and the IAM-era env the cutover expects. |
+| `deploy/aws/standalone.json` | `AWS::IAM::Role` and friends: AWS's own IAM service. |
+| `API_DOCS.md` line 39, `docs/api.md` line 24 | Tell old integrations that an `X-Org-ID` header is ignored. |
+| `frontend/` (≈130 hits) | The IAM-era SolidJS website. The web stages replace it with `web/` and delete `frontend/`; until then CI keeps building it. |
+| `UNDERSTANDING.md` | Carbon-owned; the replacement text is in `understanding-proposal.md`. |
+| `decisions.md` (root) | Append-only record; the new entries supersede the IAM/Honeycomb ones. |
+
+The other D9 words (`human`, `AI agent`, `user account`, `team` as a grouping) appear only in `cli/tests/discovery.rs`
+(its forbidden-words list), `frontend/`, history, `UNDERSTANDING.md` and the root decisions record.
+
+### Blocked on
+
+- **Briefcase's Accounts-era contract** (unchanged from stage 1): until Briefcase ships it, TTS is held by Waveform
+  and STT cannot read sources; `cutover.md` orders Briefcase first.
+
+### Left for later stages
+
+- **Web (stages 7–8):** build `web/` from the kit and ship `web/Dockerfile` meeting the container contract in
+  `deploy/native/README.md` (Next.js standalone on `PORT=4325`, `HOSTNAME=0.0.0.0`, unprivileged, writes only `/tmp` and
+  `/app/.next/cache`, `GET /auth/session` 200, settings `APP_ID`, `APP_SECRET`, `ACCOUNTS_URL`, `APP_API_URL`,
+  `SESSION_SECRET`, `PUBLIC_URL`); point `ci.yml`'s `container`/`web-builds` jobs and `backend-release.yml`'s website job
+  at `web/`; delete `frontend/`.
+- **E2E (stage 4):** `scripts/dev-accounts.sh` / `scripts/e2e-accounts.sh` replace the retired mock-IAM harness;
+  scenario 7 can use `scripts/package-apps.sh`.
+- **Cutover:** everything in `cutover.md`, run by a Carbon: sign-in setup, webhook (`"events": null`), secrets, the
+  mapping, `accounts_cutover.py`, Interface's switch to proofs, uploads to Silicon Apps and crates.io.
+
+### Gotchas
+
+- Silicon Apps' webhook "recommended" picks leave out `custodian_change`; Waveform needs it. Register with Silicon
+  Accounts' `PUT /v1/apps/waveform/webhook` and `"events": null`.
+- The previous production binary cannot start on a database migrated past what it knows (`sqlx` `VersionMissing`),
+  so any rollback across migrations needs the database restored, not just files.
+- Accounts imports match by email/phone and may assign another id than the earlier handle; map principals from the
+  import record or `external_id`, not from ids alone.
+- `silicon-apps pack` on Windows writes every file 0644; pack Linux/macOS archives on unix runners (the release
+  workflow does).
+- PyYAML and actionlint are not on this Mac: a scratch venv (`pip install pyyaml==6.0.3`) and the checksum-verified
+  actionlint 1.7.7 release binary were used from the scratchpad.
