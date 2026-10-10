@@ -697,3 +697,7 @@ The actual Silicon UI registry now supplies all 62 component/foundation items. A
 Bounded paid OpenAI TTS and STT both pass: a 1.68-second clip is written to the new Briefcase service, then read back with the Accounts proof and transcribed correctly. Both jobs are retained in the new account history.
 
 Production Accounts-generated webhooks were configured centrally and signed deliveries succeeded. Exact native CLI archives passed six native runner proofs; the Apps catalog was published centrally. Existing IAM services and data remain separate and running.
+
+## Final release record — 2026-10-10
+
+The production backend and Silicon UI website, native Apps catalog, GitHub release, and crates.io packages are live. Final source pins, merged checks, real account/product evidence, backup isolation, cleanup and verification limits are recorded in [release-2026-10-10.md](release-2026-10-10.md). This supersedes earlier pending-production statuses.
