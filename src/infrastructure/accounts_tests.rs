@@ -4,7 +4,7 @@ use wiremock::{
     matchers::{header, header_exists, method, path},
 };
 
-use super::{AccountsGateway, ProofError};
+use super::{AccountsGateway, Lookup, LookupPurpose, ProofError};
 use crate::{
     application::ports::AccountsError,
     domain::auth::AuthFailure,
@@ -229,24 +229,89 @@ async fn lookups_and_revocations_tolerate_missing_records() -> TestResult {
         .respond_with(ResponseTemplate::new(503))
         .mount(&accounts.server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/accounts/G0ne"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(
+            json!({"error":{"code":"account_deleted","message":"The account G0ne was deleted at 2026-10-01T00:00:00Z."}}),
+        ))
+        .mount(&accounts.server)
+        .await;
     let gateway = AccountsGateway::new(&accounts.settings(""))?;
     // A malformed id names no account; an outage stays an outage.
-    assert!(
+    assert_eq!(
         gateway
-            .lookup_by_id("si:a-handle-far-too-long-to-be-valid")
-            .await?
-            .is_none()
+            .lookup_by_id(
+                "si:a-handle-far-too-long-to-be-valid",
+                LookupPurpose::Selector
+            )
+            .await?,
+        Lookup::NotFound
     );
     assert_eq!(
-        gateway.lookup_by_id("si:outage").await.map(|_| ()),
+        gateway
+            .lookup_by_id("si:outage", LookupPurpose::Selector)
+            .await
+            .map(|_| ()),
         Err(AccountsError::Unavailable)
     );
-    let silicon = gateway.lookup("K1E").await?.ok_or("account")?;
+    let Lookup::Found(silicon) = gateway.lookup("K1E", LookupPurpose::Authorization).await? else {
+        return Err("K1E should be found".into());
+    };
     assert_eq!(
         silicon.custodian.map(|custodian| custodian.uuid),
         Some("zQo".to_owned())
     );
-    assert!(gateway.lookup("nope").await?.is_none());
+    assert_eq!(
+        gateway.lookup("nope", LookupPurpose::Authorization).await?,
+        Lookup::NotFound
+    );
+    // A deleted account is told apart from one that never existed.
+    assert_eq!(
+        gateway.lookup("G0ne", LookupPurpose::Sweep).await?,
+        Lookup::Deleted
+    );
     assert_eq!(gateway.revoke_proof("proof-gone").await, Ok(()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn each_lookup_purpose_has_its_own_share_of_the_budget() -> TestResult {
+    let accounts = TestAccounts::start().await;
+    accounts.account("C4b", "carbon", "c:cab", None).await;
+    let gateway = AccountsGateway::new(&accounts.settings(""))?;
+    // Accounts that callers name may use at most 100 lookups a minute...
+    for _ in 0..100 {
+        gateway.lookup("C4b", LookupPurpose::Selector).await?;
+    }
+    assert_eq!(
+        gateway.lookup("C4b", LookupPurpose::Selector).await,
+        Err(AccountsError::Unavailable)
+    );
+    // ...the background check at most 50...
+    for _ in 0..50 {
+        gateway.lookup("C4b", LookupPurpose::Sweep).await?;
+    }
+    assert_eq!(
+        gateway.lookup("C4b", LookupPurpose::Sweep).await,
+        Err(AccountsError::Unavailable)
+    );
+    // ...so custodian checks still have the rest of the 300.
+    for _ in 0..150 {
+        gateway.lookup("C4b", LookupPurpose::Authorization).await?;
+    }
+    assert_eq!(
+        gateway.lookup("C4b", LookupPurpose::Authorization).await,
+        Err(AccountsError::Unavailable)
+    );
+    let requests = accounts
+        .server
+        .received_requests()
+        .await
+        .ok_or("requests")?;
+    assert_eq!(
+        requests.len(),
+        300,
+        "refused lookups never reach Silicon Accounts"
+    );
     Ok(())
 }

@@ -236,6 +236,9 @@ pub enum AuthFailure {
     ProofIssuerNotAllowed,
     /// The route does not accept proofs.
     ProofNotAccepted,
+    /// Waveform's stored record of the account is of the other kind (Carbon or
+    /// Silicon) than its credential: its earlier data was linked to the wrong account.
+    AccountRecordConflict,
 }
 
 impl AuthFailure {
@@ -259,6 +262,7 @@ impl AuthFailure {
             Self::ProofScopeMissing => "proof_scope_missing",
             Self::ProofIssuerNotAllowed => "proof_issuer_not_allowed",
             Self::ProofNotAccepted => "proof_not_accepted",
+            Self::AccountRecordConflict => "account_record_conflict",
         }
     }
 
@@ -271,6 +275,7 @@ impl AuthFailure {
                 | Self::ProofScopeMissing
                 | Self::ProofIssuerNotAllowed
                 | Self::ProofNotAccepted
+                | Self::AccountRecordConflict
         )
     }
 
@@ -320,6 +325,9 @@ impl AuthFailure {
             Self::ProofNotAccepted => {
                 "This route does not accept proofs; the account must call it with its own access token."
             }
+            Self::AccountRecordConflict => {
+                "Waveform's record of this account names the other kind of account (Carbon or Silicon) than its credential, so it holds another account's earlier data; Waveform shows none of it."
+            }
         }
     }
 
@@ -357,6 +365,9 @@ impl AuthFailure {
             }
             Self::ProofNotAccepted => {
                 "Call with Authorization: Bearer <the account's access token>."
+            }
+            Self::AccountRecordConflict => {
+                "Waveform's operator must correct the mapping that linked earlier data to this account (`waveform-api link-identities --relink`)."
             }
         }
     }
@@ -448,6 +459,7 @@ mod tests {
             AuthFailure::ProofScopeMissing,
             AuthFailure::ProofIssuerNotAllowed,
             AuthFailure::ProofNotAccepted,
+            AuthFailure::AccountRecordConflict,
         ];
         let reasons = all
             .iter()

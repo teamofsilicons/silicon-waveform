@@ -5,6 +5,8 @@
 //! data accept `?account=c:…|si:…|<uuid>`: a Carbon may select a Silicon it is
 //! the custodian of; anyone may select themselves; nothing else is allowed.
 
+#[cfg(test)]
+mod account_tests;
 mod accounts;
 mod audio;
 pub mod contracts;
@@ -46,7 +48,7 @@ use crate::{
     infrastructure::{
         authenticator::AccountsAuthenticator,
         briefcase::BriefcaseHttp,
-        directory::{AccountDirectory, AccountRecord},
+        directory::{AccountDirectory, AccountRecord, Confirm, Selection},
         held_audio::PostgresHeldAudio,
         storage_proofs::StorageProofs,
         vault::Vault,
@@ -191,11 +193,15 @@ impl ControlState {
         Ok(())
     }
 
-    /// Resolves `?account=` to the account whose data a route acts on.
+    /// Resolves `?account=` to the account whose data a route acts on. A Carbon
+    /// may name a Silicon it looks after: reads (`Confirm::Recent`) trust a
+    /// custodian Silicon Accounts confirmed in the last ten minutes, writes
+    /// (`Confirm::Always`) ask Silicon Accounts every time.
     async fn target(
         &self,
         caller: &Caller,
         selector: Option<&str>,
+        confirm: Confirm,
     ) -> Result<Target, ControlError> {
         let Some(selector) = selector.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(Target {
@@ -223,29 +229,29 @@ impl ControlState {
         if caller.record.kind != ActorKind::Carbon {
             return Err(not_custodian());
         }
-        let target = self
+        match self
             .directory()
-            .resolve_selector(selector)
-            .await
-            .map_err(ControlError::accounts)?
-            .ok_or_else(|| {
-                ControlError::not_found(
-                    "account_not_found",
-                    format!("No Silicon Accounts account has the id or uuid {selector}."),
-                )
-            })?;
-        if !self
-            .directory()
-            .is_custodian(&caller.record.uuid, &target)
+            .select_for_custodian(&caller.record.uuid, selector, confirm)
             .await
             .map_err(ControlError::accounts)?
         {
-            return Err(not_custodian());
+            Selection::Custodian(record) => Ok(Target {
+                record: *record,
+                as_custodian: true,
+            }),
+            Selection::NotCustodian => Err(not_custodian()),
+            Selection::NotFound => Err(ControlError::not_found(
+                "account_not_found",
+                format!("No Silicon Accounts account has the id or uuid {selector}."),
+            )),
+            Selection::Throttled => Err(ControlError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "account_lookup_limit",
+                "Naming this account needs a lookup at Silicon Accounts, and you reached the limit of 30 such lookups a minute.",
+            )
+            .with_hint("Wait a minute and retry, or name a Silicon by the uuid `waveform silicons` (GET /api/v1/silicons) shows; a Silicon Waveform already knows needs no lookup.")
+            .with_retry_after(60)),
         }
-        Ok(Target {
-            record: target,
-            as_custodian: true,
-        })
     }
 }
 
@@ -337,6 +343,7 @@ pub(crate) struct ControlError {
     message: Cow<'static, str>,
     hint: Option<&'static str>,
     reason: Option<&'static str>,
+    retry_after: Option<u32>,
 }
 
 impl ControlError {
@@ -347,11 +354,17 @@ impl ControlError {
             message: message.into(),
             hint: None,
             reason: None,
+            retry_after: None,
         }
     }
 
     const fn with_hint(mut self, hint: &'static str) -> Self {
         self.hint = Some(hint);
+        self
+    }
+
+    const fn with_retry_after(mut self, seconds: u32) -> Self {
+        self.retry_after = Some(seconds);
         self
     }
 
@@ -426,12 +439,13 @@ impl IntoResponse for ControlError {
             body["error"]["reason"] = json!(reason);
         }
         let mut response = (self.status, Json(body)).into_response();
-        if self.status == StatusCode::SERVICE_UNAVAILABLE
-            && let Ok(value) = http::HeaderValue::from_str("5")
-        {
+        let retry_after = self
+            .retry_after
+            .or((self.status == StatusCode::SERVICE_UNAVAILABLE).then_some(5));
+        if let Some(seconds) = retry_after {
             response
                 .headers_mut()
-                .insert(http::header::RETRY_AFTER, value);
+                .insert(http::header::RETRY_AFTER, http::HeaderValue::from(seconds));
         }
         response
     }

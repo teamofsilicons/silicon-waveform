@@ -20,7 +20,7 @@ use super::{ControlError, ControlState, accounts::AccountQuery};
 use crate::{
     application::ports::StorageAuthorityError,
     domain::auth::{InboundCredentials, WaveformAction},
-    infrastructure::storage_proofs::StorageProofStatus,
+    infrastructure::{directory::Confirm, storage_proofs::StorageProofStatus},
 };
 
 fn status_json(
@@ -42,7 +42,9 @@ pub(super) async fn approve(
     let caller = state
         .fresh_caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let target = state.target(&caller, query.account.as_deref()).await?;
+    let target = state
+        .target(&caller, query.account.as_deref(), Confirm::Recent)
+        .await?;
     if target.as_custodian {
         return Err(ControlError::forbidden(
             "approval_needs_the_account",
@@ -95,7 +97,9 @@ pub(super) async fn status(
     let caller = state
         .caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let target = state.target(&caller, query.account.as_deref()).await?;
+    let target = state
+        .target(&caller, query.account.as_deref(), Confirm::Recent)
+        .await?;
     let status = state.storage_proofs()?.status(target.storage_key()).await?;
     Ok(Json(status_json(
         target.record.uuid.as_str(),
@@ -112,7 +116,9 @@ pub(super) async fn revoke(
     let caller = state
         .fresh_caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let target = state.target(&caller, query.account.as_deref()).await?;
+    let target = state
+        .target(&caller, query.account.as_deref(), Confirm::Always)
+        .await?;
     let reason = if target.as_custodian {
         "revoked_by_custodian"
     } else {

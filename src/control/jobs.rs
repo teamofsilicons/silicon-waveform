@@ -2,7 +2,7 @@
 //! A custodian may read its Silicons' history (`?account=si:…`).
 
 use super::{ControlError, ControlState};
-use crate::domain::auth::WaveformAction;
+use crate::{domain::auth::WaveformAction, infrastructure::directory::Confirm};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -75,7 +75,9 @@ pub(super) async fn list(
     let caller = state
         .caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let target = state.target(&caller, filters.account.as_deref()).await?;
+    let target = state
+        .target(&caller, filters.account.as_deref(), Confirm::Recent)
+        .await?;
     crate::infrastructure::idempotency::recover_expired_jobs(&state.pool)
         .await
         .map_err(|_| {
@@ -154,7 +156,9 @@ pub(super) async fn get(
     let caller = state
         .caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let target = state.target(&caller, filter.account.as_deref()).await?;
+    let target = state
+        .target(&caller, filter.account.as_deref(), Confirm::Recent)
+        .await?;
     crate::infrastructure::idempotency::recover_expired_jobs(&state.pool)
         .await
         .map_err(|_| {

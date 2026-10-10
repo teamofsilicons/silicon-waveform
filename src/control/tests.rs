@@ -529,7 +529,7 @@ async fn credentials_are_refused_with_exact_reasons_before_any_data_access() -> 
 }
 
 /// Signs an account in once so Waveform knows it (and, for a Silicon, its custodian).
-async fn sign_in(
+pub(super) async fn sign_in(
     harness: &Harness,
     account: (&str, &str, &str),
 ) -> Result<Value, Box<dyn std::error::Error>> {
@@ -547,7 +547,7 @@ async fn sign_in(
 }
 
 /// Waits until the background custodian lookup filled a Silicon's custodian.
-async fn wait_for_custodian(harness: &Harness, silicon: &str) -> TestResult {
+pub(super) async fn wait_for_custodian(harness: &Harness, silicon: &str) -> TestResult {
     for _ in 0..100 {
         let custodian: Option<String> = sqlx::query_scalar(
             "SELECT custodian_uuid FROM waveform_accounts WHERE account_uuid=$1",
@@ -564,7 +564,10 @@ async fn wait_for_custodian(harness: &Harness, silicon: &str) -> TestResult {
     Err("custodian was never looked up".into())
 }
 
-async fn storage_key(harness: &Harness, account: &str) -> Result<Uuid, Box<dyn std::error::Error>> {
+pub(super) async fn storage_key(
+    harness: &Harness,
+    account: &str,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
     Ok(sqlx::query_scalar(
         "SELECT storage_actor_id FROM waveform_account_keys WHERE account_uuid=$1",
     )

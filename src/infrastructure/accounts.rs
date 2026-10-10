@@ -34,6 +34,36 @@ const INTROSPECTION_TTL: Duration = Duration::from_secs(30);
 const INTROSPECTION_CACHE_LIMIT: usize = 10_000;
 /// Accounts allows 600 lookups per minute per app; one replica uses at most half.
 const LOOKUPS_PER_MINUTE: u32 = 300;
+/// Of those, accounts that callers name (`?account=`) may use at most this many…
+const SELECTOR_LOOKUPS_PER_MINUTE: u32 = 100;
+/// …and the background account check at most this many, so custodian checks and a
+/// Silicon's first lookup always keep at least 150 a minute for themselves.
+const SWEEP_LOOKUPS_PER_MINUTE: u32 = 50;
+
+/// Why Waveform looks an account up. Each purpose has its own share of the
+/// per-minute lookup budget, so no caller can starve the others.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LookupPurpose {
+    /// Confirming a Silicon's custodian, a Silicon's first lookup, an operator
+    /// command. May use the whole budget.
+    Authorization,
+    /// Resolving an account a caller named (`?account=`); at most
+    /// [`SELECTOR_LOOKUPS_PER_MINUTE`].
+    Selector,
+    /// The background account check; at most [`SWEEP_LOOKUPS_PER_MINUTE`].
+    Sweep,
+}
+
+/// What Silicon Accounts answered about one account.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Lookup {
+    /// The account exists.
+    Found(Box<AccountSummary>),
+    /// No account has this uuid or id (or the value cannot be one).
+    NotFound,
+    /// The account was deleted (`404 account_deleted`, or status `deleted`).
+    Deleted,
+}
 
 /// Why a proof could not be issued or refreshed.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -74,6 +104,8 @@ struct JwksState {
 struct LookupBudget {
     window_started: Instant,
     used: u32,
+    selector: u32,
+    sweep: u32,
 }
 
 /// Shared, cheap-to-clone handle to Silicon Accounts for Waveform's app.
@@ -139,6 +171,8 @@ impl AccountsGateway {
             lookups: Mutex::new(LookupBudget {
                 window_started: Instant::now(),
                 used: 0,
+                selector: 0,
+                sweep: 0,
             }),
         })
     }
@@ -295,7 +329,7 @@ impl AccountsGateway {
             })
     }
 
-    fn spend_lookup(&self) -> Result<(), AccountsError> {
+    fn spend_lookup(&self, purpose: LookupPurpose) -> Result<(), AccountsError> {
         let mut budget = self
             .lookups
             .lock()
@@ -303,32 +337,55 @@ impl AccountsGateway {
         if budget.window_started.elapsed() >= Duration::from_secs(60) {
             budget.window_started = Instant::now();
             budget.used = 0;
+            budget.selector = 0;
+            budget.sweep = 0;
         }
-        if budget.used >= LOOKUPS_PER_MINUTE {
-            tracing::warn!("Silicon Accounts lookup budget exhausted for this minute");
+        let share = match purpose {
+            LookupPurpose::Authorization => None,
+            LookupPurpose::Selector => Some((budget.selector, SELECTOR_LOOKUPS_PER_MINUTE)),
+            LookupPurpose::Sweep => Some((budget.sweep, SWEEP_LOOKUPS_PER_MINUTE)),
+        };
+        if budget.used >= LOOKUPS_PER_MINUTE || share.is_some_and(|(used, limit)| used >= limit) {
+            tracing::warn!(
+                ?purpose,
+                "Silicon Accounts lookup budget exhausted for this minute"
+            );
             return Err(AccountsError::Unavailable);
         }
         budget.used += 1;
+        match purpose {
+            LookupPurpose::Authorization => {}
+            LookupPurpose::Selector => budget.selector += 1,
+            LookupPurpose::Sweep => budget.sweep += 1,
+        }
         Ok(())
     }
 
-    /// `GET /v1/accounts/{uuid}`; `Ok(None)` when no such account exists.
+    /// `GET /v1/accounts/{uuid}`.
     ///
     /// # Errors
     ///
     /// `Unavailable` (including an exhausted lookup budget) or `Timeout`.
-    pub async fn lookup(&self, uuid: &str) -> Result<Option<AccountSummary>, AccountsError> {
-        self.spend_lookup()?;
+    pub async fn lookup(
+        &self,
+        uuid: &str,
+        purpose: LookupPurpose,
+    ) -> Result<Lookup, AccountsError> {
+        self.spend_lookup(purpose)?;
         found(self.bounded(self.app().lookup(uuid)).await?)
     }
 
-    /// `GET /v1/accounts/by-id/{id}`; `Ok(None)` when no account has this id.
+    /// `GET /v1/accounts/by-id/{id}` (current ids only).
     ///
     /// # Errors
     ///
     /// `Unavailable` (including an exhausted lookup budget) or `Timeout`.
-    pub async fn lookup_by_id(&self, id: &str) -> Result<Option<AccountSummary>, AccountsError> {
-        self.spend_lookup()?;
+    pub async fn lookup_by_id(
+        &self,
+        id: &str,
+        purpose: LookupPurpose,
+    ) -> Result<Lookup, AccountsError> {
+        self.spend_lookup(purpose)?;
         found(self.bounded(self.app().lookup_by_id(id)).await?)
     }
 
@@ -432,14 +489,21 @@ impl AccountsGateway {
     }
 }
 
-fn found(
-    answer: Result<AccountSummary, ClientError>,
-) -> Result<Option<AccountSummary>, AccountsError> {
+fn found(answer: Result<AccountSummary, ClientError>) -> Result<Lookup, AccountsError> {
     match answer {
-        Ok(account) => Ok(Some(account)),
-        // A malformed id (`invalid_id`, e.g. too long) can belong to no account: the caller
-        // answers 404 naming it, not "Silicon Accounts is unavailable".
-        Err(error) if error.is_not_found() || error.is_code("invalid_id") => Ok(None),
+        Ok(account) if account.status == "deleted" => Ok(Lookup::Deleted),
+        Ok(account) => Ok(Lookup::Found(Box::new(account))),
+        // Silicon Accounts keeps a deleted account's uuid forever and answers this code for it.
+        Err(error) if error.is_code("account_deleted") => Ok(Lookup::Deleted),
+        // A malformed id or uuid (`invalid_id`, `invalid_uuid`, e.g. too long) can belong to no
+        // account: the caller answers 404 naming it, not "Silicon Accounts is unavailable".
+        Err(error)
+            if error.is_not_found()
+                || error.is_code("invalid_id")
+                || error.is_code("invalid_uuid") =>
+        {
+            Ok(Lookup::NotFound)
+        }
         Err(error) => {
             tracing::warn!(
                 code = error.code(),

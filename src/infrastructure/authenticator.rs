@@ -77,22 +77,30 @@ impl AccountsAuthenticator {
                 .and_then(public_id_kind)
                 .ok_or(AccountsError::Rejected(AuthFailure::InvalidToken))?,
         };
+        let issued_at = claims
+            .iat
+            .and_then(|iat| OffsetDateTime::from_unix_timestamp(iat).ok());
+        // The token's id was the account's id when it was issued.
         let record = self
             .directory
-            .sighting(&uuid, kind, claims.id.as_deref(), KeySource::SignIn)
+            .sighting(
+                &uuid,
+                kind,
+                claims.id.as_deref(),
+                issued_at,
+                KeySource::SignIn,
+            )
             .await
             .map_err(|_| AccountsError::Unavailable)?;
         if record.deleted_at.is_some() {
             return Err(AccountsError::Rejected(AuthFailure::AccountDeleted));
         }
-        if let Some(revoked_before) = record.revoked_before {
-            let issued_at = claims
-                .iat
-                .and_then(|iat| OffsetDateTime::from_unix_timestamp(iat).ok());
-            if issued_at.is_none_or(|issued_at| issued_at < revoked_before) {
-                return Err(AccountsError::Rejected(AuthFailure::SignInEnded));
-            }
+        if let Some(revoked_before) = record.revoked_before
+            && issued_at.is_none_or(|issued_at| issued_at < revoked_before)
+        {
+            return Err(AccountsError::Rejected(AuthFailure::SignInEnded));
         }
+        same_kind(&record, kind)?;
         let mut actor = authorized(
             &record,
             claims.id.clone(),
@@ -138,14 +146,22 @@ impl AccountsAuthenticator {
             None => public_id_kind(&user.id)
                 .ok_or(AccountsError::Rejected(AuthFailure::InvalidProof))?,
         };
+        // Silicon Accounts just verified the proof, so its id is the account's id now.
         let record = self
             .directory
-            .sighting(&uuid, kind, Some(&user.id), KeySource::Proof)
+            .sighting(
+                &uuid,
+                kind,
+                Some(&user.id),
+                Some(OffsetDateTime::now_utc()),
+                KeySource::Proof,
+            )
             .await
             .map_err(|_| AccountsError::Unavailable)?;
         if record.deleted_at.is_some() {
             return Err(AccountsError::Rejected(AuthFailure::AccountDeleted));
         }
+        same_kind(&record, kind)?;
         let mut actor = authorized(
             &record,
             Some(user.id.clone()),
@@ -155,6 +171,20 @@ impl AccountsAuthenticator {
         actor.scopes = proof.scopes;
         Ok(actor)
     }
+}
+
+/// An account is a Carbon or a Silicon for good, so a stored record of the other
+/// kind holds another account's data (a wrong cutover mapping): show neither.
+fn same_kind(record: &AccountRecord, kind: ActorKind) -> Result<(), AccountsError> {
+    if record.kind == kind {
+        return Ok(());
+    }
+    tracing::error!(
+        stored = record.kind.as_str(),
+        credential = kind.as_str(),
+        "an account's stored kind differs from its credential; its earlier data was linked to the wrong account"
+    );
+    Err(AccountsError::Rejected(AuthFailure::AccountRecordConflict))
 }
 
 fn authorized(

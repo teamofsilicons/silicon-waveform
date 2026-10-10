@@ -73,7 +73,9 @@ pub(super) async fn me(
         .into_response())
 }
 
-/// The Silicons Waveform knows that the signed-in Carbon looks after.
+/// The Silicons Waveform knows that the signed-in Carbon looks after, each one
+/// confirmed with Silicon Accounts in the last ten minutes. `complete` is false
+/// when some could not be confirmed just now (they are left out).
 pub(super) async fn silicons(
     State(state): State<Arc<ControlState>>,
     headers: HeaderMap,
@@ -81,12 +83,7 @@ pub(super) async fn silicons(
     let caller = state
         .caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let items = state
-        .directory()
-        .silicons_of(&caller.record.uuid)
-        .await?
-        .iter()
-        .map(account_json)
-        .collect::<Vec<_>>();
-    Ok(Json(json!({"items": items})))
+    let list = state.directory().silicons_of(&caller.record.uuid).await?;
+    let items = list.items.iter().map(account_json).collect::<Vec<_>>();
+    Ok(Json(json!({"items": items, "complete": list.complete})))
 }

@@ -23,6 +23,7 @@ use crate::domain::{
     idempotency::{ACCOUNT_SCOPE, SpeechOperation},
     provider::{ProviderName, STT_PROVIDER_CHAIN, TTS_PROVIDER_CHAIN},
 };
+use crate::infrastructure::directory::Confirm;
 
 /// `?account=` selector shared by the account routes.
 #[derive(Default, Deserialize)]
@@ -97,7 +98,9 @@ pub(super) async fn preferences(
     let caller = state
         .caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let target = state.target(&caller, query.account.as_deref()).await?;
+    let target = state
+        .target(&caller, query.account.as_deref(), Confirm::Recent)
+        .await?;
     state.ensure_preferences(target.storage_key()).await?;
     let row = sqlx::query("SELECT d.tts_order AS default_tts, d.stt_order AS default_stt, p.tts_order, p.stt_order, d.voice_profile AS default_voice_profile, p.voice_profile, COALESCE(p.telemetry_enabled,true) AS telemetry_enabled FROM waveform_provider_defaults d LEFT JOIN waveform_account_preferences p ON p.plane_id=d.plane_id AND p.org_id=$2 AND p.actor_id=$3 WHERE d.plane_id=$1")
         .bind(Uuid::nil()).bind(ACCOUNT_SCOPE).bind(target.storage_key()).fetch_one(&state.pool).await?;
@@ -135,7 +138,9 @@ pub(super) async fn update_preferences(
     let caller = state
         .caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let target = state.target(&caller, query.account.as_deref()).await?;
+    let target = state
+        .target(&caller, query.account.as_deref(), Confirm::Always)
+        .await?;
     if target.as_custodian {
         // A custodian changing a Silicon's settings must still be signed in right now.
         state.ensure_live(&caller).await?;
@@ -222,7 +227,9 @@ pub(super) async fn provider_keys(
     let caller = state
         .caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let target = state.target(&caller, query.account.as_deref()).await?;
+    let target = state
+        .target(&caller, query.account.as_deref(), Confirm::Recent)
+        .await?;
     let rows = sqlx::query("SELECT provider, max(updated_at) AS updated_at FROM waveform_provider_keys WHERE plane_id=$1 AND actor_id=$2 GROUP BY provider ORDER BY provider")
         .bind(Uuid::nil())
         .bind(target.storage_key())
@@ -264,7 +271,9 @@ pub(super) async fn put_provider_key(
     let caller = state
         .fresh_caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let target = state.target(&caller, query.account.as_deref()).await?;
+    let target = state
+        .target(&caller, query.account.as_deref(), Confirm::Always)
+        .await?;
     let encrypted = state
         .vault()?
         .seal(&body.api_key, &key_context(target.storage_key(), &provider))
@@ -296,7 +305,9 @@ pub(super) async fn delete_provider_key(
     let caller = state
         .fresh_caller(&headers, WaveformAction::ManageAccount)
         .await?;
-    let target = state.target(&caller, query.account.as_deref()).await?;
+    let target = state
+        .target(&caller, query.account.as_deref(), Confirm::Always)
+        .await?;
     sqlx::query(
         "DELETE FROM waveform_provider_keys WHERE plane_id=$1 AND actor_id=$2 AND provider=$3",
     )
