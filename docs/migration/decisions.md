@@ -355,3 +355,83 @@ client/CLI `>=0.6.0, <0.7.0`.
   account another id than its earlier handle and `by-id` matches current ids only.
 - **macOS and Windows archives** are built and checked but not uploaded: Silicon Apps has only Linux validation
   workers today and a release's packages cannot change, so those targets join a later release.
+
+## End-to-end stage (stage 4)
+
+### The local stack and the scripts
+
+- **`scripts/dev-accounts.sh` runs everything with one idempotent command** (Python behind a shell entry point, like
+  the packager, because it handles JSON and HTTP). Ports from Waveform's block: the API on 4161, a Briefcase stand-in
+  on 4162. Database `waveform_e2e` on `127.0.0.1:5460` (`--fresh-db` drops and recreates it; names that do not start
+  with `waveform_` are refused). Encryption keys are generated once into `.mig/dev/` (`0600`) and reused, so stored
+  Briefcase proofs survive restarts. The stack description comes from `WAVEFORM_DEV_STACK` or the untracked
+  `.mig/dev-accounts.env`, so no machine-specific path is committed. The script refuses a Silicon Accounts that is not
+  on this machine.
+- **Webhook:** `POST /v1/apps/waveform/webhook/generate-secret`, then `PUT /v1/apps/waveform/webhook` with
+  `"events": null` (every update, including custodian changes). The secret is reused while the URL still points at
+  the API; a signed ping must arrive, otherwise the script makes a new secret and restarts the API once. `stop` hands
+  the webhook back to the stack's fake app (`POST {fake_apps_url}/waveform/_connect-webhook`, which keeps its own new
+  secret), so the shared stack is left as it was found (`--keep-webhook` skips that).
+- **Sign-in setup:** the script only adds what local runs need, read-modify-write with `expected_version`. On the
+  shared stack Waveform offered only Apple and Google, so hosted email sign-in failed with `method_not_enabled`; the
+  script enabled `methods.email` (config version 2 → 3). The device flow, public client, callbacks and origins were
+  already there. Email stays enabled: Waveform's web stages sign in the same way.
+- **A Briefcase stand-in, not Briefcase itself:** this stage owns no other app's ports. The stand-in follows
+  Briefcase's Accounts-era branch (as of `1fb52fd`): every proof is verified with Silicon Accounts using Briefcase's
+  own development credentials; an app sees only `apps/{app}/`; an empty `parent_path` and a listing without a parent
+  mean that folder; the byte transfer takes only the upload capability; permanent URLs are `{origin}/{owner id}/{path}`.
+  `WAVEFORM_BRIEFCASE_BASE_URL` points the dev stack at a running Briefcase instead (the integration run).
+- **`scripts/e2e-accounts.sh`** uses new identities every run (`waveform-e2e-{c1,c2,s1}-<HHMMSS>`), at most eight email
+  codes per address, and waits 45 s once when the stack rate-limits codes. Sharing and "Silicons are not open to the
+  world" are recorded as not applicable: Waveform has nothing to share and no inbound action.
+
+### Briefcase proofs (defects the run found, fixed)
+
+- **A refused proof is renewed, once.** A User verification proof stands on the sign-in it was issued from; one
+  machine's `waveform logout` or the website's sign-out (`app_revoked`, which correctly does not end the account's other
+  sign-ins) ends it at Silicon Accounts, and Briefcase refuses it before its token expires. When Briefcase answers 401
+  to a stored proof, Waveform refreshes it under the account's lock: a live proof gets a new token; Silicon Accounts'
+  `details.reason` decides the rest:
+
+  | Refresh answer | Waveform |
+  | --- | --- |
+  | 200 | save the rotated pair, retry with the new token |
+  | 410 `revoked_by_account` / `revoked_by_owner` | mark the access revoked (`revoked_at_accounts`); speech is held until the account approves |
+  | any other refusal (`sign_in_revoked`, `sign_in_expired`, `refresh_token_reuse`, `access_removed`, expired…) | mark it ended (`proof_ended`) and issue a new one from the caller's own token, then retry |
+  | unreachable | keep the refusal (`briefcase_refused`) |
+
+  A request with an app's proof has no Waveform token for the account, so it can only refresh; otherwise it answers
+  `storage_authorization_required`. Another request's renewal is reused instead of refreshing twice.
+- **Revocations stick.** After `revoked_by_account`, `revoked_by_custodian` or `revoked_at_accounts`, speech is held with
+  `storage_not_authorized` and nothing is issued until `POST /api/v1/storage-authorizations` (`waveform storage
+  approve`), as the CLI help already promised. Every other end (expiry, a sign-in ended, access removed and given back)
+  is replaced on the account's next direct request ("the first speech request gives it").
+- **A new issuance gets a new proof.** The issue idempotency key was derived from the subject token alone, so
+  approving again with the same token after a revoke got the revoked proof replayed by Silicon Accounts and stored as
+  active. The key now also names the proof being replaced (a retry of one issuance still gets the same proof).
+- **The STT folder is learnt from its contents.** Briefcase hides `apps/` from an app, so listing it to find
+  `apps/waveform` always failed. Waveform now takes the folder id from the `parent_id` of an entry inside it (and still
+  reads a Briefcase that lists the container). An empty folder cannot be seen that way: `404 briefcase_folder_not_found`
+  with a hint (store one speech there first, or upload with your own Briefcase access). Recorded under "Blocked on".
+
+### Speech routes refuse `?account=`
+
+`/tts`, `/stt`, `/stt/source-target` and `/audio/{request_id}` answered as the caller and ignored `?account=si:…`. They
+now answer `400 speech_runs_as_yourself` with a hint, like the CLI: a custodian never speaks as a Silicon or fetches its
+audio, and silence could make an integration believe it had.
+
+### `/me` shows the account's name and photo
+
+Access tokens carry no name or photo and app lookups return neither, so `/me` showed `null` until an `account.updated`
+arrived. `/me` now reads them once from Silicon Accounts' userinfo with the account's own token (at most every 10
+minutes while unknown; a profile version older than the cached one is ignored).
+
+### Checked and kept
+
+- Revocation markers compare a token's whole-second `iat` with the event's millisecond time, so a sign-in made within
+  the same second after an end is refused once (signing in again a second later works, as the run shows). This is
+  the safe side; kept.
+- Selecting a Silicon by `si:` id always asks Silicon Accounts; by uuid it uses the cache. A former custodian selecting
+  by uuid keeps access until `silicon.custodian_changed` arrives (seconds in the run) or the 10-minute re-check;
+  selecting by id is refused at once. Kept: a missed webhook must not lock a new custodian out, and the old one's
+  window is short.

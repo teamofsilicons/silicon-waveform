@@ -444,3 +444,180 @@ The other D9 words (`human`, `AI agent`, `user account`, `team` as a grouping) a
   workflow does).
 - PyYAML and actionlint are not on this Mac: a scratch venv (`pip install pyyaml==6.0.3`) and the checksum-verified
   actionlint 1.7.7 release binary were used from the scratchpad.
+
+## 2026-10-10 — Stage 4 (end to end against Silicon Accounts)
+
+Waveform's API and CLI were run against the shared Silicon Accounts stack with real tokens, a real PostgreSQL and a
+Briefcase stand-in that verifies every proof with Briefcase's own credentials. The run found six defects; all are fixed
+with tests, and the whole suite is green: **114 passed, 0 failed, 2 not applicable**. Decisions:
+[`decisions.md`](decisions.md#end-to-end-stage-stage-4); production notes: [`cutover.md`](cutover.md).
+
+### What was added
+
+- `scripts/dev-accounts.sh start|stop|restart-api|status|env` (+ `dev_accounts.py`): database `waveform_e2e` on 5460,
+  keys in `.mig/dev/`, Waveform's sign-in setup on the stack (only additions), webhook to
+  `http://127.0.0.1:4161/webhooks/accounts` with a generated secret kept in `.mig/dev/webhook.secret`, the Briefcase
+  stand-in on 4162 (or `WAVEFORM_BRIEFCASE_BASE_URL`), the API on 4161, then a signed ping. `stop` hands the webhook
+  back to `http://127.0.0.1:9593/waveform/webhooks`. Local settings for this machine are in the untracked
+  `.mig/dev-accounts.env` (`WAVEFORM_DEV_STACK`, `WAVEFORM_E2E_MINT`, `WAVEFORM_E2E_TSX`, `WAVEFORM_E2E_ACCOUNTS_CLI`).
+- `scripts/dev_briefcase_stub.py`: Briefcase's delegated routes as its Accounts-era branch defines them (see decisions).
+- `scripts/e2e-accounts.sh [--only 1,2,…] [--keep-running] [--no-start]` (+ `e2e_accounts.py`): the eight scenarios,
+  PASS/FAIL per check, transcripts without secrets in `.mig/e2e/<run>/`.
+- `scripts/test_dev_tools.py` (in CI): the stand-in against a fake verify endpoint, and the dev script's safety rails.
+
+### Defects found and fixed
+
+First full run: `87 passed, 17 failed` (`.mig/logs/e2e/run-1.log`). Two of the 17 were the script's own (header-name
+casing; replay detection), the rest came from these defects:
+
+| # | Defect (evidence from the run) | Fix | Commit |
+| --- | --- | --- | --- |
+| 1 | `POST /api/v1/stt/source-target` and `waveform stt-folder` always `404 briefcase_folder_not_found`: Waveform listed `apps/`, which Briefcase hides from an app | folder id from the entries inside `apps/waveform`; an empty folder answers 404 with a hint | `5018508` |
+| 2 | after `DELETE /storage-authorizations`, `POST` answered the **same** `proof_id` (`01a123e9-f0d0-…` both times): the issue key came from the subject token only, so Silicon Accounts replayed the revoked proof, stored as active; speech then `briefcase_refused` | the key also names the proof being replaced | `5018508` |
+| 3 | after a revoke, the next TTS re-issued access by itself (status back to `active`), contradicting "revoke: speech is then held" | explicit revocations stick until approved | `5018508` |
+| 4 | after the Silicon's `waveform logout`, its next sign-in's TTS was held `briefcase_refused`: the stored proof died with the logged-out sign-in and kept being presented | on a Briefcase 401, refresh and classify; replace an ended proof, keep a revocation; retry once | `5018508` |
+| 5 | `POST /api/v1/tts?account=si:…` returned 200 and spoke as the caller | `400 speech_runs_as_yourself` on the four speech routes | `59b977a` |
+| 6 | `/api/v1/me` answered `display_name: null`, `pfp_url: null` for every account | profile from userinfo once, version-ordered | `9513121` |
+
+Each fix has a test that fails without it (checked by reverting each fix and re-running):
+
+| Mutation | Tests that failed |
+| --- | --- |
+| issue key ignores the replaced proof (#2) | `revoked_briefcase_access_stays_revoked_until_approved_and_approval_gets_a_new_proof` (`left: "proof-1"`, `right: "proof-2"`) |
+| explicit revocations re-issued (#3) | that test and `a_proof_briefcase_refuses_is_replaced_when_it_ended_but_an_account_revocation_is_kept` |
+| no renewal on a Briefcase 401 (#4) | 4 service unit tests (`a_refused_briefcase_proof_is_renewed_once…`, `a_refused_proof_that_cannot_be_renewed…`, `delegated_stt_renews…`, `tts_replay_renews…`) and the second DB test |
+
+#1 has two adapter tests (`the_stt_folder_is_found_through_what_is_inside_it`,
+`an_empty_stt_folder_hidden_from_waveform_is_not_found_and_a_listed_one_is_read`); #5 a unit test
+(`an_account_selector_is_found_in_any_spelling_of_the_query`) and a DB test (`speech_never_takes_an_account_selector`);
+#6 a DB test (`me_shows_the_accounts_profile_from_userinfo_once`); the gateway test now covers refusal reasons
+(`proof_refresh_is_idempotent_and_classifies_refusals`).
+
+### Commits
+
+`5018508` fix: keep Briefcase access working across sign-outs and keep revocations · `59b977a` fix: refuse an account
+selector on speech routes instead of ignoring it · `9513121` fix: show the account's name and photo from Silicon
+Accounts on /me · `c27cd39` test: run Waveform end to end against a Silicon Accounts development stack · `265bded` docs:
+describe Briefcase access recovery, speech refusals and the local end-to-end run · the commit that adds this section.
+Each fix commit's tree was checked alone (clippy `-D warnings`, unit and DB tests) before committing.
+
+### Tests (Rust env from stage 1; Postgres 16 on 5460; logs in `.mig/logs/e2e/`)
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` (root, `client/`, `cli/`) | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` (root, `client/`, `cli/`) | pass |
+| `cargo test --all-targets --all-features` | lib 181 passed / 13 ignored (DB); `postgres_idempotency` 8 ignored |
+| `WAVEFORM_TEST_DATABASE_URL=…/waveform_test cargo test --lib -- --ignored --test-threads=1` | 13 passed (9 earlier + 4 new) |
+| `WAVEFORM_TEST_DATABASE_URL=…/waveform_idem_test cargo test --test postgres_idempotency -- --ignored --test-threads=1` | 8 passed |
+| `cargo test --manifest-path client/Cargo.toml` | 5 + 13 + 9 + 4 doctests passed |
+| `cargo test --manifest-path cli/Cargo.toml` | 15 + 9 + 12 + 6 passed |
+| `python3 scripts/test_dev_tools.py` (also `-W error::ResourceWarning`) | 7 passed |
+| `python3 scripts/sync-cli-docs.py --check`; `npx @redocly/cli@1.34.5 lint openapi.yaml` | in sync; valid |
+| `cd docs-site && npm run build && npm run check` | 11 pages, links and anchors verified |
+| `actionlint` (1.7.7) on `.github/workflows/ci.yml` | clean |
+| `scripts/e2e-accounts.sh` (run `094633`, final, on the committed code) | **114 passed, 0 failed, 2 not applicable** |
+
+### The final run, trimmed (run `094633`; full transcript `.mig/e2e/094633/`, log `.mig/logs/e2e/run-final.log`)
+
+Identities: Carbon `c:waveform-e2e-c1-094633` (uuid `ztq`), its Silicon `si:waveform-e2e-s1-094633` (uuid `bM9`),
+unrelated Carbon `c:waveform-e2e-c2-094633` (uuid `N6S`). API `http://127.0.0.1:4161`, Silicon Accounts
+`http://localhost:9590`, Briefcase stand-in `http://127.0.0.1:4162`.
+
+```text
+[0 setup]  hosted email sign-in + PKCE + code exchange → scope profile; Silicon created under c1; c2 signed in
+[1 Carbon on the API]
+  PASS  GET /api/v1/me … display_name='Waveform E2e C1 094633' pfp_url='http://127.0.0.1:9594/pfp/carbon?id=ztq'
+  PASS  a first-party Silicon Accounts token is refused  [401 wrong_audience]
+  PASS  create / list / update (updated_at 04:16:34.61 → 04:16:35.73) / delete provider key openai  [204, 200, 204, 204 then []]
+  PASS  TTS stores the MP3 … [http://127.0.0.1:4162/c:waveform-e2e-c1-094633/apps/waveform/tts_20261010_041635_01a12406-….mp3]
+  PASS  same Idempotency-Key → same request_id; history lists and reads it; STT reads it back from Briefcase [200 gemini]
+  PASS  source-target names apps/waveform; access active with the four briefcase.* scopes
+  PASS  revoke → speech held storage_not_authorized, access stays revoked
+  PASS  approve again: POST issues a NEW proof  [new=01a12406-ec22-… old=01a12406-ebbc-…]; speech stored again
+  PASS  Briefcase saw only valid proofs issued by waveform for this Carbon, with the four scopes  [11 accepted call(s)]
+[2 Silicon on the CLI]
+  PASS  `waveform login --slt-stdin` (fresh SILICON_HOME); the SLT appears in no output and no file
+  PASS  `login status --json`: authenticated, uuid bM9, kind silicon, custodian ztq
+  PASS  tts (stored in si:…/apps/waveform), jobs, preferences set+show, provider-keys set+list, stt, stt-folder
+  PASS  `storage revoke` → tts held storage_not_authorized; `waveform audio` → 192514-byte MP3; `storage approve` → stored
+  PASS  `waveform logout` → {"revoked":true,"signed_out":true}; `login status --json` → {"authenticated":false} (exit 0)
+[3 device flow]
+  PASS  `waveform login` prints http://localhost:9590/device Z8RM-DJEQ; `mint.mts approve` → signed_in (method device)
+  PASS  `waveform me`; `waveform silicons` lists the Silicon
+[4 custodians and outsiders]
+  PASS  custodian: history (4 jobs), one job, preferences, provider key set/list/delete, Briefcase access
+  PASS  custodian cannot speak as the Silicon [400 speech_runs_as_yourself] nor approve for it [403 approval_needs_the_account]
+  PASS  the Silicon cannot select its custodian [403 not_custodian]
+  PASS  outsider: history/preferences/keys/storage of the Silicon [403 not_custodian]; its job [404]; c1's job [404];
+        c1's held audio [404 audio_not_found]; lists no Silicons
+  PASS  known limit: an empty Waveform folder → 404 briefcase_folder_not_found; after one TTS → apps/waveform
+  N/A   sharing by c: id, and unsharing (nothing to share); Silicons are not open to the world (no inbound action)
+[5 webhooks]
+  PASS  custodian changes the Silicon's id → Waveform shows si:waveform-e2e-s1r-094633 (account.id_changed: id_updated)
+  PASS  Silicon Accounts replays it (same event_id): delivered again, 2 attempts, recorded and applied once
+  PASS  `silicon-accounts login --silicon` + `login --app waveform -q | waveform login --slt-stdin`; its speech is
+        stored even though its earlier sign-in (and that sign-in's Briefcase proof) ended
+  PASS  `silicon-accounts apps remove waveform` → its earlier token 401 sign_in_ended (sign_ins_ended); CLI `me` exit 3;
+        `login status` {"authenticated":false}; its Briefcase access revoked
+  PASS  forged: other secret / stale timestamp / unsigned → 401 invalid_webhook_signature, nothing changed
+  PASS  a correctly signed delivery reusing the processed event_id → {"duplicate":true}
+  PASS  signing in again after removing access works
+  PASS  transfer to c2, accepted → silicon.custodian_changed: c1 refused by uuid and by id [403 not_custodian];
+        c2 lists the Silicon and reads its history; the Silicon's /me names c2
+[6 proofs]
+  PASS  interface proof (waveform.tts + waveform.stt): TTS held delegated_call; the app downloads the MP3 (184364 bytes);
+        `waveform tts --proof-file` in an empty home; history records issuing_app interface; STT for the app works
+  PASS  refused: proof for briefcase [401 invalid_proof]; without waveform.tts [403 proof_scope_missing]; on /me
+        [403 proof_not_accepted]; revoked [401 invalid_proof]; dm on waveform.tts [403 proof_issuer_not_allowed];
+        dm on waveform.stt accepted
+  PASS  issuer: every proof Waveform sent Briefcase verified at Silicon Accounts with Briefcase's credentials
+        [33 accepted, 1 refused: the proof that ended with the Silicon's logout, then renewed]
+  PASS  refresh near expiry: same proof_id, new token (expires +30 min), Briefcase accepts it
+  PASS  Briefcase down (503 injected): held briefcase_unavailable, owner downloads, other account 404; next one stored
+  PASS  account revokes the proof at Silicon Accounts → held storage_not_authorized, access revoked/revoked_at_accounts;
+        approve → stored
+[7 discovery from a package]
+  PASS  release build; scripts/package-apps.sh 0.6.0 macos-aarch64 (PACKAGE_DISCOVERY=require) → sha256 43d56d1f…
+  PASS  archive = apps.yaml + bin/waveform; --help (14967 bytes), accounts --json, login status --json in an empty home;
+        nothing written; `silicon-apps validate` valid (local only)
+[8 restart safety]
+  PASS  restart (pid 27030 → 27459); same Carbon token works; device-flow CLI sign-in works; processed event_id still
+        a duplicate; stored Briefcase proof decrypts and works; Silicon Accounts still delivers signed events
+114 passed, 0 failed, 2 not applicable
+```
+
+No token, secret, short-lived token or proof appeared in the API log (`grep` for `sa_app_`, `whsec_`, `sap_`, `sapr_`,
+`slt_`, `eyJ`: none). Everything this stage started was stopped; no process listens on 4160-4179; Waveform's webhook on
+the stack points at `http://127.0.0.1:9593/waveform/webhooks` again.
+
+### Blocked on
+
+- **Briefcase: an app cannot read its own empty folder's entry.** Briefcase's Accounts-era branch shows a proof only
+  `apps/{app}/` and what is inside it. `POST /api/v1/obo/entries/list {"path":"apps"}` with Waveform's proof answers
+  `404` (the container is hidden), and `{"path":null,"parent_id":null}` lists the folder's contents but not the folder.
+  So for an account whose `apps/waveform` is still empty, `POST /api/v1/stt/source-target` answers
+  `404 briefcase_folder_not_found` ("…it is still empty", hint: store one speech first or upload with your own
+  Briefcase access). Asked of Briefcase: return the listed folder itself (e.g. a `folder` entry in the
+  `obo/entries/list` answer) or show the app its own folder when it lists `apps/`.
+- **Interface's voice transcripts** copy the recording into `apps/waveform` before calling Waveform's STT. With
+  Briefcase's confinement an Interface proof reaches only `apps/interface/`, so that copy needs Briefcase's first-party
+  exception for Interface (its part 3 decision). Recorded in `cutover.md` (section 3, step 4).
+
+### Left for later stages
+
+- **Integration:** run the dev stack with `WAVEFORM_BRIEFCASE_BASE_URL=http://127.0.0.1:4101` (and the Briefcase
+  permanent origin) against Briefcase's service, and re-run scenario 6 with real Briefcase.
+- **Web (stages 7–8):** sign in through the hosted pages (email is enabled for Waveform on the stack), use
+  `GET /api/v1/me` for the account menu, and show `storage.reason` (`storage_not_authorized` after a revoke).
+
+### Gotchas
+
+- Waveform's sign-in setup on the shared stack had email codes off, so `mint.mts app-signin` failed with
+  `method_not_enabled`; `dev-accounts.sh start` turns them on (config version 3).
+- `GET /v1/apps/{app}/signin-config` answers 405; the setup and `config_version` are in `GET /v1/apps/{app}`.
+- `PUT /v1/apps/{app}/webhook` keeps the stored secret (`"secret": null`); use `generate-secret` first to know it.
+- Silicon Accounts skips replays of an account's events after that account removed the app's access
+  (`membership_inactive`), and a replay resets a delivery's `attempt_count` (count the `attempts` list instead).
+- Idempotency keys shorter than 8 characters are refused (`invalid_request`).
+- `psql -At` prints a concatenated boolean as `true`, not `t`.

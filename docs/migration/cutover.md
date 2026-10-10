@@ -197,7 +197,12 @@ PY
 4. **Release the Silicon Interface** with User verification proofs for `receiving_app` `waveform` (scopes
    `waveform.tts` and/or `waveform.stt`) on `POST /api/v1/tts`, `POST /api/v1/stt`, `POST /api/v1/stt/source-target`
    and `GET /api/v1/audio/{request_id}`. TTS answers to a proof carry `storage.status = "held"` and an `audio_url`
-   Interface downloads with the same proof.
+   Interface downloads with the same proof. Interface's voice transcripts copy the recording into the account's
+   Waveform folder (`apps/waveform`, from `POST /api/v1/stt/source-target`) before calling `POST /api/v1/stt`; on
+   Briefcase's Accounts-era release an app's proof reaches only its own `apps/{app}/` folder, so that copy needs
+   Briefcase's first-party exception for Interface (Briefcase's part 3 decision) or another hand-over. Check it in the
+   integration run before this window: without it, voice transcripts from Interface fail while Waveform's own STT
+   (sources in `apps/waveform`) works.
 
 5. **Replace the website**: `python3 install-frontend.py --image <website image digest>`. It writes
    `/etc/waveform/web.env` (the app secret from `native.env`, a new session secret) and checks `/auth/session`.
@@ -322,5 +327,9 @@ IAM `oac_…` token is refused before anything is sent (`slt_not_a_short_lived_t
   (`organizations_removed`, naming the fix): drop them. Its `app_configs.waveform.default_tts_provider: google` is not
   a Waveform provider id: use `gemini`.
 - **Silicon Interface:** the switch to proofs in section 3, step 4, in the same window.
-- **Briefcase:** its Accounts-era release first (section 1). Waveform's assumptions about Briefcase's new routes are
-  listed in [decisions](decisions.md#briefcase-waveform--briefcase) for the integration run to reconcile.
+- **Briefcase:** its Accounts-era release first (section 1), with `waveform` allowed for `briefcase.uploads.reserve`,
+  `briefcase.uploads.commit`, `briefcase.entries.list` and `briefcase.files.read` in `BRIEFCASE_PROOF_ISSUERS` (its
+  production value in Briefcase's decisions does). Waveform's assumptions about Briefcase's routes are listed in
+  [decisions](decisions.md#briefcase-waveform--briefcase); the end-to-end run checked them against a stand-in built
+  from Briefcase's Accounts-era branch (proof checks, `apps/{app}/` confinement, `{origin}/{owner id}/{path}` URLs),
+  and the integration run checks them against Briefcase itself.
