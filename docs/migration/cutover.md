@@ -335,3 +335,16 @@ IAM `oac_…` token is refused before anything is sent (`slt_not_a_short_lived_t
   and the integration run checks them against Briefcase itself.
 
 Review correction: identity mappings are verified online for existence and kind even on dry runs. Review every source-to-target identity manually; matching mutable handles alone does not establish ownership. `--merge` cannot merge two different legacy identities. `--relink` is only a pre-use cutover correction: it refuses activity written after the previous link and preserves the old account's sign-out/deletion fence.
+
+## Accounts 128-bit UUID backfill
+
+Stop Waveform API/workers alongside the coordinated Accounts cutover and back up PostgreSQL. Apply release migrations through0020 first. Obtain the single persisted Accounts CSV with exact header `old_uuid,new_uuid,kind`; it includes deleted accounts. Do not independently generate UUIDs.
+
+```sh
+WAVEFORM_DATABASE_URL=... python3 scripts/migrate_account_uuids.py /secure/accounts-uuid-map.csv
+WAVEFORM_DATABASE_URL=... python3 scripts/migrate_account_uuids.py /secure/accounts-uuid-map.csv --apply
+```
+
+Inspect the dry-run counts, then apply the same file. The importer uses one transaction and records immutable mappings; repeating the same file changes nothing, while collisions or a changed mapping roll back. Keep the export with the coordinated backup. Rollback requires restoring Accounts and every app backup together, before writers resume. Never reverse only Waveform while Accounts uses new subjects.
+
+Private Waveform storage UUIDs and encrypted provider data remain intact. Old subjects are fenced; the new token identifies the existing storage key. Accounts revokes account token/proof families at this cutover: browsers/CLIs must sign in again. Saved Briefcase proof metadata remains visible with `account_uuid_migrated`; the account must approve storage again. Deploy this release before issuing UUID-shaped subjects and verify new sign-in → existing history/key access → explicit storage approval → actual Briefcase write/read. Existing human public handles and file URLs remain unchanged.

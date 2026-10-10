@@ -145,6 +145,15 @@ impl Harness {
         schema: String,
         issuers: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::over_with_mail(pool, schema, issuers, None).await
+    }
+
+    pub(super) async fn over_with_mail(
+        pool: PgPool,
+        schema: String,
+        issuers: &str,
+        mail: Option<super::reporting::Mail>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let accounts = TestAccounts::start().await;
         let briefcase = MockServer::start().await;
         let accounts_settings = accounts.settings(issuers);
@@ -174,7 +183,7 @@ impl Harness {
         let held_audio = PostgresHeldAudio::new(pool.clone(), Duration::from_hours(24));
         let state = Arc::new(ControlState {
             pool: pool.clone(),
-            mail: None,
+            mail,
             station: None,
             app_id: "waveform".to_owned(),
             accounts_url: accounts.issuer(),
@@ -2246,6 +2255,66 @@ async fn revoked_briefcase_access_stays_revoked_until_approved_and_approval_gets
     assert_eq!(
         briefcase_access(&harness, &fresh).await?["proof_id"],
         "proof-3"
+    );
+    harness.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn uuid_backfill_rejects_old_subject_and_requires_storage_reauthorization() -> TestResult {
+    let harness = Harness::new("").await?;
+    harness.accounts.introspection(true).await;
+    let keys = issues_numbered_proofs(&harness.accounts).await;
+    briefcase_accepts_uploads(&harness.briefcase).await;
+    sign_in(&harness, ADA).await?;
+    let old = bearer(&harness.token(ADA));
+    assert_eq!(
+        speak(&harness, &old, "before-uuid").await?["storage"]["status"],
+        "stored"
+    );
+    // Execute the same SQL the offline consumer uses, against this isolated schema.
+    let output = std::process::Command::new("python3")
+        .args(["-c", "import sys;sys.path.insert(0,'scripts');from migrate_account_uuids import migration_sql;print(migration_sql([('zQo','f858d0b5-98ba-4a4d-8ce5-114e93136f23','carbon')],True))"])
+        .output()?;
+    assert!(output.status.success());
+    sqlx::raw_sql(sqlx::AssertSqlSafe(String::from_utf8(output.stdout)?))
+        .execute(&harness.pool)
+        .await?;
+    let (status, _) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/me",
+        &[("authorization", &old)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let fresh_identity = ("f858d0b5-98ba-4a4d-8ce5-114e93136f23", "carbon", "c:ada");
+    sign_in(&harness, fresh_identity).await?;
+    let fresh = bearer(&harness.token(fresh_identity));
+    assert_eq!(
+        briefcase_access(&harness, &fresh).await?["revoked_reason"],
+        "account_uuid_migrated"
+    );
+    let held = speak(&harness, &fresh, "after-uuid").await?;
+    assert_eq!(
+        held["storage"]["reason"], "storage_not_authorized",
+        "{held}"
+    );
+    assert_eq!(keys.lock().map_or(0, |keys| keys.len()), 1);
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/storage-authorizations",
+        &[("authorization", &fresh)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["briefcase"]["proof_id"], "proof-2");
+    assert_eq!(
+        speak(&harness, &fresh, "approved-uuid").await?["storage"]["status"],
+        "stored"
     );
     harness.finish().await
 }

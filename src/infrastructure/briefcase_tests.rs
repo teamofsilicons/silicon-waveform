@@ -344,3 +344,26 @@ async fn an_empty_stt_folder_hidden_from_waveform_is_not_found_and_a_listed_one_
     assert_eq!(target.folder_id, folder);
     Ok(())
 }
+
+#[tokio::test]
+async fn an_empty_stt_folder_is_identified_by_its_authorized_listing_metadata() -> TestResult {
+    let storage = MockServer::start().await;
+    let folder = Uuid::new_v4();
+    Mock::given(method("POST")).and(path("/api/v1/obo/entries/list"))
+        .and(body_partial_json(json!({"path":null})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[],"folder":{"id":folder,"type":"folder","path":"apps/waveform","origin_app_id":"waveform"}})))
+        .expect(1).mount(&storage).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/entries/list"))
+        .and(body_partial_json(json!({"path":"apps"})))
+        .respond_with(ResponseTemplate::new(403))
+        .expect(0)
+        .mount(&storage)
+        .await;
+    let adapter = BriefcaseHttp::new(&settings(&storage)?, "waveform")?;
+    let target = adapter
+        .prepare_source_target(&proof()?, RequestId::new(Uuid::new_v4())?)
+        .await?;
+    assert_eq!(target.folder_id, folder);
+    Ok(())
+}

@@ -210,6 +210,155 @@ impl ControlState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one concurrent report lifecycle exercises queue, quota and delivery atomically"
+    )]
+    async fn reports_are_idempotent_rate_limited_and_delivered_once()
+    -> super::super::tests::TestResult {
+        use super::super::tests::{ADA, BOB, Harness, bearer, database, send, sign_in};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+        let mail = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/email"))
+            .and(header("X-Postmark-Server-Token", "fixture-mail-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ErrorCode":0,"MessageID":"fixture-accepted"})),
+            )
+            .mount(&mail)
+            .await;
+        let (pool, schema) = database().await?;
+        let harness = Harness::over_with_mail(
+            pool,
+            schema,
+            "",
+            Some(Mail {
+                token: "fixture-mail-token".into(),
+                endpoint: format!("{}/email", mail.uri()).parse()?,
+            }),
+        )
+        .await?;
+        for account in [ADA, BOB] {
+            sign_in(&harness, account).await?;
+        }
+        let auth = bearer(&harness.token(ADA));
+        let headers = [
+            ("authorization", auth.as_str()),
+            ("idempotency-key", "browser-report"),
+        ];
+        let payload =
+            json!({"message":"The voice selector needs attention.","client_version":"test"});
+        let (first, replay) = tokio::join!(
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &headers,
+                Some(payload.clone())
+            ),
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &headers,
+                Some(payload.clone())
+            )
+        );
+        let (status, first) = first?;
+        let (again, replay) = replay?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+        assert_eq!(again, StatusCode::ACCEPTED, "{replay}");
+        assert_eq!(first["id"], replay["id"]);
+        assert_eq!(
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &headers,
+                Some(json!({"message":"Changed payload"}))
+            )
+            .await?
+            .0,
+            StatusCode::CONFLICT
+        );
+        for i in 1..10 {
+            let key = format!("report-{i}");
+            assert_eq!(
+                send(
+                    &harness.app,
+                    "POST",
+                    "/api/v1/reports",
+                    &[("authorization", &auth), ("idempotency-key", &key)],
+                    Some(payload.clone())
+                )
+                .await?
+                .0,
+                StatusCode::ACCEPTED
+            );
+        }
+        assert_eq!(
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &[
+                    ("authorization", &auth),
+                    ("idempotency-key", "report-eleven")
+                ],
+                Some(payload.clone())
+            )
+            .await?
+            .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // A replay still succeeds at quota, and another account has its own quota.
+        assert_eq!(
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &headers,
+                Some(payload.clone())
+            )
+            .await?
+            .0,
+            StatusCode::ACCEPTED
+        );
+        let bob = bearer(&harness.token(BOB));
+        assert_eq!(
+            send(
+                &harness.app,
+                "POST",
+                "/api/v1/reports",
+                &[
+                    ("authorization", &bob),
+                    ("idempotency-key", "browser-report")
+                ],
+                Some(payload)
+            )
+            .await?
+            .0,
+            StatusCode::ACCEPTED
+        );
+        for _ in 0..12 {
+            assert!(harness.state.deliver_report().await.is_ok());
+        }
+        let requests = mail.received_requests().await.ok_or("mail requests")?;
+        assert_eq!(requests.len(), 11);
+        let sent: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM waveform_bug_reports WHERE status='sent'")
+                .fetch_one(&harness.pool)
+                .await?;
+        assert_eq!(sent, 11);
+        harness.finish().await
+    }
+
     #[test]
     fn validates_reports_before_storage() {
         let report = |message: &str, pr: Option<&str>| Report {

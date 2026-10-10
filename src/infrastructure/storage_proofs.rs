@@ -39,10 +39,11 @@ const MINIMUM_REMAINING: time::Duration = time::Duration::seconds(60);
 /// Accounts) or its custodian. Speech never gives the access back by itself after one of these; the
 /// account approves again (`waveform storage approve`). Every other end (the sign-in it stood on ended,
 /// expiry, access removed and given again) is replaced on the account's next direct request.
-const EXPLICIT_REVOCATIONS: [&str; 3] = [
+const EXPLICIT_REVOCATIONS: [&str; 4] = [
     "revoked_by_account",
     "revoked_by_custodian",
     "revoked_at_accounts",
+    "account_uuid_migrated",
 ];
 
 fn is_explicit(reason: Option<&str>) -> bool {

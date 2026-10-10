@@ -133,7 +133,9 @@ impl FromStr for AccountUuid {
                 max_length: MAX_ACCOUNT_UUID_LENGTH,
             });
         }
-        if !value.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        if !value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            && !Uuid::parse_str(value).is_ok_and(|uuid| uuid.hyphenated().to_string() == value)
+        {
             return Err(IdentityError::InvalidCharacters {
                 field: "account uuid",
             });
@@ -345,7 +347,12 @@ mod tests {
     use super::{AccountUuid, ActorKind, ApplicationId, IdentityError, RequestId, public_id_kind};
 
     #[test]
-    fn account_uuids_are_case_sensitive_base62_text() {
+    fn account_uuids_accept_canonical_uuids_and_case_sensitive_legacy_keys() {
+        let canonical = "bd5d6e33-3eec-470f-9a28-2efb2c1ef1c9";
+        assert_eq!(
+            AccountUuid::from_str(canonical).map(|v| v.to_string()),
+            Ok(canonical.to_owned())
+        );
         let upper = AccountUuid::from_str("zQo");
         let lower = AccountUuid::from_str("zqo");
         assert!(upper.is_ok());

@@ -811,3 +811,53 @@ async fn the_background_check_fills_a_linked_silicons_custodian() -> TestResult 
     assert_eq!(listed["complete"], true);
     harness.finish().await
 }
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn canonical_128_bit_accounts_reach_tokens_custodians_and_pending_events() -> TestResult {
+    const OWNER: (&str, &str, &str) = (
+        "bd5d6e33-3eec-470f-9a28-2efb2c1ef1c9",
+        "carbon",
+        "c:uuid-owner",
+    );
+    const CHILD: (&str, &str, &str) = (
+        "3ab13a61-b343-40c1-ad13-54b1a071a10a",
+        "silicon",
+        "si:uuid-child",
+    );
+    let harness = Harness::new("").await?;
+    harness
+        .accounts
+        .account(OWNER.0, OWNER.1, OWNER.2, None)
+        .await;
+    harness
+        .accounts
+        .account(CHILD.0, CHILD.1, CHILD.2, Some((OWNER.0, OWNER.2)))
+        .await;
+    harness.accounts.introspection(true).await;
+    for account in [OWNER, CHILD] {
+        sign_in(&harness, account).await?;
+    }
+    wait_for_custodian(&harness, CHILD.0).await?;
+    let auth = bearer(&harness.token(OWNER));
+    assert_eq!(me(&harness, &auth).await?["account"]["uuid"], OWNER.0);
+    let (status, body) = send(
+        &harness.app,
+        "GET",
+        &format!("/api/v1/preferences?account={}", CHILD.0),
+        &[("authorization", &auth)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["account"]["uuid"], CHILD.0);
+    let missing = "fbe924cb-f88a-4191-bac3-240bc88c5ce0";
+    let deleted = event(
+        "account.deleted",
+        json!({"uuid":missing,"kind":"carbon","id":"c:uuid-gone"}),
+    );
+    assert_eq!(deliver(&harness.app, &deleted).await?.0, StatusCode::OK);
+    let pending:i64=sqlx::query_scalar("SELECT count(*) FROM waveform_account_pending_events WHERE account_uuid=$1 AND deleted_at IS NOT NULL").bind(missing).fetch_one(&harness.pool).await?;
+    assert_eq!(pending, 1);
+    harness.finish().await
+}

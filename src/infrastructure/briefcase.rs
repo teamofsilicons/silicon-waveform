@@ -154,6 +154,8 @@ impl Entry {
 struct EntryPage {
     items: Vec<Entry>,
     #[serde(default)]
+    folder: Option<Entry>,
+    #[serde(default)]
     next_cursor: Option<String>,
 }
 
@@ -541,9 +543,9 @@ impl BriefcaseHttp {
     /// so a caller can put STT source audio there.
     ///
     /// Briefcase shows an app only what is inside `apps/{app}/`, not `apps/`
-    /// itself, so the folder's id comes from the entries in it (their
-    /// `parent_id`); a Briefcase that also lists the `apps/` container is read
-    /// as before.
+    /// itself. Current Briefcase includes the listed folder as metadata, including
+    /// when empty. Earlier responses are supported through a child's `parent_id`
+    /// or an explicitly accessible apps/ container.
     ///
     /// # Errors
     ///
@@ -557,6 +559,20 @@ impl BriefcaseHttp {
     ) -> Result<SourceTarget, BriefcaseError> {
         // Listing with no parent opens Waveform's folder, creating it on first use.
         let page = self.list(proof, None, None, 1, request_id).await?;
+        if let Some(folder) = page.folder.as_ref().filter(|folder| {
+            folder.path == self.app_folder
+                && folder.is_folder()
+                && folder.is_live()
+                && folder
+                    .origin_app_id
+                    .as_deref()
+                    .is_none_or(|app| app == self.waveform_app_id)
+        }) {
+            return Ok(SourceTarget {
+                folder_id: folder.id,
+                folder_path: self.app_folder.clone(),
+            });
+        }
         let prefix = format!("{}/", self.app_folder);
         if let Some(folder_id) = page
             .items
