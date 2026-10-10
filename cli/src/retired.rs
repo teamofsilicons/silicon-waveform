@@ -77,10 +77,31 @@ fn command_error(command: &str, next: Option<&str>) -> Option<CliError> {
     Some(error)
 }
 
+/// `--account` selects a Silicon a Carbon looks after, for its data only: speech and Briefcase
+/// approval always act as the signed-in account.
+fn account_error(command: &str, subcommand: Option<&str>) -> Option<CliError> {
+    match (command, subcommand) {
+        ("tts" | "stt" | "stt-folder" | "audio", _) => Some(refuse(
+            "speech_runs_as_yourself",
+            &format!(
+                "`waveform {command}` always runs as the signed-in account; --account only selects a Silicon you look after for its history, settings, provider keys and Briefcase access status."
+            ),
+            "Drop --account. A custodian never speaks for its Silicon: the Silicon runs the command signed in as itself (silicon-accounts login --app waveform -q | waveform login --slt-stdin).",
+        )),
+        ("storage", Some("approve")) => Some(refuse(
+            "approval_by_the_account_only",
+            "Only the account itself can give Waveform Briefcase access, because the proof is made from its own sign-in; --account is not accepted on `storage approve`.",
+            "The Silicon runs `waveform storage approve` signed in as itself (or just its next `waveform tts`). You can see or revoke the access with `waveform storage status|revoke --account si:<id>`.",
+        )),
+        _ => None,
+    }
+}
+
 /// Returns the refusal for the first retired flag or command in `argv`, if any.
 pub fn check(argv: &[OsString]) -> Option<CliError> {
     let mut command: Option<String> = None;
-    let mut subcommand_checked = false;
+    let mut subcommand: Option<String> = None;
+    let mut account_flag = false;
     let mut skip_value = false;
     for arg in argv.iter().skip(1) {
         let Some(arg) = arg.to_str() else {
@@ -101,6 +122,7 @@ pub fn check(argv: &[OsString]) -> Option<CliError> {
             if let Some(error) = flag_error(&name) {
                 return Some(error);
             }
+            account_flag |= name == "--account";
             // Only this version's global value options consume the next argument (they may
             // appear anywhere); an unknown flag is left to clap.
             if VALUE_OPTIONS.contains(&name.as_str()) && !arg.contains('=') {
@@ -120,16 +142,19 @@ pub fn check(argv: &[OsString]) -> Option<CliError> {
             }
             // Only the word right after the command can be a retired subcommand; later
             // words are values, but the flags after them are still checked.
-            Some(first) if !subcommand_checked => {
-                subcommand_checked = true;
+            Some(first) if subcommand.is_none() => {
                 if let Some(error) = command_error(first, Some(arg)) {
                     return Some(error);
                 }
+                subcommand = Some(arg.to_owned());
             }
             Some(_) => {}
         }
     }
-    None
+    match (&command, account_flag) {
+        (Some(command), true) => account_error(command, subcommand.as_deref()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -210,5 +235,35 @@ mod tests {
         assert_eq!(run(&["tts", "--", "--org"]), None);
         assert_eq!(run(&["login", "status", "--json"]), None);
         assert_eq!(run(&["storage", "approve"]), None);
+    }
+
+    #[test]
+    fn account_selection_is_refused_where_only_the_account_itself_may_act() {
+        for args in [
+            vec!["tts", "Hi", "--account", "si:scout"],
+            vec!["stt", "https://b.test/a.mp3", "--account=si:scout"],
+            vec![
+                "audio",
+                "0192b9f0-0000-7000-8000-000000000001",
+                "--account",
+                "si:scout",
+            ],
+        ] {
+            assert_eq!(
+                run(&args).as_deref(),
+                Some("speech_runs_as_yourself"),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            run(&["storage", "approve", "--account", "si:scout"]).as_deref(),
+            Some("approval_by_the_account_only")
+        );
+        assert_eq!(run(&["storage", "status", "--account", "si:scout"]), None);
+        assert_eq!(run(&["jobs", "--account", "si:scout"]), None);
+        assert_eq!(
+            run(&["tts", "Hi", "--accounts-url", "http://localhost:9590"]),
+            None
+        );
     }
 }

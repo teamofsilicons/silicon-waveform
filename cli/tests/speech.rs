@@ -248,11 +248,16 @@ async fn a_custodian_selects_a_silicon_for_its_data_and_never_for_speech() {
         let value = json_out(&stubs.run(&home, &args, None).await);
         assert_eq!(value["account"]["id"], "si:scout", "{args:?}");
     }
-    // Speech has no --account at all.
+    // Speech always runs as the signed-in account.
     let refused = stubs
         .run(&home, &["tts", "Hi", "--account", "si:scout"], None)
         .await;
     assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        text(&refused).contains("never speaks for its Silicon"),
+        "{}",
+        text(&refused)
+    );
     let approve = stubs
         .run(
             &home,
@@ -265,6 +270,7 @@ async fn a_custodian_selects_a_silicon_for_its_data_and_never_for_speech() {
         Some(2),
         "only the account itself approves Briefcase access"
     );
+    assert!(text(&approve).contains("Only the account itself"));
 }
 
 #[tokio::test]

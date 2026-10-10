@@ -451,3 +451,139 @@ pub enum ConfigCommand {
         enabled: String,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Args, Command, LoginCommand, ProviderKeysCommand, StorageCommand};
+    use clap::{CommandFactory as _, Parser as _};
+
+    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("waveform").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn tts_runs_one_provider_by_default_and_controls_exclude_fallback() {
+        let Command::Tts(tts) = parse(&["tts", "Hello"]).unwrap().command else {
+            panic!("tts")
+        };
+        assert!(!tts.auto_fallback && tts.proof.proof_file.is_none());
+        assert!(
+            parse(&[
+                "tts",
+                "Hi",
+                "--provider",
+                "elevenlabs",
+                "--provider-options",
+                "{}"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "tts",
+                "Hi",
+                "--provider",
+                "gemini",
+                "--provider-order",
+                "openai"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["tts", "Hi", "--auto-fallback", "--provider-options", "{}"]).is_err());
+        assert!(
+            parse(&[
+                "tts",
+                "Hi",
+                "--auto-fallback",
+                "--provider-options-file",
+                "c.json"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "tts",
+                "Hi",
+                "--provider-options",
+                "{}",
+                "--provider-options-file",
+                "c.json"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&["tts", "Hi", "--provider", "deepgram"]).is_err(),
+            "deepgram does not speak"
+        );
+        assert!(
+            parse(&["tts", "Hi", "--text-file", "t.txt"]).is_err(),
+            "text or a file, not both"
+        );
+        assert!(parse(&["tts"]).is_err(), "text is required");
+        assert!(parse(&["tts", "--text-file", "-"]).is_ok());
+    }
+
+    #[test]
+    fn login_takes_one_short_lived_token_source() {
+        let login = |args: &[&str]| match parse(args).map(|args| args.command) {
+            Ok(Command::Login(login)) => Ok(login),
+            Ok(_) => panic!("login"),
+            Err(error) => Err(error),
+        };
+        assert!(login(&["login"]).unwrap().slt.is_none());
+        assert_eq!(
+            login(&["login", "slt_x"]).unwrap().slt_argument.as_deref(),
+            Some("slt_x")
+        );
+        assert_eq!(
+            login(&["login", "--slt", "slt_x"]).unwrap().slt.as_deref(),
+            Some("slt_x")
+        );
+        assert!(login(&["login", "--slt-stdin"]).unwrap().slt_stdin);
+        assert!(login(&["login", "--slt", "a", "--slt-stdin"]).is_err());
+        assert!(login(&["login", "slt_a", "--slt", "slt_b"]).is_err());
+        assert!(matches!(
+            login(&["login", "status", "--offline"]).unwrap().command,
+            Some(LoginCommand::Status(status)) if status.offline
+        ));
+    }
+
+    #[test]
+    fn account_selection_and_subcommands_parse_where_they_belong() {
+        assert!(matches!(
+            parse(&["provider-keys", "--account", "si:scout"]).unwrap().command,
+            Command::ProviderKeys(keys) if keys.command.is_none() && keys.account.as_deref() == Some("si:scout")
+        ));
+        assert!(matches!(
+            parse(&["provider-keys", "set", "gemini", "--key-file", "-", "--account", "si:scout"]).unwrap().command,
+            Command::ProviderKeys(keys) if matches!(keys.command, Some(ProviderKeysCommand::Set { .. }))
+        ));
+        assert!(
+            parse(&["provider-keys", "set", "gemini"]).is_err(),
+            "a key or --key-file"
+        );
+        assert!(parse(&["provider-keys", "set", "nope", "--key-file", "k"]).is_err());
+        assert!(matches!(
+            parse(&["storage", "revoke", "--account", "si:scout"]).unwrap().command,
+            Command::Storage(storage) if matches!(storage.command, StorageCommand::Revoke(_))
+        ));
+        assert!(parse(&["storage", "approve", "--account", "si:scout"]).is_err());
+        assert!(
+            parse(&["jobs", "--wait"]).is_err(),
+            "--wait follows one job"
+        );
+        assert!(parse(&["jobs", "--job-id", "x", "--wait", "--account", "si:scout"]).is_ok());
+        assert!(parse(&["telemetry", "maybe"]).is_err());
+        assert!(
+            parse(&["docs", "iam"]).is_err(),
+            "the earlier guide is gone"
+        );
+        assert!(parse(&["--json", "--profile", "work", "me"]).is_ok());
+        assert!(matches!(parse(&["iam"]).unwrap().command, Command::Iam));
+    }
+}
