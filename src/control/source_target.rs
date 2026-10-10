@@ -46,7 +46,7 @@ pub(super) async fn prepare(
                     "storage_authorization_required",
                     "Waveform has no Briefcase access for this account.",
                 )
-                .with_hint("The account can grant it with `waveform storage approve`, or by calling Waveform directly once.")
+                .with_hint("The account gives it with `waveform storage approve`; its first direct Waveform request also gives it, unless the account or its custodian revoked it.")
             }
             StorageAuthorityError::Unavailable => ControlError::unavailable(
                 "dependency_unavailable",
@@ -58,26 +58,49 @@ pub(super) async fn prepare(
                 "Silicon Accounts did not answer in time.",
             ),
         })?;
-    let target = state
+    let request_id = crate::api::headers::request_id(&headers);
+    let target = match state
         .briefcase
-        .prepare_source_target(&proof, crate::api::headers::request_id(&headers))
+        .prepare_source_target(&proof, request_id)
         .await
-        .map_err(|error| match error {
-            BriefcaseError::Unauthorized | BriefcaseError::Forbidden => ControlError::forbidden(
-                "storage_authorization_required",
-                "Briefcase refused Waveform's access for this account.",
-            ),
-            BriefcaseError::NotFound => ControlError::not_found(
-                "briefcase_folder_not_found",
-                "Briefcase has no Waveform folder for this account yet.",
-            ),
-            BriefcaseError::Timeout => ControlError::new(
-                StatusCode::GATEWAY_TIMEOUT,
-                "dependency_timeout",
-                "Briefcase did not answer in time.",
-            ),
-            _ => ControlError::unavailable("briefcase_unavailable", "Briefcase is unavailable."),
-        })?;
+    {
+        // The stored proof ended (with the sign-in it stood on) or was revoked:
+        // renew it once, as speech does, and look again.
+        Err(BriefcaseError::Unauthorized) => {
+            match state
+                .storage_proofs()?
+                .renew_refused_proof(&caller.actor, subject, &proof)
+                .await
+            {
+                Ok(renewed) => {
+                    state
+                        .briefcase
+                        .prepare_source_target(&renewed, request_id)
+                        .await
+                }
+                Err(_) => Err(BriefcaseError::Unauthorized),
+            }
+        }
+        other => other,
+    }
+    .map_err(|error| match error {
+        BriefcaseError::Unauthorized | BriefcaseError::Forbidden => ControlError::forbidden(
+            "storage_authorization_required",
+            "Briefcase refused Waveform's access for this account.",
+        )
+        .with_hint("The account can give it again with `waveform storage approve`."),
+        BriefcaseError::NotFound => ControlError::not_found(
+            "briefcase_folder_not_found",
+            "Briefcase did not show Waveform its folder (apps/waveform) for this account: Briefcase shows an app its folder only through the files in it, and it is still empty.",
+        )
+        .with_hint("Store one speech there first (`waveform tts …`), or upload the source into apps/waveform with your own Briefcase access and pass its permanent URL to `waveform stt`."),
+        BriefcaseError::Timeout => ControlError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "dependency_timeout",
+            "Briefcase did not answer in time.",
+        ),
+        _ => ControlError::unavailable("briefcase_unavailable", "Briefcase is unavailable."),
+    })?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(serde_json::json!({

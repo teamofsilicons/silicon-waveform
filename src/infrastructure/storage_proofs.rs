@@ -35,6 +35,27 @@ pub const BRIEFCASE_SCOPES: [&str; 4] = [
 /// A proof token is replaced when it has less than this left.
 const MINIMUM_REMAINING: time::Duration = time::Duration::seconds(60);
 
+/// Why access ended when someone decided it: the account (`waveform storage revoke`, or at Silicon
+/// Accounts) or its custodian. Speech never gives the access back by itself after one of these; the
+/// account approves again (`waveform storage approve`). Every other end (the sign-in it stood on ended,
+/// expiry, access removed and given again) is replaced on the account's next direct request.
+const EXPLICIT_REVOCATIONS: [&str; 3] = [
+    "revoked_by_account",
+    "revoked_by_custodian",
+    "revoked_at_accounts",
+];
+
+fn is_explicit(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| EXPLICIT_REVOCATIONS.contains(&reason))
+}
+
+/// The newest proof row of an account, live or ended (no secrets).
+struct Latest {
+    proof_id: String,
+    active: bool,
+    reason: Option<String>,
+}
+
 /// What Waveform holds for one account at Briefcase (no secrets).
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct StorageProofStatus {
@@ -122,37 +143,47 @@ impl StorageProofs {
     ) -> Result<StorageProofStatus, StorageAuthorityError> {
         let storage_key = actor.actor.id.as_uuid();
         let mut transaction = self.lock(storage_key).await?;
-        let previous: Option<String> = sqlx::query_scalar("SELECT proof_id FROM waveform_storage_proofs WHERE storage_actor_id=$1 AND receiving_app=$2 AND invalidated_at IS NULL")
-            .bind(storage_key)
-            .bind(&self.receiving_app)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|_| StorageAuthorityError::Unavailable)?;
-        self.issue(&mut transaction, storage_key, subject_token)
-            .await?;
+        let previous = self.latest(&mut transaction, storage_key).await?;
+        self.issue(
+            &mut transaction,
+            storage_key,
+            subject_token,
+            previous.as_ref().map(|latest| latest.proof_id.as_str()),
+        )
+        .await?;
         transaction
             .commit()
             .await
             .map_err(|_| StorageAuthorityError::Unavailable)?;
-        if let Some(previous) = previous {
-            self.revoke_remote_by_id(&previous).await;
+        if let Some(previous) = previous.filter(|latest| latest.active) {
+            self.revoke_remote_by_id(&previous.proof_id).await;
         }
         self.status(storage_key)
             .await
             .map_err(|_| StorageAuthorityError::Unavailable)
     }
 
+    /// Issues a proof from the account's token. The idempotency key names the
+    /// proof being replaced, so a retry of this issuance gets the same proof while
+    /// replacing a revoked or ended proof with the same token gets a new one
+    /// (Silicon Accounts would otherwise answer the earlier, revoked proof again).
     async fn issue(
         &self,
         transaction: &mut Transaction<'static, Postgres>,
         storage_key: Uuid,
         subject_token: &AccessToken,
+        replacing: Option<&str>,
     ) -> Result<BriefcaseProof, StorageAuthorityError> {
         let subject_digest = Sha256::digest(subject_token.expose_secret().as_bytes());
         let key = format!(
             "waveform-briefcase-{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(
-                [storage_key.as_bytes().as_slice(), &subject_digest].concat()
+                [
+                    storage_key.as_bytes().as_slice(),
+                    &subject_digest,
+                    replacing.unwrap_or("none").as_bytes(),
+                ]
+                .concat()
             ))
         );
         let issued = self
@@ -164,8 +195,56 @@ impl StorageProofs {
                 &key,
             )
             .await
-            .map_err(map_proof_error)?;
+            .map_err(|error| map_proof_error(&error))?;
         self.save(transaction, storage_key, &issued).await
+    }
+
+    async fn latest(
+        &self,
+        transaction: &mut Transaction<'static, Postgres>,
+        storage_key: Uuid,
+    ) -> Result<Option<Latest>, StorageAuthorityError> {
+        let row = sqlx::query("SELECT proof_id, invalidated_at IS NULL AS active, invalidated_reason FROM waveform_storage_proofs WHERE storage_actor_id=$1 AND receiving_app=$2")
+            .bind(storage_key)
+            .bind(&self.receiving_app)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| StorageAuthorityError::Unavailable)?;
+        row.map(|row| {
+            Ok(Latest {
+                proof_id: row.try_get("proof_id")?,
+                active: row.try_get("active")?,
+                reason: row.try_get("invalidated_reason")?,
+            })
+        })
+        .transpose()
+        .map_err(|_: sqlx::Error| StorageAuthorityError::Unavailable)
+    }
+
+    /// Issues a replacement when the request carries the account's own token and
+    /// the last proof did not end by someone's decision.
+    async fn replace(
+        &self,
+        transaction: &mut Transaction<'static, Postgres>,
+        storage_key: Uuid,
+        subject_token: Option<&AccessToken>,
+    ) -> Result<BriefcaseProof, StorageAuthorityError> {
+        let latest = self.latest(transaction, storage_key).await?;
+        let explicit = latest
+            .as_ref()
+            .is_some_and(|latest| !latest.active && is_explicit(latest.reason.as_deref()));
+        match subject_token {
+            Some(subject_token) if !explicit => {
+                self.issue(
+                    transaction,
+                    storage_key,
+                    subject_token,
+                    latest.as_ref().map(|latest| latest.proof_id.as_str()),
+                )
+                .await
+            }
+            _ => Err(StorageAuthorityError::NotAuthorized),
+        }
     }
 
     async fn save(
@@ -342,13 +421,96 @@ impl StorageProofs {
             .await
         {
             Ok(issued) => self.save(transaction, storage_key, &issued).await.map(Some),
-            Err(ProofError::Refused) => {
-                self.invalidate(transaction, storage_key, "refresh_refused")
-                    .await?;
+            Err(error @ ProofError::Refused { .. }) => {
+                let reason = if error.is_explicit_revocation() {
+                    "revoked_at_accounts"
+                } else {
+                    "refresh_refused"
+                };
+                self.invalidate(transaction, storage_key, reason).await?;
                 Ok(None)
             }
-            Err(error) => Err(map_proof_error(error)),
+            Err(error) => Err(map_proof_error(&error)),
         }
+    }
+
+    /// See [`StorageAuthorityPort::renew_refused_proof`].
+    async fn renew(
+        &self,
+        transaction: &mut Transaction<'static, Postgres>,
+        storage_key: Uuid,
+        subject_token: Option<&AccessToken>,
+        refused: &BriefcaseProof,
+    ) -> Result<BriefcaseProof, StorageAuthorityError> {
+        let row = sqlx::query("SELECT token_cipher, token_expires_at, refresh_cipher, refresh_expires_at FROM waveform_storage_proofs WHERE storage_actor_id=$1 AND receiving_app=$2 AND invalidated_at IS NULL")
+            .bind(storage_key)
+            .bind(&self.receiving_app)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| StorageAuthorityError::Unavailable)?;
+        let Some(row) = row else {
+            return self.replace(transaction, storage_key, subject_token).await;
+        };
+        let now = OffsetDateTime::now_utc();
+        let token_expires_at: OffsetDateTime = row
+            .try_get("token_expires_at")
+            .map_err(|_| StorageAuthorityError::Unavailable)?;
+        let cipher: Vec<u8> = row
+            .try_get("token_cipher")
+            .map_err(|_| StorageAuthorityError::Unavailable)?;
+        let token = self
+            .vault
+            .open(&cipher, &self.context(storage_key, "token"))
+            .map_err(|_| StorageAuthorityError::Unavailable)?;
+        if token.expose_secret() != refused.token.expose_secret()
+            && token_expires_at - now > MINIMUM_REMAINING
+        {
+            // Another request already put a new proof in its place.
+            return Ok(BriefcaseProof {
+                token: ProofToken::new(token.expose_secret().to_owned())
+                    .map_err(|_| StorageAuthorityError::Unavailable)?,
+                expires_at: token_expires_at,
+            });
+        }
+        let refresh_cipher: Option<Vec<u8>> = row
+            .try_get("refresh_cipher")
+            .map_err(|_| StorageAuthorityError::Unavailable)?;
+        let refresh_expires_at: Option<OffsetDateTime> = row
+            .try_get("refresh_expires_at")
+            .map_err(|_| StorageAuthorityError::Unavailable)?;
+        if let (Some(refresh_cipher), true) = (
+            refresh_cipher,
+            refresh_expires_at.is_none_or(|end| end > now),
+        ) {
+            let refresh = self
+                .vault
+                .open(&refresh_cipher, &self.context(storage_key, "refresh"))
+                .map_err(|_| StorageAuthorityError::Unavailable)?;
+            let key = format!(
+                "waveform-refresh-{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(Sha256::digest(refresh.expose_secret().as_bytes()))
+            );
+            match self
+                .gateway
+                .refresh_proof(refresh.expose_secret(), &key)
+                .await
+            {
+                // Still alive: present a fresh token.
+                Ok(issued) => return self.save(transaction, storage_key, &issued).await,
+                Err(error) if error.is_explicit_revocation() => {
+                    self.invalidate(transaction, storage_key, "revoked_at_accounts")
+                        .await?;
+                    return Err(StorageAuthorityError::NotAuthorized);
+                }
+                // Ended with its sign-in, expired, or its refresh token was spent: replace it.
+                Err(ProofError::Refused { .. }) => {}
+                Err(error) => return Err(map_proof_error(&error)),
+            }
+        }
+        self.invalidate(transaction, storage_key, "proof_ended")
+            .await?;
+        self.replace(transaction, storage_key, subject_token).await
     }
 
     async fn invalidate(
@@ -377,30 +539,43 @@ impl StorageAuthorityPort for StorageProofs {
     ) -> Result<BriefcaseProof, StorageAuthorityError> {
         let storage_key = actor.actor.id.as_uuid();
         let mut transaction = self.lock(storage_key).await?;
-        let proof = if let Some(proof) = self.stored(&mut transaction, storage_key).await? {
-            proof
-        } else {
-            let Some(subject_token) = subject_token else {
-                transaction
-                    .commit()
+        let proof = match self.stored(&mut transaction, storage_key).await? {
+            Some(proof) => Ok(proof),
+            None => {
+                self.replace(&mut transaction, storage_key, subject_token)
                     .await
-                    .map_err(|_| StorageAuthorityError::Unavailable)?;
-                return Err(StorageAuthorityError::NotAuthorized);
-            };
-            self.issue(&mut transaction, storage_key, subject_token)
-                .await?
+            }
         };
+        // Commit what was learnt (an invalidation) even when no proof came out of it.
         transaction
             .commit()
             .await
             .map_err(|_| StorageAuthorityError::Unavailable)?;
-        Ok(proof)
+        proof
+    }
+
+    async fn renew_refused_proof(
+        &self,
+        actor: &AuthorizedActor,
+        subject_token: Option<&AccessToken>,
+        refused: &BriefcaseProof,
+    ) -> Result<BriefcaseProof, StorageAuthorityError> {
+        let storage_key = actor.actor.id.as_uuid();
+        let mut transaction = self.lock(storage_key).await?;
+        let renewed = self
+            .renew(&mut transaction, storage_key, subject_token, refused)
+            .await;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| StorageAuthorityError::Unavailable)?;
+        renewed
     }
 }
 
-const fn map_proof_error(error: ProofError) -> StorageAuthorityError {
+const fn map_proof_error(error: &ProofError) -> StorageAuthorityError {
     match error {
-        ProofError::Refused => StorageAuthorityError::Refused,
+        ProofError::Refused { .. } => StorageAuthorityError::Refused,
         ProofError::Unavailable => StorageAuthorityError::Unavailable,
         ProofError::Timeout => StorageAuthorityError::Timeout,
     }

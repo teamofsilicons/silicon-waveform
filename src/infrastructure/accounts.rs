@@ -36,17 +36,31 @@ const INTROSPECTION_CACHE_LIMIT: usize = 10_000;
 const LOOKUPS_PER_MINUTE: u32 = 300;
 
 /// Why a proof could not be issued or refreshed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ProofError {
     /// Accounts refused (invalid subject token, revoked or reused refresh token, inactive membership…).
     #[error("Silicon Accounts refused the proof")]
-    Refused,
+    Refused {
+        /// Why, as Accounts says it: `error.details.reason` (e.g. `revoked_by_account`,
+        /// `sign_in_revoked`) when it gives one, else the error code (e.g. `proof_expired`).
+        reason: Option<String>,
+    },
     /// Accounts could not be reached or failed.
     #[error("Silicon Accounts is unavailable")]
     Unavailable,
     /// Accounts did not answer in time.
     #[error("Silicon Accounts timed out")]
     Timeout,
+}
+
+impl ProofError {
+    /// A refusal because the account (or the issuing app's owner) revoked the proof
+    /// on purpose, as opposed to the proof ending with the sign-in it stood on.
+    #[must_use]
+    pub fn is_explicit_revocation(&self) -> bool {
+        matches!(self, Self::Refused { reason: Some(reason) }
+            if matches!(reason.as_str(), "revoked_by_account" | "revoked_by_owner"))
+    }
 }
 
 #[derive(Default)]
@@ -374,7 +388,13 @@ impl AccountsGateway {
                 .map_err(|_| ProofError::Unavailable);
         }
         if status.is_client_error() && status.as_u16() != 429 && status.as_u16() != 401 {
-            return Err(ProofError::Refused);
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_default();
+            return Err(ProofError::Refused {
+                reason: refusal_reason(&body["error"]["details"], &body["error"]["code"]),
+            });
         }
         Err(ProofError::Unavailable)
     }
@@ -421,10 +441,30 @@ fn proof_failure(error: &ClientError) -> ProofError {
     }
     match error.status() {
         Some(status) if (400..500).contains(&status) && status != 429 && status != 401 => {
-            ProofError::Refused
+            ProofError::Refused {
+                reason: refusal_reason(
+                    error.details().unwrap_or(&serde_json::Value::Null),
+                    &serde_json::Value::String(error.code().to_owned()),
+                ),
+            }
         }
         _ => ProofError::Unavailable,
     }
+}
+
+/// `details.reason` when Accounts gives one, else the error code; bounded, never a token.
+fn refusal_reason(details: &serde_json::Value, code: &serde_json::Value) -> Option<String> {
+    details["reason"]
+        .as_str()
+        .or_else(|| code.as_str())
+        .filter(|reason| {
+            !reason.is_empty()
+                && reason.len() <= 64
+                && reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+        .map(str::to_owned)
 }
 
 fn token_failure(error: &ClientError) -> AccountsError {

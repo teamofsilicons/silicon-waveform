@@ -8,7 +8,10 @@
 //! (recorded in docs/migration/decisions.md for the integration stage):
 //! - an empty `parent_path` puts an upload in Waveform's folder of the account's
 //!   drive, `WAVEFORM_BRIEFCASE_APP_FOLDER` (default `apps/waveform`);
-//! - list paths are drive-relative;
+//! - list paths are drive-relative, and listing with no parent lists that
+//!   folder (Briefcase creates it on first use);
+//! - an app sees only `apps/{app}/` and what is inside it (not the drive's top
+//!   or `apps/` itself), so the folder's own entry is learnt from its children;
 //! - a permanent URL is `{origin}/{owner}/{drive path}`; legacy
 //!   `{origin}/org/{org}/{path}` URLs still resolve.
 
@@ -123,6 +126,8 @@ struct Entry {
     name: String,
     #[serde(default)]
     path: String,
+    #[serde(default)]
+    parent_id: Option<Uuid>,
     #[serde(default)]
     permanent_url: Option<String>,
     #[serde(default)]
@@ -535,17 +540,38 @@ impl BriefcaseHttp {
     /// Makes sure Waveform's folder exists in the account's drive and returns it,
     /// so a caller can put STT source audio there.
     ///
+    /// Briefcase shows an app only what is inside `apps/{app}/`, not `apps/`
+    /// itself, so the folder's id comes from the entries in it (their
+    /// `parent_id`); a Briefcase that also lists the `apps/` container is read
+    /// as before.
+    ///
     /// # Errors
     ///
-    /// [`BriefcaseError`] by category; `NotFound` when Briefcase has no Waveform
-    /// folder for the account.
+    /// [`BriefcaseError`] by category; `NotFound` when Briefcase does not let
+    /// Waveform see its folder's entry (the folder is empty and the container is
+    /// not listed to Waveform).
     pub async fn prepare_source_target(
         &self,
         proof: &BriefcaseProof,
         request_id: RequestId,
     ) -> Result<SourceTarget, BriefcaseError> {
-        // Listing the drive root initializes the app's folder (delegated semantics).
-        self.list(proof, None, None, 1, request_id).await?;
+        // Listing with no parent opens Waveform's folder, creating it on first use.
+        let page = self.list(proof, None, None, 1, request_id).await?;
+        let prefix = format!("{}/", self.app_folder);
+        if let Some(folder_id) = page
+            .items
+            .iter()
+            .find(|entry| {
+                entry.path.starts_with(&prefix) && !entry.path[prefix.len()..].contains('/')
+            })
+            .and_then(|entry| entry.parent_id)
+            .filter(|id| !id.is_nil())
+        {
+            return Ok(SourceTarget {
+                folder_id,
+                folder_path: self.app_folder.clone(),
+            });
+        }
         let parent = self
             .app_folder
             .rsplit_once('/')
@@ -554,7 +580,11 @@ impl BriefcaseHttp {
             .find(proof, parent, request_id, |entry| {
                 entry.path == self.app_folder && entry.is_folder() && entry.is_live()
             })
-            .await?;
+            .await
+            .map_err(|error| match error {
+                BriefcaseError::Forbidden => BriefcaseError::NotFound,
+                other => other,
+            })?;
         if folder
             .origin_app_id
             .as_deref()

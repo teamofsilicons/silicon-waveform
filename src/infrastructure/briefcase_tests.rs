@@ -264,3 +264,83 @@ fn permanent_urls_map_to_drive_paths_for_both_url_schemes() -> TestResult {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn the_stt_folder_is_found_through_what_is_inside_it() -> TestResult {
+    // Briefcase shows an app only apps/{app}/ and its contents: listing with no
+    // parent lists the folder, and listing apps/ itself is refused.
+    let storage = MockServer::start().await;
+    let folder = Uuid::new_v4();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/entries/list"))
+        .and(header("authorization", "Proof sap_briefcase-proof"))
+        .and(body_partial_json(json!({"path": null, "parent_id": null})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[{"id":Uuid::new_v4(),"type":"file","name":"note.mp3","path":"apps/waveform/note.mp3","parent_id":folder,"permanent_url":format!("{}/c:ada/apps/waveform/note.mp3", storage.uri()),"origin_app_id":"waveform","deleted_at":null}],"next_cursor":null})))
+        .expect(1)
+        .mount(&storage)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/entries/list"))
+        .and(body_partial_json(json!({"path": "apps"})))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&storage)
+        .await;
+    let adapter = BriefcaseHttp::new(&settings(&storage)?, "waveform")?;
+    let target = adapter
+        .prepare_source_target(&proof()?, RequestId::new(Uuid::new_v4())?)
+        .await?;
+    assert_eq!(target.folder_id, folder);
+    assert_eq!(target.folder_path, "apps/waveform");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_empty_stt_folder_hidden_from_waveform_is_not_found_and_a_listed_one_is_read()
+-> TestResult {
+    let storage = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/entries/list"))
+        .and(body_partial_json(json!({"path": null})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"items":[],"next_cursor":null})),
+        )
+        .mount(&storage)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/entries/list"))
+        .and(body_partial_json(json!({"path": "apps"})))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&storage)
+        .await;
+    let adapter = BriefcaseHttp::new(&settings(&storage)?, "waveform")?;
+    let refused = adapter
+        .prepare_source_target(&proof()?, RequestId::new(Uuid::new_v4())?)
+        .await;
+    assert_eq!(refused.err(), Some(BriefcaseError::NotFound));
+
+    // A Briefcase that lists the apps/ container to the app: the folder entry is read there.
+    let legacy = MockServer::start().await;
+    let folder = Uuid::new_v4();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/entries/list"))
+        .and(body_partial_json(json!({"path": null})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"items":[],"next_cursor":null})),
+        )
+        .mount(&legacy)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/entries/list"))
+        .and(body_partial_json(json!({"path": "apps"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[{"id":folder,"type":"folder","name":"waveform","path":"apps/waveform","origin_app_id":"waveform","deleted_at":null}],"next_cursor":null})))
+        .mount(&legacy)
+        .await;
+    let adapter = BriefcaseHttp::new(&settings(&legacy)?, "waveform")?;
+    let target = adapter
+        .prepare_source_target(&proof()?, RequestId::new(Uuid::new_v4())?)
+        .await?;
+    assert_eq!(target.folder_id, folder);
+    Ok(())
+}

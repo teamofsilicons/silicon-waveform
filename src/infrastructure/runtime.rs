@@ -499,6 +499,15 @@ impl StorageAuthorityPort for NoStorageAuthority {
     ) -> Result<crate::domain::auth::BriefcaseProof, StorageAuthorityError> {
         Err(StorageAuthorityError::NotAuthorized)
     }
+
+    async fn renew_refused_proof(
+        &self,
+        _actor: &crate::domain::auth::AuthorizedActor,
+        _subject_token: Option<&crate::domain::auth::AccessToken>,
+        _refused: &crate::domain::auth::BriefcaseProof,
+    ) -> Result<crate::domain::auth::BriefcaseProof, StorageAuthorityError> {
+        Err(StorageAuthorityError::NotAuthorized)
+    }
 }
 
 fn spawn_cleanup(

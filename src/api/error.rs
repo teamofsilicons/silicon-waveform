@@ -311,7 +311,7 @@ struct ErrorBody {
     provider_status: Option<u16>,
 }
 
-const STORAGE_HINT: &str = "The account can grant it with `waveform storage approve` (or POST /api/v1/storage-authorizations with its own access token). Its next direct Waveform request also grants it.";
+const STORAGE_HINT: &str = "The account gives it with `waveform storage approve` (or POST /api/v1/storage-authorizations with its own access token). Its first direct Waveform request also gives it, unless the account or its custodian revoked it.";
 
 const fn dependency_name(dependency: Dependency) -> &'static str {
     match dependency {

@@ -137,12 +137,28 @@ pub enum AccountsError {
 #[async_trait]
 pub trait StorageAuthorityPort: Send + Sync {
     /// Returns a Briefcase proof that is valid for at least a minute. With the
-    /// account's own Waveform access token, a missing or dead proof is replaced
-    /// by a newly issued one; without it only a stored proof can be used.
+    /// account's own Waveform access token, a missing proof, or one that ended
+    /// with the sign-in it stood on, is replaced by a newly issued one; a proof
+    /// the account or its custodian revoked is not (that needs an explicit
+    /// approval). Without the token only a stored proof can be used.
     async fn briefcase_proof(
         &self,
         actor: &AuthorizedActor,
         subject_token: Option<&AccessToken>,
+    ) -> Result<BriefcaseProof, StorageAuthorityError>;
+
+    /// Called when Briefcase refused `refused` (HTTP 401): a User verification
+    /// proof ends with the sign-in it was issued under (another machine's
+    /// `waveform logout`, the website's sign-out), and Briefcase then refuses it
+    /// before it expires. Answers the proof another request already put in its
+    /// place, or asks Silicon Accounts to refresh it: a live proof gets a new
+    /// token; an ended one is replaced as in [`Self::briefcase_proof`]; one the
+    /// account revoked at Silicon Accounts is marked revoked and not replaced.
+    async fn renew_refused_proof(
+        &self,
+        actor: &AuthorizedActor,
+        subject_token: Option<&AccessToken>,
+        refused: &BriefcaseProof,
     ) -> Result<BriefcaseProof, StorageAuthorityError>;
 }
 

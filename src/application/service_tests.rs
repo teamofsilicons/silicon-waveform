@@ -89,6 +89,9 @@ impl AccountsPort for FakeAccounts {
 struct FakeAuthority {
     result: Mutex<Result<(), StorageAuthorityError>>,
     calls: Mutex<Vec<bool>>,
+    /// `renew_refused_proof`: its answer, and whether each call carried a subject token.
+    renew_result: Mutex<Result<(), StorageAuthorityError>>,
+    renewals: Mutex<Vec<bool>>,
 }
 
 #[async_trait]
@@ -106,9 +109,29 @@ impl StorageAuthorityPort for FakeAuthority {
             expires_at: datetime!(2099-01-01 00:00:00 UTC),
         })
     }
+
+    async fn renew_refused_proof(
+        &self,
+        _actor: &AuthorizedActor,
+        subject_token: Option<&AccessToken>,
+        refused: &BriefcaseProof,
+    ) -> Result<BriefcaseProof, StorageAuthorityError> {
+        assert_eq!(refused.token.expose_secret(), "sap_briefcase-proof");
+        lock(&self.renewals).push(subject_token.is_some());
+        (*lock(&self.renew_result))?;
+        Ok(BriefcaseProof {
+            token: ProofToken::new("sap_briefcase-renewed".to_owned())
+                .unwrap_or_else(|error| panic!("valid proof: {error}")),
+            expires_at: datetime!(2099-01-01 00:00:00 UTC),
+        })
+    }
 }
 
 struct FakeBriefcase {
+    /// How many of the next calls Briefcase refuses with 401 (a proof that ended).
+    refusals: Mutex<u32>,
+    /// The proof token each call presented.
+    tokens: Mutex<Vec<String>>,
     source: Result<SourceMedia, BriefcaseError>,
     stored: Mutex<Result<BriefcaseFileUrl, BriefcaseError>>,
     access_result: Mutex<Result<(), BriefcaseError>>,
@@ -123,6 +146,7 @@ impl BriefcasePort for FakeBriefcase {
         &self,
         request: BriefcaseFileAccessRequest,
     ) -> Result<(), BriefcaseError> {
+        self.refuse(&request.proof)?;
         lock(&self.verified_accesses).push((request.request_id, request.file_url.to_string()));
         *lock(&self.access_result)
     }
@@ -131,6 +155,7 @@ impl BriefcasePort for FakeBriefcase {
         &self,
         request: ReadSourceMediaRequest,
     ) -> Result<SourceMedia, BriefcaseError> {
+        self.refuse(&request.proof)?;
         lock(&self.read_request_ids).push(request.request_id);
         self.source.clone()
     }
@@ -139,8 +164,21 @@ impl BriefcasePort for FakeBriefcase {
         &self,
         request: StoreGeneratedAudioRequest,
     ) -> Result<BriefcaseFileUrl, BriefcaseError> {
+        self.refuse(&request.proof)?;
         lock(&self.store_requests).push((request.request_id, request.filename.to_string()));
         lock(&self.stored).clone()
+    }
+}
+
+impl FakeBriefcase {
+    fn refuse(&self, proof: &BriefcaseProof) -> Result<(), BriefcaseError> {
+        lock(&self.tokens).push(proof.token.expose_secret().to_owned());
+        let mut refusals = lock(&self.refusals);
+        if *refusals > 0 {
+            *refusals -= 1;
+            return Err(BriefcaseError::Unauthorized);
+        }
+        Ok(())
     }
 }
 
@@ -356,6 +394,8 @@ fn fixture(
     let authority = Arc::new(FakeAuthority {
         result: Mutex::new(Ok(())),
         calls: Mutex::new(Vec::new()),
+        renew_result: Mutex::new(Ok(())),
+        renewals: Mutex::new(Vec::new()),
     });
     let idempotency = Arc::new(FakeIdempotency {
         decisions: Mutex::new(VecDeque::from([Ok(decision)])),
@@ -367,6 +407,8 @@ fn fixture(
         releases: Mutex::new(Vec::new()),
     });
     let briefcase = Arc::new(FakeBriefcase {
+        refusals: Mutex::new(0),
+        tokens: Mutex::new(Vec::new()),
         source: Ok(source_media()),
         stored: Mutex::new(Ok(briefcase_file_url())),
         access_result: Mutex::new(Ok(())),
@@ -1650,4 +1692,138 @@ async fn personal_keys_reach_tts_and_stt_without_changing_shared_providers()
         );
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn a_refused_briefcase_proof_is_renewed_once_and_the_speech_is_stored() {
+    // A User verification proof ends with the sign-in it was issued under (one
+    // machine's `waveform logout`), and Briefcase refuses it before it expires.
+    let fixture = fixture(
+        acquired(90),
+        first_tts_succeeds(),
+        provider_failures_for_stt(),
+    );
+    *lock(&fixture.briefcase.refusals) = 1;
+    let result = fixture
+        .service
+        .synthesize(context(request_id(91), "renewed-proof"), tts_request())
+        .await
+        .unwrap_or_else(|error| panic!("request should complete: {error}"))
+        .result;
+    assert_eq!(
+        result.storage,
+        AudioStorage::Briefcase {
+            permanent_url: briefcase_file_url()
+        }
+    );
+    assert_eq!(
+        &*lock(&fixture.briefcase.tokens),
+        &["sap_briefcase-proof", "sap_briefcase-renewed"]
+    );
+    // The direct caller's token may back a replacement proof.
+    assert_eq!(&*lock(&fixture.authority.renewals), &[true]);
+    assert!(lock(&fixture.held.holds).is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_proof_that_cannot_be_renewed_holds_the_speech_with_the_exact_reason() {
+    for (renewal, expected) in [
+        (
+            Err(StorageAuthorityError::NotAuthorized),
+            HeldReason::StorageNotAuthorized,
+        ),
+        (
+            Err(StorageAuthorityError::Unavailable),
+            HeldReason::BriefcaseRefused,
+        ),
+    ] {
+        let fixture = fixture(
+            acquired(92),
+            first_tts_succeeds(),
+            provider_failures_for_stt(),
+        );
+        *lock(&fixture.briefcase.refusals) = 1;
+        *lock(&fixture.authority.renew_result) = renewal;
+        let result = fixture
+            .service
+            .synthesize(context(request_id(93), "not-renewed"), tts_request())
+            .await
+            .unwrap_or_else(|error| panic!("{expected:?}: request should complete: {error}"))
+            .result;
+        assert!(
+            matches!(result.storage, AudioStorage::Held { reason, .. } if reason == expected),
+            "{expected:?}: {:?}",
+            result.storage
+        );
+        assert_eq!(lock(&fixture.briefcase.tokens).len(), 1, "{expected:?}");
+        assert_eq!(&*lock(&fixture.authority.renewals), &[true]);
+    }
+}
+
+#[tokio::test]
+async fn delegated_stt_renews_a_refused_proof_without_the_accounts_token() {
+    let fixture = fixture(
+        acquired(94),
+        provider_failures_for_tts(),
+        [
+            Ok(SttProviderResult {
+                transcript: Transcript::new("hello".to_owned()).unwrap_or_else(|_| unreachable!()),
+                detected_language: None,
+                duration: None,
+            }),
+            provider_failure(ProviderName::OpenAi),
+            provider_failure(ProviderName::Deepgram),
+        ],
+    );
+    *lock(&fixture.briefcase.refusals) = 1;
+    let result = fixture
+        .service
+        .transcribe(
+            proof_context(request_id(95), "delegated-renewal"),
+            stt_request(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("request should complete: {error}"));
+    assert_eq!(result.result.transcript.as_str(), "hello");
+    // An app's proof can never back a new Briefcase proof: only a refresh is possible.
+    assert_eq!(&*lock(&fixture.authority.renewals), &[false]);
+
+    let ended = self::fixture(
+        acquired(96),
+        provider_failures_for_tts(),
+        provider_failures_for_stt(),
+    );
+    *lock(&ended.briefcase.refusals) = 1;
+    *lock(&ended.authority.renew_result) = Err(StorageAuthorityError::NotAuthorized);
+    assert_eq!(
+        ended
+            .service
+            .transcribe(
+                proof_context(request_id(97), "delegated-ended"),
+                stt_request()
+            )
+            .await,
+        Err(WaveformError::StorageAuthorizationRequired)
+    );
+}
+
+#[tokio::test]
+async fn tts_replay_renews_a_refused_proof_before_checking_the_file() {
+    let completed = replayed_tts_result(request_id(14));
+    let fixture = fixture(
+        IdempotencyDecision::Replay(CompletedSpeechOperation::Tts(completed.clone())),
+        provider_failures_for_tts(),
+        provider_failures_for_stt(),
+    );
+    *lock(&fixture.briefcase.refusals) = 1;
+    let result = fixture
+        .service
+        .synthesize(context(request_id(15), "replay-renewal"), tts_request())
+        .await;
+    assert_eq!(
+        result,
+        Ok(ServiceResponse::replayed(completed.into_result()))
+    );
+    assert_eq!(&*lock(&fixture.authority.renewals), &[true]);
+    assert_eq!(lock(&fixture.briefcase.verified_accesses).len(), 1);
 }

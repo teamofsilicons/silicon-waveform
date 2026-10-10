@@ -820,7 +820,7 @@ impl Client {
     pub async fn approve_storage(&self) -> Result<BriefcaseAccess> {
         if let Some(account) = &self.account {
             return Err(Error::Invalid(format!(
-                "Only the account itself can give Waveform Briefcase access, because the proof is made from its own sign-in; {account} gets it on its next direct Waveform request, or by running the approval while signed in as itself."
+                "Only the account itself can give Waveform Briefcase access, because the proof is made from its own sign-in; {account} gives it itself, by running the approval while signed in as itself (its first direct Waveform request also gives it, unless the access was revoked)."
             )));
         }
         let url = self.api(&["storage-authorizations"], Call::default(), Vec::new())?;

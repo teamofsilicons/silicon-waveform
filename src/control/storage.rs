@@ -46,7 +46,7 @@ pub(super) async fn approve(
     if target.as_custodian {
         return Err(ControlError::forbidden(
             "approval_needs_the_account",
-            "Only the account itself can give Waveform Briefcase access, because the proof is made from its own Waveform sign-in. A Silicon gets it on its next direct Waveform request, or with `waveform storage approve`.",
+            "Only the account itself can give Waveform Briefcase access, because the proof is made from its own Waveform sign-in. A Silicon gives it itself, with `waveform storage approve` (its first direct Waveform request also gives it, unless the access was revoked).",
         ));
     }
     let InboundCredentials::Bearer(token) = &caller.credentials else {

@@ -15,7 +15,7 @@ use tower::ServiceExt as _;
 use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{body_partial_json, method, path},
+    matchers::{body_partial_json, header, method, path},
 };
 
 use super::ControlState;
@@ -41,7 +41,7 @@ use crate::{
         testing::{FixtureAudioNormalizer, TEST_STT_TEXT, provider_chains},
         vault::Vault,
     },
-    test_support::{TestAccounts, WEBHOOK_SECRET, signed_delivery},
+    test_support::{TestAccounts, WEBHOOK_SECRET, issued_proof, signed_delivery},
 };
 
 pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2006,5 +2006,258 @@ async fn iam_era_data_upgrades_and_links_to_accounts_without_loss() -> TestResul
     .fetch_one(&pool)
     .await?;
     assert_eq!(merged, gone);
+    harness.finish().await
+}
+
+/// Proof issuance that answers a new proof for every new Idempotency-Key
+/// (`sap_briefcase-N`, `proof-N`) and the same proof for a key it saw before, as
+/// Silicon Accounts does; answers the keys it was given.
+async fn issues_numbered_proofs(accounts: &TestAccounts) -> Arc<std::sync::Mutex<Vec<String>>> {
+    let keys = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = keys.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/proofs/user-verification"))
+        .respond_with(move |request: &wiremock::Request| {
+            let key = request
+                .headers
+                .get("idempotency-key")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let number = seen.lock().map_or(0, |mut keys| {
+                keys.iter().position(|known| *known == key).map_or_else(
+                    || {
+                        keys.push(key.clone());
+                        keys.len()
+                    },
+                    |index| index + 1,
+                )
+            });
+            let mut body = issued_proof(
+                &format!("sap_briefcase-{number}"),
+                &format!("sapr_briefcase-{number}"),
+            );
+            body["proof_id"] = json!(format!("proof-{number}"));
+            ResponseTemplate::new(201).set_body_json(body)
+        })
+        .mount(&accounts.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/proofs/revoke"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&accounts.server)
+        .await;
+    keys
+}
+
+async fn speak(
+    harness: &Harness,
+    authorization: &str,
+    key: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/tts",
+        &[("authorization", authorization), ("idempotency-key", key)],
+        Some(json!({"text": "Hello from the storage tests."})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(body)
+}
+
+async fn briefcase_access(
+    harness: &Harness,
+    authorization: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let (status, body) = send(
+        &harness.app,
+        "GET",
+        "/api/v1/storage-authorizations",
+        &[("authorization", authorization)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(body["briefcase"].clone())
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn revoked_briefcase_access_stays_revoked_until_approved_and_approval_gets_a_new_proof()
+-> TestResult {
+    let harness = Harness::new("").await?;
+    harness.accounts.introspection(true).await;
+    let keys = issues_numbered_proofs(&harness.accounts).await;
+    briefcase_accepts_uploads(&harness.briefcase).await;
+    sign_in(&harness, ADA).await?;
+    let ada = bearer(&harness.token(ADA));
+
+    // The first direct speech gives Waveform access and lands in Briefcase.
+    assert_eq!(
+        speak(&harness, &ada, "speech-first").await?["storage"]["status"],
+        "stored"
+    );
+    assert_eq!(
+        briefcase_access(&harness, &ada).await?["proof_id"],
+        "proof-1"
+    );
+    // The account revokes it: speech is held and nothing is issued behind its back.
+    let (status, body) = send(
+        &harness.app,
+        "DELETE",
+        "/api/v1/storage-authorizations",
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(
+        (status, body["briefcase"]["revoked_reason"].clone()),
+        (StatusCode::OK, json!("revoked_by_account"))
+    );
+    let held = speak(&harness, &ada, "speech-after-revoke").await?;
+    assert_eq!(
+        held["storage"]["reason"], "storage_not_authorized",
+        "{held}"
+    );
+    assert_eq!(briefcase_access(&harness, &ada).await?["status"], "revoked");
+    assert_eq!(keys.lock().map_or(0, |keys| keys.len()), 1);
+    // Approving again gets a new proof, not the revoked one replayed for the same token.
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/storage-authorizations",
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["briefcase"]["proof_id"], "proof-2");
+    assert!(
+        keys.lock()
+            .is_ok_and(|keys| keys.len() == 2 && keys[0] != keys[1])
+    );
+    assert_eq!(
+        speak(&harness, &ada, "speech-approved").await?["storage"]["status"],
+        "stored"
+    );
+
+    // An end nobody decided (the account's sign-ins ended) is replaced by the next direct speech.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let (status, body) = deliver(
+        &harness.app,
+        &event(
+            "membership.signed_out",
+            json!({"uuid":"zQo","membership_id":"waveform:zQo","reason":"stk_rotated"}),
+        ),
+    )
+    .await?;
+    assert_eq!(
+        (status, body["outcome"].clone()),
+        (StatusCode::OK, json!("sign_ins_ended"))
+    );
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let fresh = bearer(&harness.token(ADA));
+    assert_eq!(
+        briefcase_access(&harness, &fresh).await?["revoked_reason"],
+        "stk_rotated"
+    );
+    assert_eq!(
+        speak(&harness, &fresh, "speech-after-sign-out").await?["storage"]["status"],
+        "stored"
+    );
+    assert_eq!(
+        briefcase_access(&harness, &fresh).await?["proof_id"],
+        "proof-3"
+    );
+    harness.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires WAVEFORM_TEST_DATABASE_URL"]
+async fn a_proof_briefcase_refuses_is_replaced_when_it_ended_but_an_account_revocation_is_kept()
+-> TestResult {
+    let harness = Harness::new("").await?;
+    harness.accounts.introspection(true).await;
+    let keys = issues_numbered_proofs(&harness.accounts).await;
+    let reason = Arc::new(std::sync::Mutex::new("sign_in_revoked".to_owned()));
+    let answer = reason.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/proofs/refresh"))
+        .respond_with(move |_request: &wiremock::Request| {
+            let reason = answer.lock().map(|reason| reason.clone()).unwrap_or_default();
+            ResponseTemplate::new(410).set_body_json(json!({"error":{"code":"proof_revoked",
+                "message":"Proof can't be refreshed.","details":{"proof_id":"proof-n","reason":reason}}}))
+        })
+        .mount(&harness.accounts.server)
+        .await;
+    // Briefcase refuses proof-1: it ended with the sign-in it was issued under.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/uploads/reserve"))
+        .and(header("authorization", "Proof sap_briefcase-1"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_json(json!({"error":{"code":"proof_invalid"}})),
+        )
+        .with_priority(1)
+        .mount(&harness.briefcase)
+        .await;
+    briefcase_accepts_uploads(&harness.briefcase).await;
+    sign_in(&harness, ADA).await?;
+    let ada = bearer(&harness.token(ADA));
+
+    let stored = speak(&harness, &ada, "replaced").await?;
+    assert_eq!(stored["storage"]["status"], "stored", "{stored}");
+    let access = briefcase_access(&harness, &ada).await?;
+    assert_eq!(
+        (access["status"].clone(), access["proof_id"].clone()),
+        (json!("active"), json!("proof-2"))
+    );
+    assert_eq!(keys.lock().map_or(0, |keys| keys.len()), 2);
+
+    // The account revokes proof-2 at Silicon Accounts: Briefcase refuses it, and
+    // Silicon Accounts says why; Waveform keeps it revoked instead of re-issuing.
+    if let Ok(mut reason) = reason.lock() {
+        "revoked_by_account".clone_into(&mut reason);
+    }
+    Mock::given(method("POST"))
+        .and(path("/api/v1/obo/uploads/reserve"))
+        .and(header("authorization", "Proof sap_briefcase-2"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_json(json!({"error":{"code":"proof_invalid"}})),
+        )
+        .with_priority(1)
+        .mount(&harness.briefcase)
+        .await;
+    for key in ["revoked-at-accounts", "still-revoked"] {
+        let held = speak(&harness, &ada, key).await?;
+        assert_eq!(
+            held["storage"]["reason"], "storage_not_authorized",
+            "{key}: {held}"
+        );
+    }
+    let access = briefcase_access(&harness, &ada).await?;
+    assert_eq!(
+        (access["status"].clone(), access["revoked_reason"].clone()),
+        (json!("revoked"), json!("revoked_at_accounts"))
+    );
+    assert_eq!(keys.lock().map_or(0, |keys| keys.len()), 2);
+    // Until the account approves again.
+    let (status, body) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/storage-authorizations",
+        &[("authorization", &ada)],
+        None,
+    )
+    .await?;
+    assert_eq!(
+        (status, body["briefcase"]["proof_id"].clone()),
+        (StatusCode::CREATED, json!("proof-3"))
+    );
+    assert_eq!(
+        speak(&harness, &ada, "approved-again").await?["storage"]["status"],
+        "stored"
+    );
     harness.finish().await
 }

@@ -715,6 +715,42 @@ impl WaveformService {
             })
     }
 
+    /// Runs one Briefcase operation with `proof`. When Briefcase refuses the
+    /// proof (401: it ended with the sign-in it stood on, or was revoked), asks
+    /// for it to be renewed and runs the operation once more with the new one.
+    async fn with_renewal<T, F, Fut>(
+        &self,
+        authorization: &AuthorizedActor,
+        subject_token: Option<&AccessToken>,
+        proof: BriefcaseProof,
+        operation: F,
+    ) -> Result<T, Renewal>
+    where
+        F: Fn(BriefcaseProof) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<T, BriefcaseError>> + Send,
+    {
+        match operation(proof.clone()).await {
+            Err(BriefcaseError::Unauthorized) => {
+                let subject_token = if authorization.is_delegated() {
+                    None
+                } else {
+                    subject_token
+                };
+                let renewed = self
+                    .storage
+                    .authority
+                    .renew_refused_proof(authorization, subject_token, &proof)
+                    .await
+                    .map_err(Renewal::Authority)?;
+                tracing::info!(
+                    "Briefcase refused a stored proof; retrying once with a renewed one"
+                );
+                operation(renewed).await.map_err(Renewal::Briefcase)
+            }
+            other => other.map_err(Renewal::Briefcase),
+        }
+    }
+
     async fn replay_tts(
         &self,
         attempt_request_id: RequestId,
@@ -727,15 +763,17 @@ impl WaveformService {
                 let proof = self
                     .briefcase_authority(authorization, subject_token)
                     .await?;
-                self.storage
-                    .briefcase
-                    .verify_file_read_access(BriefcaseFileAccessRequest {
-                        proof,
-                        file_url: permanent_url.clone(),
-                        request_id: attempt_request_id,
-                    })
-                    .await
-                    .map_err(map_briefcase_error)?;
+                self.with_renewal(authorization, subject_token, proof, |proof| {
+                    self.storage
+                        .briefcase
+                        .verify_file_read_access(BriefcaseFileAccessRequest {
+                            proof,
+                            file_url: permanent_url.clone(),
+                            request_id: attempt_request_id,
+                        })
+                })
+                .await
+                .map_err(map_renewal_error)?;
             }
             AudioStorage::Held { .. } => {
                 let held = self
@@ -915,18 +953,34 @@ impl WaveformService {
             }
         };
         match self
-            .storage
-            .briefcase
-            .store_generated_audio(StoreGeneratedAudioRequest {
-                proof,
-                filename: filename.clone(),
-                audio: audio.clone(),
-                request_id,
+            .with_renewal(authorization, subject_token, proof, |proof| {
+                self.storage
+                    .briefcase
+                    .store_generated_audio(StoreGeneratedAudioRequest {
+                        proof,
+                        filename: filename.clone(),
+                        audio: audio.clone(),
+                        request_id,
+                    })
             })
             .await
         {
             Ok(permanent_url) => Ok(AudioStorage::Briefcase { permanent_url }),
-            Err(error) => {
+            Err(Renewal::Authority(error)) => {
+                let reason = match error {
+                    StorageAuthorityError::NotAuthorized | StorageAuthorityError::Refused => {
+                        HeldReason::StorageNotAuthorized
+                    }
+                    // The refusal stands when the proof could not be renewed now.
+                    StorageAuthorityError::Unavailable | StorageAuthorityError::Timeout => {
+                        HeldReason::BriefcaseRefused
+                    }
+                };
+                tracing::warn!(request_id = %request_id, reason = reason.as_str(), "Briefcase refused the proof and it could not be renewed; holding audio");
+                self.hold(authorization, filename, audio, request_id, reason)
+                    .await
+            }
+            Err(Renewal::Briefcase(error)) => {
                 let reason = match error {
                     BriefcaseError::Unauthorized | BriefcaseError::Forbidden => {
                         HeldReason::BriefcaseRefused
@@ -986,16 +1040,18 @@ impl WaveformService {
             .briefcase_authority(authorization, subject_token)
             .await?;
         let media = self
-            .storage
-            .briefcase
-            .read_source_media(ReadSourceMediaRequest {
-                proof,
-                source_url: request.source_url,
-                size_limit: self.policy.source_media_size_limit,
-                request_id,
+            .with_renewal(authorization, subject_token, proof, |proof| {
+                self.storage
+                    .briefcase
+                    .read_source_media(ReadSourceMediaRequest {
+                        proof,
+                        source_url: request.source_url.clone(),
+                        size_limit: self.policy.source_media_size_limit,
+                        request_id,
+                    })
             })
             .await
-            .map_err(map_briefcase_error)?;
+            .map_err(map_renewal_error)?;
 
         let source_duration = self
             .audio_normalizer
@@ -1180,6 +1236,31 @@ const fn map_accounts_error(error: AccountsError) -> WaveformError {
             dependency: Dependency::Accounts,
         },
         AccountsError::Timeout => WaveformError::DependencyTimeout {
+            dependency: Dependency::Accounts,
+        },
+    }
+}
+
+/// A Briefcase operation that failed at Briefcase, or whose refused proof could
+/// not be renewed.
+#[derive(Clone, Copy, Debug)]
+enum Renewal {
+    Briefcase(BriefcaseError),
+    Authority(StorageAuthorityError),
+}
+
+const fn map_renewal_error(error: Renewal) -> WaveformError {
+    match error {
+        Renewal::Briefcase(error) => map_briefcase_error(error),
+        Renewal::Authority(
+            StorageAuthorityError::NotAuthorized | StorageAuthorityError::Refused,
+        ) => WaveformError::StorageAuthorizationRequired,
+        Renewal::Authority(StorageAuthorityError::Unavailable) => {
+            WaveformError::DependencyUnavailable {
+                dependency: Dependency::Accounts,
+            }
+        }
+        Renewal::Authority(StorageAuthorityError::Timeout) => WaveformError::DependencyTimeout {
             dependency: Dependency::Accounts,
         },
     }

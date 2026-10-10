@@ -148,13 +148,44 @@ async fn proof_refresh_is_idempotent_and_classifies_refusals() -> TestResult {
         .respond_with(ResponseTemplate::new(503))
         .mount(&accounts.server)
         .await;
+    for (key, reason) in [
+        ("by-account", "revoked_by_account"),
+        ("sign-in", "sign_in_revoked"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/proofs/refresh"))
+            .and(header("idempotency-key", key))
+            .respond_with(ResponseTemplate::new(410).set_body_json(json!({"error":{
+                "code":"proof_revoked","message":"revoked",
+                "details":{"proof_id":"01a1","reason":reason,"revoked_at":"2026-10-10T00:00:00.000Z"}}})))
+            .mount(&accounts.server)
+            .await;
+    }
     let gateway = AccountsGateway::new(&accounts.settings(""))?;
     let refreshed = gateway.refresh_proof("sapr_old", "refresh-key-1").await?;
     assert_eq!(refreshed.proof_token.expose(), "sap_new");
     assert_eq!(
         gateway.refresh_proof("sapr_old", "reused").await.err(),
-        Some(ProofError::Refused)
+        Some(ProofError::Refused {
+            reason: Some("proof_refresh_token_reused".to_owned())
+        })
     );
+    // The account revoking the proof is told apart from the proof ending with its sign-in.
+    let by_account = gateway.refresh_proof("sapr_old", "by-account").await.err();
+    assert!(
+        by_account
+            .as_ref()
+            .is_some_and(ProofError::is_explicit_revocation),
+        "{by_account:?}"
+    );
+    let sign_in = gateway.refresh_proof("sapr_old", "sign-in").await.err();
+    assert_eq!(
+        sign_in,
+        Some(ProofError::Refused {
+            reason: Some("sign_in_revoked".to_owned())
+        })
+    );
+    assert!(sign_in.is_some_and(|error| !error.is_explicit_revocation()));
     assert_eq!(
         gateway.refresh_proof("sapr_old", "down").await.err(),
         Some(ProofError::Unavailable)
