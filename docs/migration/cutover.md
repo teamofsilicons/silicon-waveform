@@ -62,3 +62,25 @@ deploy, website, CLI and Silicon Apps steps. Nothing here has been run against p
   first TTS after the release creates Waveform's new Briefcase access (or `waveform storage approve`).
 - Earlier test-environment tables and webhook-event tables stay untouched; drop them later only by a Carbon's
   decision.
+
+## 5. The CLI and the Rust client (client/CLI stage)
+
+Nothing here is published or run; the ship stage builds the archives.
+
+1. **Sign-in setup** (run at cutover, read-modify-write with `expected_version`; arrays replace): Waveform's app
+   needs `device_flow: true` (Carbons: `waveform login`) and `public_client: true` (Silicons:
+   `waveform login --slt-stdin`, exchanged with `client_id=waveform` and no secret). The CLI uses no redirect URI.
+2. **Order.** Release the service first. The 0.6 CLI needs `GET /api/v1/me`, `/api/v1/accounts` and the Accounts-era
+   routes; the 0.5 CLI's sign-in route answers `410 route_retired` from the new service. Publish
+   `silicon-waveform-client` 0.6.0 to crates.io before `waveform-cli` 0.6.0 (the CLI depends on it by version).
+3. **Every machine signs in again.** Sign-ins saved by CLI 0.5 (`.waveform/dir/session-<digest>.json`) are never
+   used; `waveform login status` reports `"reason":"legacy_session"` and `waveform logout` deletes them (with the
+   cached test secrets of `test-environments-*.json`). Carbons run `waveform login`; Silicons run
+   `silicon-accounts login --app waveform -q | waveform login --slt-stdin`.
+4. **Silicon runtimes.** `waveform iam --json` (hidden, prints the `accounts --json` object) and the positional
+   `waveform login <SLT>` keep working for one minor release, but the token must come from
+   `silicon-accounts login --app waveform -q`: an old `oac_…` token is refused before anything is sent
+   (`slt_not_a_short_lived_token`). Instructions that pass `--org`/`--actor` (Stemcell's voice-note tooling) fail with
+   exit 2 `organizations_removed`, which names the fix; the Stemcell owners should drop those flags.
+5. **Renamed commands** fail with exit 2 and the replacement: `provider-key-set|delete` → `provider-keys set|delete`,
+   `storage start|complete` → `storage approve`; `test-env`, `daemon` and `config auto-update` are gone.

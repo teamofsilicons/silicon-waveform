@@ -155,3 +155,142 @@ overwrite ids or custodians changed since they started; a mutation check confirm
   20 ms timeout and failed once under a parallel build; it passes alone and on reruns.
 - A DB test whose stub keeps answering stale data will expose any lookup still in flight; await first lookups rather
   than sleeping.
+
+## 2026-10-10 — Stage 2 (client and CLI): Silicon Accounts sign-in, no Teams
+
+The Rust client (`silicon-waveform-client` 0.6.0) and the `waveform` CLI (`waveform-cli` 0.6.0) speak Silicon
+Accounts only, follow the Silicon Apps CLI contract, and work against the migrated service. Decisions:
+[`decisions.md`](decisions.md#client-and-cli-stage-2); production steps: [`cutover.md`](cutover.md) section 5.
+
+An earlier run of this stage was interrupted after writing most of the client and the CLI modules (uncommitted, last
+edit 05:44). This run reviewed that work file by file against the service and `silicon-accounts-client` 0.4.0
+sources, kept it, and finished it (`main.rs`, `retired.rs`, `accounts`/`docs`/`config` commands, the tests, the docs).
+
+### What changed
+
+- **Client:** no IAM types, organizations, actors, test environments or updater. `signin::SignIn` (device flow with
+  `interval`/`slow_down`, secretless short-lived token exchange with exact refusal reasons, rotating refresh,
+  revoke); `Auth::{Anonymous, Bearer, Proof}`; `for_account` (custodian); typed `ApiError` keeping
+  `{error:{code,message,hint,reason,request_id,provider…}}`; `accounts()`, `silicons()`, `held_audio`,
+  `approve_storage`/`storage`/`revoke_storage`; the API-version handshake headers unchanged.
+- **CLI:** `login` (device flow, `--open`, `--label`, `--json` line stream), `login --slt`/`--slt-stdin`/positional,
+  `login status [--json] [--offline]`, `logout` (revokes), `refresh`, `accounts --json`, hidden `iam`, `me`,
+  `silicons`, `tts` (`--text-file`, `--proof-file`), `stt`, `stt-folder`, `audio`, `jobs`, `preferences`,
+  `voice-profiles`, `provider-keys [list|set|delete]`, `storage approve|status|revoke`, `telemetry`, `report`,
+  `capabilities`, `contracts`, `docs`, `config show|home|telemetry`. Sessions: per profile and Silicon Accounts
+  origin, `0600`, atomic, file lock, single-flight refresh. Retired flags/commands fail with exit 2 and the
+  replacement. `daemon.rs`/`updater.rs` deleted. Space Station telemetry unchanged (opt-out, step names only).
+- **Docs:** `cli/README.md` (= `docs/cli.md`, the long help), `docs/{README,accounts,api,client,testing}.md` and the
+  CLI half of `configuration.md` rewritten; `docs/iam.md` → `docs/history/iam.md`; the sync script covers the two
+  READMEs too; docs-site nav lists `accounts.md`.
+- **Service:** `?account=` ids Silicon Accounts calls `invalid_id` now answer `404 account_not_found` (was 503).
+
+### Commits
+
+`433a7c3` feat!: client and CLI 0.6.0 sign in with Silicon Accounts · `5195e4b` fix: answer 404 for an account id
+Silicon Accounts calls invalid · `56e8810` feat(cli): refuse --account where only the account itself may act · the
+docs commit that adds this section.
+
+### Tests (Rust env from stage 1)
+
+| Command | Result |
+| --- | --- |
+| `cargo test --manifest-path client/Cargo.toml` | pass: 5 unit, 13 `api`, 9 `signin`, 4 doctests (3 from the README) |
+| `cargo test --manifest-path cli/Cargo.toml` | pass: 15 unit (session perms/lock/corruption/legacy, home, retired spellings, argument grammar incl. clap `debug_assert`), 9 `discovery`, 12 `signin`, 6 `speech` |
+| `cargo fmt --check` + `cargo clippy --all-targets --all-features -D warnings` in `client/`, `cli/` and the root | pass |
+| `cargo build --locked` for `client/` and `cli/`; `cargo package --allow-dirty` in `client/` (verifies) | pass; no `silicon-iam-client`/`briefcase-client` in either lockfile |
+| `python3 scripts/sync-cli-docs.py --check` | pass (it failed at the start of this stage: `configuration.md` was stale) |
+| `cargo test --all-targets --all-features` (root) | pass: lib 174 passed / 9 ignored |
+| `WAVEFORM_TEST_DATABASE_URL=…/waveform_test cargo test --lib -- --ignored --test-threads=1` | pass: 9 passed |
+| `cargo test --lib lookups_and_revocations` with the 404 fix reverted | fails (the new assertion catches the bug); passes with it |
+| `~/.apps/bin/silicon-apps validate <scratch dir>` (apps.yaml + `bin/waveform`, macos-aarch64, local only) | `"valid": true` |
+
+The stub-based CLI tests run the real binary in empty homes: device flow pending → slow_down (interval 1 → 6) →
+success; denied and expired (exit 3); SLT from stdin/argument/flag with `client_id=waveform` and no secret; each
+`invalid_grant` description → its code and hint; four concurrent processes with an expiring token → exactly one
+refresh, all succeed; a stale-token 401 → one refresh and one retry; an ended sign-in deleted; logout revokes (and
+still deletes the file when Silicon Accounts answers 503); `login status` offline / refused / unreachable; golden
+`accounts --json`; help tree free of org/IAM/Honeycomb/test-env wording; legacy and corrupted session files.
+
+### Live run against the shared stack and the migrated service
+
+Service: `waveform-api` from this branch on `127.0.0.1:4161`, database `waveform_cli` (dropped afterwards),
+`WAVEFORM_SPEECH_FIXTURES=true`, Briefcase pointed at unused `127.0.0.1:4169`, `ACCOUNTS_URL=http://localhost:9590`,
+`ACCOUNTS_API_URL=http://127.0.0.1:9589`, `WAVEFORM_PROOF_ISSUERS='waveform.tts=interface;waveform.stt=interface'`.
+CLI env: fresh `SILICON_HOME=HOME=<scratch>/home-*`, `WAVEFORM_URL=http://127.0.0.1:4161`,
+`ACCOUNTS_URL=http://localhost:9590`. Identities: `mint.mts silicon --custodian-email waveform-cli-599174@example.test
+--handle waveform-cli-599174` → Silicon `si:waveform-cli-599174` (uuid `AYF`), custodian `c:waveform-cli-599174`
+(uuid `YEW`).
+
+Silicon:
+- `mint.mts slt --silicon si:waveform-cli-599174 --stk … --app waveform` → `printf %s "$SLT" | waveform login --slt-stdin`
+  → "Signed in to Waveform as si:waveform-cli-599174 … custodian c:waveform-cli-599174 … checked yes", exit 0.
+- `waveform login status --json` → `{"authenticated":true,"uuid":"AYF","id":"si:waveform-cli-599174","kind":"silicon",
+  "custodian":{"id":"c:waveform-cli-599174","uuid":"YEW"},"expires_at":…,"refresh_expires_at":…,"method":"slt","verified":true,…}`.
+- The same SLT again → `{"error":{"code":"slt_already_used",…,"hint":"Short-lived tokens work once. Mint a fresh one …"}}`, exit 3.
+  The SLT appeared in no output and no file.
+- `waveform me --json` (custodian shown); `waveform tts "Hello from a Silicon." --voice-profile puck --idempotency
+  cli-stage-silicon-0001 --json` → `storage {"status":"held","reason":"briefcase_unavailable",…}`, `audio_url`;
+  replay with the same key → same `request_id`; `waveform audio <id> --output speech.mp3` → 184364 bytes, "MPEG ADTS,
+  layer III"; `waveform jobs --limit 5 --json`; `waveform jobs --job-id <id> --wait --json` → completed;
+  `waveform preferences --voice-profile sulafat --tts-order elevenlabs,gemini --json`; `waveform voice-profiles` →
+  30; `waveform storage status --json` → `active`, the four `briefcase.*` scopes (created by the first TTS, from a
+  real Silicon Accounts proof); `waveform refresh --json` → `refreshed: true`; `waveform silicons --json` → `[]`.
+- Single-flight, live: the saved access token was marked as expiring in 20 s and four `waveform me --json` ran at
+  once → all exit 0, and the rotated family still refreshed afterwards (a reused refresh token would have revoked it).
+- `waveform logout --json` → `{"signed_out":true,"revoked":true,…}`; `login status --json` → `{"authenticated":false}`
+  (exit 0), text form exit 1; presenting the old refresh token to `/v1/oauth/token` → `invalid_grant … revoked at …
+  (app_revoked)`.
+
+Carbon:
+- `waveform login --json --label "waveform CLI stage test"` in the background → first line `{"event":"device_code",
+  "user_code":"MR3P-RVGJ","verification_uri":"http://localhost:9590/device",…,"interval":5}`; `mint.mts approve
+  --email waveform-cli-599174@example.test --code MR3P-RVGJ` → 204; the CLI finished with
+  `{"event":"signed_in","id":"c:waveform-cli-599174","kind":"carbon","method":"device","verified":true,…}`.
+- As custodian: `waveform silicons` → `si:waveform-cli-599174  uuid AYF`; `waveform jobs --account si:waveform-cli-599174`
+  → the Silicon's TTS job; `waveform preferences --account … --stt-order deepgram`; `printf %s <key> | waveform
+  provider-keys set openai --key-file - --account …` → saved (the key appeared in no output), listed, deleted;
+  `waveform storage status --account …` → `active`; the Carbon's own `waveform tts` → held audio.
+- Refusals (after the fixes): `waveform tts 'Hi' --account si:…` → exit 2 `speech_runs_as_yourself`;
+  `waveform storage approve --account si:… --json` → exit 2 `approval_by_the_account_only`;
+  `waveform jobs --account si:nobody-looks-after-this-one-599174` → exit 4 "No Silicon Accounts account has the id or
+  uuid …" (before the service fix: exit 1 "Silicon Accounts is temporarily unavailable"). `waveform logout` → revoked.
+
+Proofs: `mint.mts app-signin --app interface --email waveform-cli-599174@example.test --redirect
+http://127.0.0.1:9593/interface/callback --exchange`, then `POST /v1/proofs/user-verification` (interface's
+credentials, `receiving_app` `waveform`, scopes `["waveform.tts"]`) → `sap_…` in a `0600` file. In an empty home:
+`waveform tts "Spoken for an app." --proof-file proof.txt --json` → `storage.reason: "delegated_call"`;
+`waveform audio <id> --output proof.mp3 --proof-file proof.txt` → 182797 bytes MP3; `printf %s "$PROOF" | waveform stt
+… --proof-file -` → exit 3, `reason: proof_scope_missing`; `login status --json` → `{"authenticated":false}`; nothing
+written to the home; the proof appeared in no output.
+
+Discovery in an empty, scrubbed environment (`env -i HOME=$E SILICON_HOME=$E`): `waveform --help` exit 0 (14.7 KB);
+`waveform accounts --json` exit 0 with `{"app_id":"waveform","accounts_url":"https://accounts.teamofsilicons.com",
+"api_url":"https://backend.waveform.teamofsilicons.com","docs_url":…,"version":"0.6.0","proof_scopes":[…],"sign_in":{…}}`;
+`waveform login status --json` exit 0 `{"authenticated":false}`; `waveform iam --json` → same object; no file created.
+
+### Blocked on
+
+- Nothing new. Briefcase's Accounts-era contract (stage 1) still decides where TTS lands; the CLI only reports what
+  the service answers.
+
+### Left for later stages
+
+- Ship: `apps.yaml` packaging, `release.yml`/`ci.yml` (the CI `sync-cli-docs --check` step keeps working), remove
+  `honeycomb.yaml`/Honeycomb scripts, publish order (client before CLI), move the remaining IAM/Honeycomb/dated docs
+  to `docs/history/` and exclude it from the docs site, the root README and `API_DOCS.md`.
+- Web: Next.js + Arc UI BFF (the CLI's `docs/accounts.md` describes the website's sign-in as the hosted pages with
+  PKCE and a server-held session).
+- Stemcell: drop `--org/--actor` from its voice-note instructions; its `default_tts_provider: google` is not a
+  Waveform provider id (`gemini`).
+
+### Gotchas
+
+- `silicon-accounts-client` 0.4.0 lacks a secretless SLT exchange and a non-first-party public revoke; `SignIn`
+  posts both forms itself (see decisions).
+- The shared stack's issuer is `http://localhost:9590`; the CLI's `ACCOUNTS_URL` must be that origin (the session file
+  is keyed by it), while the service also needs `ACCOUNTS_API_URL=http://127.0.0.1:9589`.
+- Restarting the service with a new `WAVEFORM_ENCRYPTION_KEY` orphans the Briefcase proofs it stored; keep the key
+  fixed across restarts in local runs.
+- Tool-call JSON decodes `\uXXXX` escapes: writing a test that needs a literal `\ud83d` through a heredoc produced the
+  emoji instead. Build such strings with `chr(92)` (Python) or check the result with `cat -v`.

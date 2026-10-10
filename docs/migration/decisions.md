@@ -197,3 +197,65 @@ client/CLI `>=0.6.0, <0.7.0`.
 - `refresh_proof` in `silicon-accounts-client` 0.4.0 cannot send an `Idempotency-Key`, so Waveform calls
   `POST /v1/proofs/refresh` directly with its app credentials and a key derived from the refresh token; every other
   Accounts call goes through the client.
+
+## Client and CLI (stage 2)
+
+- **Client shape (0.6.0, breaking).** `signin::SignIn` (Waveform's public client: device flow, short-lived token
+  exchange, refresh, revoke) and `Client` (`Auth::{Anonymous, Bearer, Proof}`, `for_account` for a custodian). No
+  method takes an organization or an actor. `iam()` became `accounts()`; `login`/`refresh`/`logout` moved to
+  `SignIn` because the service no longer has sign-in routes. The updater module and test-environment methods are
+  deleted. README examples compile as doctests.
+- **Two Accounts calls are made directly.** `silicon-accounts-client` 0.4.0 has no secretless short-lived token
+  exchange and its public-client revoke accepts only first-party ids, so `SignIn` posts `grant_type=…:slt` with
+  `client_id=waveform` and `POST /v1/oauth/revoke` (`token`, `token_type_hint=refresh_token`, `client_id`) itself.
+  The device flow and refresh use the client's `app_device_authorize`/`app_device_poll`/`refresh_app_public_client`.
+- **Refusal reasons for short-lived tokens** are classified from Silicon Accounts' exact `error_description`
+  (checked against its source): `slt_already_used`, `slt_expired`, `slt_wrong_app` (names the app), `slt_unknown`,
+  `slt_not_a_short_lived_token` (refused before sending; an old `oac_` token lands here), `slt_access_removed`,
+  `slt_sign_in_ended`. Every hint ends with `silicon-accounts login --app waveform -q | waveform login --slt-stdin`.
+- **Session file.** `<state dir>/accounts-session-<first 8 bytes of sha256(accounts origin), hex>.json`, one per
+  profile and Silicon Accounts origin, so a development sign-in never replaces production. `0600` in a `0700`
+  directory, written to a temp file, synced and renamed. A `.lock` file beside it serialises sign-in, refresh and
+  sign-out (30 s wait, then a precise `sign_in_locked` error). A command refreshes when fewer than 60 s remain, and
+  once more when Waveform calls a token stale (`token_expired`, `sign_in_ended`, `token_inactive`,
+  `unknown_signing_key`); a process that waited for the lock uses the pair another process just saved instead of
+  refreshing again. A refresh that Silicon Accounts refuses with `invalid_grant` deletes the dead sign-in.
+- **Earlier sign-ins** (`session-*.json` from 0.5) are never read: status reports `legacy_session`, commands say
+  "sign in again", and `waveform logout` deletes them together with their lock files and the cached test secrets in
+  `test-environments-*.json`. A stray `session-*.lock` left by an earlier sign-out is not reported as a sign-in.
+- **Signing in again replaces the saved sign-in and revokes the replaced one** at Silicon Accounts (a failure to
+  revoke is a warning). Profiles (`--profile`) remain the way to keep several accounts on one machine.
+- **`login status`.** `--json` always exits 0, including for an invalid profile or an unreadable file (then
+  `{"authenticated":false,"reason":…,"message":…}`). Signed in, it adds `app_id`, `custodian`, `accounts_url`,
+  `api_url`, `profile` and `method` (`device`|`slt`) to the required fields. When Waveform or Silicon Accounts
+  cannot be reached it reports the saved sign-in with `verified:false` and a `warning` instead of failing; when
+  Waveform refuses the token for a reason a refresh cannot cure it reports `authenticated:false` with that reason.
+- **Device flow.** The sign-in is labelled `waveform CLI on <$HOSTNAME|$COMPUTERNAME>` (`--label` overrides). Text
+  mode prints the page and the code on stderr and the result on stdout; `--json` prints one JSON object per line
+  (`device_code`, `slow_down`, `retrying`, then `signed_in` or the error). Network failures while polling are retried
+  until the code expires. `WAVEFORM_TEST_POLL_UNIT_MS` scales the poll interval for tests and is honoured only for a
+  loopback Silicon Accounts.
+- **Command tree.** `provider-key-set|delete` became `provider-keys set|delete` (with `list`, the default);
+  `storage start|status|complete` became `storage approve|status|revoke`; new `audio` (held MP3s), `stt-folder`,
+  `silicons`, `config show`, `tts --text-file`. `--account si:…` selects a Silicon on `jobs`, `preferences`,
+  `provider-keys`, `storage status|revoke` and `telemetry`. `--proof-file` replaces `--obo-app/--obo-token-file`.
+- **Retired spellings fail precisely (exit 2)** instead of with clap's generic error: `--org`/`--organization`/
+  `--actor` (`organizations_removed`), `--test`/`--app-secret-file`/`test-env` (`test_environments_removed`),
+  `--obo-*` (`delegated_tokens_removed`), `daemon`/`config auto-update` (`updater_removed`), the renamed commands
+  (`command_renamed`), and `--account` on `tts|stt|stt-folder|audio` (`speech_runs_as_yourself`) or
+  `storage approve` (`approval_by_the_account_only`). `WAVEFORM_TEST` in the environment only prints a warning (the
+  command still runs, against `--url`); `WAVEFORM_ORG`/`SILICON_ORG` are ignored silently because Silicon runtimes
+  set them for other apps.
+- **Transition aliases** (one minor release, mentioned only here and in `cutover.md`): hidden `waveform iam` prints
+  exactly the `accounts --json` object whether or not `--json` is given; the positional `waveform login <SLT>` stays
+  documented as an alias of `--slt`.
+- **Exit codes** are the Silicon Accounts CLI's: 0 ok, 1 failure, 2 invalid input, 3 not signed in or refused,
+  4 not found, 5 conflict, 6 rate limited. With `--json` every error, including usage errors, is
+  `{"error":{"code","message","hint","details"}}` on stdout.
+- **Docs.** `waveform docs iam` became `waveform docs accounts` (new `docs/accounts.md`); `docs/iam.md` moved to
+  `docs/history/`. `scripts/sync-cli-docs.py` now also keeps `cli/README.md` = `docs/cli.md` and
+  `client/README.md` = `docs/client.md`, so the CLI help, the crate README and the docs site cannot drift. The
+  docs-site navigation lists `accounts.md` instead of `iam.md`.
+- **Service fix found by the live run.** An `?account=` id that Silicon Accounts rejects as malformed
+  (`422 invalid_id`, e.g. too long) answered `503 dependency_unavailable`; it now answers `404 account_not_found`
+  naming the id (real outages stay 503).
