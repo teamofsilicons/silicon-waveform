@@ -7,12 +7,11 @@ use common::{
     tokens,
 };
 use serde_json::{Value, json};
-use std::{
-    fs,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+#[cfg(unix)]
+use std::fs;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use wiremock::{
     Mock, Request, ResponseTemplate,

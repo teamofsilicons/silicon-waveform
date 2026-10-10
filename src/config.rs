@@ -402,7 +402,7 @@ impl Settings {
             }
         }
         let public = load_public(source, environment, &server)?;
-        let briefcase = load_briefcase(source, &accounts.app_id, &limits)?;
+        let briefcase = load_briefcase(source, environment, &accounts.app_id, &limits)?;
         let providers = load_providers(source)?;
         let audio = load_audio(source)?;
         let idempotency = load_idempotency(source)?;
@@ -573,7 +573,7 @@ fn load_public(
     server: &ServerSettings,
 ) -> Result<PublicSettings, SettingsError> {
     let default = if environment == RuntimeEnvironment::Production {
-        "https://backend.waveform.teamofsilicons.com".to_owned()
+        "https://api.waveform.teamofsilicons.com".to_owned()
     } else {
         format!("http://127.0.0.1:{}", server.bind_addr.port())
     };
@@ -593,13 +593,18 @@ fn load_public(
 
 fn load_briefcase(
     source: &impl EnvironmentSource,
+    environment: RuntimeEnvironment,
     waveform_app_id: &str,
     limits: &LimitSettings,
 ) -> Result<BriefcaseSettings, SettingsError> {
     let base_url = http_url_or(
         source,
         "WAVEFORM_BRIEFCASE_BASE_URL",
-        "http://127.0.0.1:8082",
+        if environment == RuntimeEnvironment::Production {
+            "https://api.briefcase.teamofsilicons.com"
+        } else {
+            "http://127.0.0.1:8082"
+        },
     )?;
     let app_id = bounded_string(
         "WAVEFORM_BRIEFCASE_APP_ID",
@@ -642,7 +647,11 @@ fn load_briefcase(
         permanent_origin: origin_url_or(
             source,
             "WAVEFORM_BRIEFCASE_PERMANENT_ORIGIN",
-            "https://127.0.0.1:8082",
+            if environment == RuntimeEnvironment::Production {
+                "https://briefcase.teamofsilicons.com"
+            } else {
+                "https://127.0.0.1:8082"
+            },
         )?,
         base_url,
         app_id,
@@ -1597,6 +1606,17 @@ mod tests {
                 "postgres://waveform:password@db.internal/waveform?sslmode=verify-full",
             );
             environment.set("WAVEFORM_ENCRYPTION_KEY", "19".repeat(32));
+            environment.set("WAVEFORM_REQUIRE_FULL_PROVIDER_CHAIN", "true");
+            environment.set("WAVEFORM_LOG_JSON", "true");
+            environment.set("WAVEFORM_FFMPEG_PATH", "/usr/bin/ffmpeg");
+            for name in [
+                "WAVEFORM_GEMINI_API_KEY",
+                "WAVEFORM_ELEVENLABS_API_KEY",
+                "WAVEFORM_OPENAI_API_KEY",
+                "WAVEFORM_DEEPGRAM_API_KEY",
+            ] {
+                environment.set(name, "provider-test-key");
+            }
             environment.set(
                 "WAVEFORM_APP_SECRET",
                 "sa_app_waveform_a-long-production-secret-value",
@@ -1609,6 +1629,15 @@ mod tests {
         );
         let mut environment = production();
         environment.set("WAVEFORM_ACCOUNTS_WEBHOOK_SECRET", "whsec_production");
+        let settings = Settings::from_source(&environment).expect("valid production settings");
+        assert_eq!(
+            settings.public.base_url.as_str(),
+            "https://api.waveform.teamofsilicons.com/"
+        );
+        assert_eq!(
+            settings.briefcase.base_url.as_str(),
+            "https://api.briefcase.teamofsilicons.com/"
+        );
         environment.set("WAVEFORM_SPEECH_FIXTURES", "true");
         assert!(matches!(
             Settings::from_source(&environment),

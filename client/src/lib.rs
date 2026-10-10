@@ -57,7 +57,7 @@ pub use types::*;
 /// client (this package and the CLI) and the `receiving_app` of proofs sent to Waveform.
 pub const APP_ID: &str = "waveform";
 /// The production Waveform API origin.
-pub const DEFAULT_API_URL: &str = "https://backend.waveform.teamofsilicons.com";
+pub const DEFAULT_API_URL: &str = "https://api.waveform.teamofsilicons.com";
 /// The production Silicon Accounts origin.
 pub const DEFAULT_ACCOUNTS_URL: &str = "https://accounts.teamofsilicons.com";
 /// Waveform's documentation.
@@ -108,7 +108,7 @@ mod lib_tests {
             ("http://127.8.0.1", true),
             ("http://[::1]:4161", true),
             ("http://10.0.0.2", false),
-            ("http://backend.waveform.teamofsilicons.com", false),
+            ("http://api.waveform.teamofsilicons.com", false),
             ("http://localhost.example.com", false),
         ] {
             assert_eq!(

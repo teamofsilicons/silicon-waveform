@@ -135,7 +135,7 @@ async fn discovery_answers_in_an_empty_environment_with_the_exact_shapes() {
         json!({
             "app_id": "waveform",
             "accounts_url": "https://accounts.teamofsilicons.com",
-            "api_url": "https://backend.waveform.teamofsilicons.com",
+            "api_url": "https://api.waveform.teamofsilicons.com",
             "docs_url": "https://docs.waveform.teamofsilicons.com",
             "version": env!("CARGO_PKG_VERSION"),
             "proof_scopes": ["waveform.tts", "waveform.stt"],

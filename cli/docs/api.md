@@ -1,6 +1,6 @@
 # Waveform API
 
-The base is `https://backend.waveform.teamofsilicons.com/api/v1`. The full operation catalogue is
+The base is `https://api.waveform.teamofsilicons.com/api/v1`. The full operation catalogue is
 [`openapi.yaml`](https://docs.waveform.teamofsilicons.com/openapi.yaml); this guide explains how the pieces fit.
 
 ## Authentication
@@ -95,7 +95,7 @@ with the same key (changed content answers `409`).
 
 ## Account events
 
-Silicon Accounts posts signed events to `POST https://backend.waveform.teamofsilicons.com/webhooks/accounts`
+Silicon Accounts posts signed events to `POST https://api.waveform.teamofsilicons.com/webhooks/accounts`
 (headers `X-Accounts-Timestamp`, `X-Accounts-Signature`, verified over the raw body; repeats of an event id are
 ignored). See [Sign in with Silicon Accounts](accounts.md#account-events).
 

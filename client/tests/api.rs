@@ -34,14 +34,14 @@ fn tts_body(id: &str, held: bool) -> serde_json::Value {
 #[test]
 fn urls_must_be_origins_and_plain_http_only_for_this_machine() {
     for ok in [
-        "https://backend.waveform.teamofsilicons.com",
+        "https://api.waveform.teamofsilicons.com",
         "http://127.0.0.1:4161",
         "http://localhost:4161/",
     ] {
         assert!(Client::new(ok, Auth::Anonymous).is_ok(), "{ok}");
     }
     for bad in [
-        "http://backend.waveform.teamofsilicons.com",
+        "http://api.waveform.teamofsilicons.com",
         "https://user:pass@backend.test",
         "https://backend.test/api",
         "https://backend.test/?x=1",
@@ -531,7 +531,7 @@ async fn contract_discovery_sends_the_version_handshake_without_credentials() ->
         .and(path("/api/v1/accounts"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "app_id":"waveform","accounts_url":"https://accounts.teamofsilicons.com",
-            "api_url":"https://backend.waveform.teamofsilicons.com","docs_url":"https://docs.waveform.teamofsilicons.com",
+            "api_url":"https://api.waveform.teamofsilicons.com","docs_url":"https://docs.waveform.teamofsilicons.com",
             "proof_scopes":["waveform.tts","waveform.stt"],"version":"0.6.0"})))
         .expect(1)
         .mount(&server)

@@ -34,7 +34,7 @@ The Next.js/Arc UI website lives in [`web/`](web/README.md). It uses hosted Sili
 
 ## Public API
 
-The base URL is `https://backend.waveform.teamofsilicons.com/api/v1`.
+The base URL is `https://api.waveform.teamofsilicons.com/api/v1`.
 
 - `POST /tts` synthesizes text (with an optional BCP 47 language hint and voice profile), normalizes it to MP3, stores
   it in the account's Briefcase files and returns its permanent URL. When Briefcase cannot take it, the request still

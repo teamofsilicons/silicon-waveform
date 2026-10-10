@@ -40,6 +40,14 @@ impl Home {
             .env("SILICON_HOME", &self.root)
             .env("NO_COLOR", "1")
             .env("WAVEFORM_TEST_POLL_UNIT_MS", "10");
+        // Windows networking and TLS load system components through SystemRoot.
+        // Retain only OS runtime paths, never inherited app credentials/configuration.
+        #[cfg(windows)]
+        for name in ["SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
         command
     }
 
@@ -237,7 +245,8 @@ pub async fn sign_in(
         .await;
     assert!(
         output.status.success(),
-        "{}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
