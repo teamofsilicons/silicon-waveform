@@ -1,6 +1,6 @@
 # Silicon Waveform website
 
-Next.js 16, React 19 and Arc UI, using the Accounts/Apps theme and workspace shell. The website calls the actual Waveform API through a same-origin server proxy. Tokens stay in sealed HTTP-only cookies; the browser uses hosted Silicon Accounts sign-in with PKCE.
+Next.js 16, React 19 and Silicon UI, using the Accounts/Apps theme and workspace shell. The website calls the actual Waveform API through a same-origin server proxy. Tokens stay in sealed HTTP-only cookies; the browser uses hosted Silicon Accounts sign-in with PKCE.
 
 ## Product pages
 
@@ -58,4 +58,4 @@ The release workflow builds `web/Dockerfile` into the existing waveform-frontend
 
 ## Design and provenance
 
-Shared styles and Arc components are under `styles/`, `components/arc/` and `components/foundation/`. Product components are under `components/waveform/`. See `DESIGN.md`, `vendor/uiarc/PROVENANCE.md`, `vendor/uiarc/LICENSE` and the BDO Grotesk font licenses.
+Shared styles and Silicon UI components are under `styles/`, `components/silicon-ui/` and `components/foundation/`. Product components are under `components/waveform/`. See `DESIGN.md`, `vendor/silicon-ui/PROVENANCE.md`, `vendor/uiarc/LICENSE` and the BDO Grotesk font licenses.

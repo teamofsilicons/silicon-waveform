@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useQuery,useQueryClient } from "@tanstack/react-query";
-import { HoldToConfirm } from "@/components/arc/hold-to-confirm/hold-to-confirm";
+import { HoldToConfirm } from "@/components/silicon-ui/hold-to-confirm/hold-to-confirm";
 import { Page,PageHeader,Section,Stack,Cluster,Grid,Button,Input,Textarea,Select,Switch,SettingsGroup,SettingsRow,api,ErrorBox,AccountPicker,accountQuery,useVoices,usePreferences,options,date,type Preferences } from "./common";
 import styles from "./waveform.module.css";
 type Storage={briefcase:{status:string;revoked_reason?:string;refresh_expires_at?:string}};
