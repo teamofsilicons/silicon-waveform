@@ -1,0 +1,339 @@
+{
+  "verified_at": "2026-10-10T15:01:09.073208+00:00",
+  "tag": {
+    "name": "v0.6.0",
+    "object": {
+      "sha": "6457752f1774b0f9cd031dd0b7eae15d4f3b3b91",
+      "type": "commit",
+      "url": "https://api.github.com/repos/teamofsilicons/silicon-waveform/git/commits/6457752f1774b0f9cd031dd0b7eae15d4f3b3b91"
+    }
+  },
+  "release": {
+    "assets": [
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239556",
+        "contentType": "application/json",
+        "createdAt": "2026-10-10T15:00:12Z",
+        "digest": "sha256:1d2f8c91d7d2929cef4ae504047e970ab3de660dac76b0c98ddfca8158566735",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lcizE",
+        "label": "",
+        "name": "release.json",
+        "size": 603,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:13Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/release.json"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239550",
+        "contentType": "application/octet-stream",
+        "createdAt": "2026-10-10T15:00:12Z",
+        "digest": "sha256:a8e5e75709058e25fd8eec4e34d6fbf4c4777e3f75adcd33ca9a49ac65b9155a",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciy-",
+        "label": "",
+        "name": "SHA256SUMS",
+        "size": 613,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:12Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/SHA256SUMS"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239554",
+        "contentType": "application/octet-stream",
+        "createdAt": "2026-10-10T15:00:12Z",
+        "digest": "sha256:509ba977bff15863d5701daf6e1b89da1d840aaae974a43df32ccd2158f78f59",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lcizC",
+        "label": "",
+        "name": "SOURCE_REVISION",
+        "size": 41,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:13Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/SOURCE_REVISION"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239388",
+        "contentType": "application/x-gtar",
+        "createdAt": "2026-10-10T15:00:09Z",
+        "digest": "sha256:1e33df77ad021cf769e52a4ecba2be695920aa59f5acfbffe21905bef48ce1cf",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciwc",
+        "label": "",
+        "name": "waveform-0.6.0-linux-aarch64.tar.gz",
+        "size": 4952910,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:11Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-linux-aarch64.tar.gz"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239522",
+        "contentType": "application/octet-stream",
+        "createdAt": "2026-10-10T15:00:11Z",
+        "digest": "sha256:8d2309ed3e626ebe09989a4165d2829171f8e256e848a61d015a198a45c29bf2",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciyi",
+        "label": "",
+        "name": "waveform-0.6.0-linux-aarch64.tar.gz.sha256",
+        "size": 102,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:12Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-linux-aarch64.tar.gz.sha256"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239391",
+        "contentType": "application/x-gtar",
+        "createdAt": "2026-10-10T15:00:09Z",
+        "digest": "sha256:2e57ce04b9eca30a9ea2425613c39bd1d31bb34657fbbc07de411fdfde46c215",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciwf",
+        "label": "",
+        "name": "waveform-0.6.0-linux-x86_64.tar.gz",
+        "size": 5156677,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:11Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-linux-x86_64.tar.gz"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239521",
+        "contentType": "application/octet-stream",
+        "createdAt": "2026-10-10T15:00:11Z",
+        "digest": "sha256:d90b5def4a48ec6244f5d3616719623e80fe144d89be787917903c5b29c3a26a",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciyh",
+        "label": "",
+        "name": "waveform-0.6.0-linux-x86_64.tar.gz.sha256",
+        "size": 101,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:12Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-linux-x86_64.tar.gz.sha256"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239392",
+        "contentType": "application/x-gtar",
+        "createdAt": "2026-10-10T15:00:09Z",
+        "digest": "sha256:3c08cd04e59363e05b4bb143f68a059f64cadfac335bcc534cbb41f8f8c3b263",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciwg",
+        "label": "",
+        "name": "waveform-0.6.0-macos-aarch64.tar.gz",
+        "size": 4500778,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:11Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-macos-aarch64.tar.gz"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239530",
+        "contentType": "application/octet-stream",
+        "createdAt": "2026-10-10T15:00:12Z",
+        "digest": "sha256:c65a1a59cd56c13e92dc43576794c4e2db1d1835e979d26a23076d79370e8564",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciyq",
+        "label": "",
+        "name": "waveform-0.6.0-macos-aarch64.tar.gz.sha256",
+        "size": 102,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:12Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-macos-aarch64.tar.gz.sha256"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239397",
+        "contentType": "application/x-gtar",
+        "createdAt": "2026-10-10T15:00:09Z",
+        "digest": "sha256:dd28a1eafdb2cbe597d847288c5d13a20a4ff0584d2b714a73c6e9dcde73aeb1",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciwl",
+        "label": "",
+        "name": "waveform-0.6.0-macos-x86_64.tar.gz",
+        "size": 4709929,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:11Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-macos-x86_64.tar.gz"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239536",
+        "contentType": "application/octet-stream",
+        "createdAt": "2026-10-10T15:00:12Z",
+        "digest": "sha256:34a7fcfeb31d4ac442cc6c0f2c50347d44a128723ba5f8fb5bd67c9fd7440019",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciyw",
+        "label": "",
+        "name": "waveform-0.6.0-macos-x86_64.tar.gz.sha256",
+        "size": 101,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:12Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-macos-x86_64.tar.gz.sha256"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239390",
+        "contentType": "application/x-gtar",
+        "createdAt": "2026-10-10T15:00:09Z",
+        "digest": "sha256:6db83789640b54687e1063a2965d8970cb0ef85ffdbfcb7174b5ab1567ec557e",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciwe",
+        "label": "",
+        "name": "waveform-0.6.0-windows-aarch64.tar.gz",
+        "size": 3372737,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:11Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-windows-aarch64.tar.gz"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239549",
+        "contentType": "application/octet-stream",
+        "createdAt": "2026-10-10T15:00:12Z",
+        "digest": "sha256:ffbc5cf490eef9d1b02a9db95ad94b34b13e44344b8d4e6feb39085c175a9787",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciy9",
+        "label": "",
+        "name": "waveform-0.6.0-windows-aarch64.tar.gz.sha256",
+        "size": 104,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:12Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-windows-aarch64.tar.gz.sha256"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239503",
+        "contentType": "application/x-gtar",
+        "createdAt": "2026-10-10T15:00:11Z",
+        "digest": "sha256:17cf2d442dfb9ec1b998e1a116127009496a5c614f47848dcde796ac0a9f444e",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciyP",
+        "label": "",
+        "name": "waveform-0.6.0-windows-x86_64.tar.gz",
+        "size": 3642864,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:12Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-windows-x86_64.tar.gz"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239552",
+        "contentType": "application/octet-stream",
+        "createdAt": "2026-10-10T15:00:12Z",
+        "digest": "sha256:4f07eb168001f8d525c3ee4d6573c8fc3d2af21efd7ff14cadb03c92eea3aa54",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lcizA",
+        "label": "",
+        "name": "waveform-0.6.0-windows-x86_64.tar.gz.sha256",
+        "size": 103,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:12Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-0.6.0-windows-x86_64.tar.gz.sha256"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239567",
+        "contentType": "application/json",
+        "createdAt": "2026-10-10T15:00:13Z",
+        "digest": "sha256:efc0db27b1f9ce080c7fda86d0520c519cb1d1908695c4ac703fa5e23bfb00db",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lcizP",
+        "label": "",
+        "name": "waveform-linux-aarch64.json",
+        "size": 34289,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:13Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-linux-aarch64.json"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239572",
+        "contentType": "application/json",
+        "createdAt": "2026-10-10T15:00:13Z",
+        "digest": "sha256:b5ffc6bf3693d59a0c1de6b2da121d19f063704db463ebc69a4a735c4537d229",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lcizU",
+        "label": "",
+        "name": "waveform-linux-x86_64.json",
+        "size": 34285,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:13Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-linux-x86_64.json"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239569",
+        "contentType": "application/json",
+        "createdAt": "2026-10-10T15:00:13Z",
+        "digest": "sha256:baa0d71c917d96ab8db342a98f39879a919aa517c56e65f5b9dd5026cb13a071",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lcizR",
+        "label": "",
+        "name": "waveform-macos-aarch64.json",
+        "size": 34287,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:13Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-macos-aarch64.json"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239576",
+        "contentType": "application/json",
+        "createdAt": "2026-10-10T15:00:13Z",
+        "digest": "sha256:e20f0ff5d28e168eb8dac8d645bdccb8f06c402f2825115c16d25e7166cfc777",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lcizY",
+        "label": "",
+        "name": "waveform-macos-x86_64.json",
+        "size": 34287,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:13Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-macos-x86_64.json"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239578",
+        "contentType": "application/json",
+        "createdAt": "2026-10-10T15:00:13Z",
+        "digest": "sha256:e024c4dc315c31244a24ba0ba5a17626751b04bb0fe7314516aca08daca711b2",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lciza",
+        "label": "",
+        "name": "waveform-windows-aarch64.json",
+        "size": 34557,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:13Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-windows-aarch64.json"
+      },
+      {
+        "apiUrl": "https://api.github.com/repos/teamofsilicons/silicon-waveform/releases/assets/628239585",
+        "contentType": "application/json",
+        "createdAt": "2026-10-10T15:00:14Z",
+        "digest": "sha256:47c918efb9ac32bd4f58a63ff73363ce2f127f761c58db052ea127a5a178bdf5",
+        "downloadCount": 0,
+        "id": "RA_kwDOUKkiWc4lcizh",
+        "label": "",
+        "name": "waveform-windows-x86_64.json",
+        "size": 34555,
+        "state": "uploaded",
+        "updatedAt": "2026-10-10T15:00:14Z",
+        "url": "https://github.com/teamofsilicons/silicon-waveform/releases/download/v0.6.0/waveform-windows-x86_64.json"
+      }
+    ],
+    "isDraft": false,
+    "tagName": "v0.6.0",
+    "targetCommitish": "6457752f1774b0f9cd031dd0b7eae15d4f3b3b91",
+    "url": "https://github.com/teamofsilicons/silicon-waveform/releases/tag/v0.6.0"
+  },
+  "crates": {
+    "silicon-waveform-client": {
+      "version": "0.6.0",
+      "yanked": false,
+      "checksum": "4b5471b28291d392a4787f7fcb297cfc517b6937e14aa0428a46b1998d5a1fd7"
+    },
+    "waveform-cli": {
+      "version": "0.6.0",
+      "yanked": false,
+      "checksum": "4348dabb9b3b3361ab2a37339fe4a075bf63be8f0f62f4f10707752d40e9e42f"
+    }
+  },
+  "public": [
+    {
+      "url": "https://api.waveform.teamofsilicons.com/health/ready",
+      "status": 200
+    },
+    {
+      "url": "https://api.waveform.teamofsilicons.com/api/v1/me",
+      "status": 401
+    },
+    {
+      "url": "https://waveform.teamofsilicons.com/",
+      "status": 200
+    }
+  ]
+}

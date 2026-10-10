@@ -1,0 +1,42 @@
+{
+  "method": "Existing genuine Accounts CLI sessions rendered through a production BFF test cookie; no synthetic identity or authorization token",
+  "environment": "public production website and API",
+  "pages": [
+    {
+      "app": "waveform",
+      "route": "speech",
+      "status": 200,
+      "heading": "Your words, in another form",
+      "violations": [],
+      "tokens": {
+        "--space-4": "16px",
+        "--space-6": "24px",
+        "--radius-surface": "14px"
+      }
+    },
+    {
+      "app": "waveform",
+      "route": "settings",
+      "status": 200,
+      "heading": "Make Waveform yours",
+      "violations": [],
+      "tokens": {
+        "--space-4": "16px",
+        "--space-6": "24px",
+        "--radius-surface": "14px"
+      }
+    },
+    {
+      "app": "waveform",
+      "route": "history",
+      "status": 200,
+      "heading": "Speech history",
+      "violations": [],
+      "tokens": {
+        "--space-4": "16px",
+        "--space-6": "24px",
+        "--radius-surface": "14px"
+      }
+    }
+  ]
+}
