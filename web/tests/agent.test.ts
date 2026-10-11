@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { llmsTxt, robotsTxt, sitemapXml } from "../lib/agent/files";
+import { appConfig } from "../lib/app.config";
 import { markSvg } from "../lib/brand-svg";
 
 const ORIGIN = "https://waveform.example";
@@ -26,14 +27,13 @@ test("llms.txt says what the app is, how a Silicon installs it and signs in, and
   assert.match(text, /^# Waveform\n\n> Give words a voice. Give audio a transcript\.\n/);
   assert.ok(text.includes("`silicon-apps install waveform`"));
   assert.ok(text.includes("`silicon-accounts login --app waveform -q | waveform login --slt-stdin`"));
-  assert.ok(text.includes("- [Docs](https://github.com/teamofsilicons/silicon-waveform/tree/main/docs)"));
+  assert.ok(text.includes("- [Docs](https://docs.waveform.teamofsilicons.com)"));
   for (const word of ["AI agent", "human", "user account", "organization", " org ", "Honeycomb", "IAM"]) assert.ok(!text.includes(word), `never "${word}"`);
 });
 
-test("the mark is the configured glyph, white on a squircle of the app's colour", () => {
+test("the mark is the configured glyph, in ink on a cream square", () => {
   const svg = markSvg();
-  assert.match(svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" viewBox="0 0 64 64"><path fill="#1F5FB8" d="M32 0c19\.6/);
-  assert.ok(svg.includes('stroke="#FFFFFF"'));
-  assert.ok(svg.includes('<path d="M2 10v4"/>'));
-  assert.match(markSvg({ shape: "square" }), /<rect width="64" height="64" fill="#1F5FB8"\/>/);
+  assert.match(svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" viewBox="0 0 64 64"><rect width="64" height="64" fill="#EDE8E0"\/>/);
+  assert.ok(svg.includes('stroke="#181818"'));
+  assert.ok(svg.includes(`<path d="${appConfig.mark.paths[0]}"/>`));
 });

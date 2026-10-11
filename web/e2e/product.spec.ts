@@ -34,7 +34,7 @@ test("provider keys, preferences and Briefcase authorization persist through the
  await expect(page.getByText("Key saved.",{exact:true})).toBeVisible();
  await page.reload();await expect(page.getByRole("button",{name:"Hold to remove OpenAI key",exact:true})).toBeVisible();
  const remove=page.getByRole("button",{name:"Hold to remove OpenAI key",exact:true});await remove.focus();await page.keyboard.down("Space");await page.waitForTimeout(1800);await page.keyboard.up("Space");await expect(page.getByText("Key removed.",{exact:true})).toBeVisible();
- const telemetry=page.getByRole("switch",{name:"Share operational telemetry"});await telemetry.click();await expect(page.getByText("Telemetry disabled.",{exact:true})).toBeVisible();await page.reload();await expect(telemetry).not.toBeChecked();
+ await expect(page.getByRole("switch",{name:/telemetry/i})).toHaveCount(0);
  const revoke=page.getByRole("button",{name:"Hold to revoke access",exact:true});await revoke.focus();await page.keyboard.down("Space");await page.waitForTimeout(1800);await page.keyboard.up("Space");await expect(page.getByText("Briefcase access revoked.",{exact:true})).toBeVisible();
  await page.getByRole("button",{name:"Approve access",exact:true}).click();await expect(page.getByText("Briefcase access approved.",{exact:true})).toBeVisible();
  await page.evaluate(()=>{(document.activeElement as HTMLElement)?.blur();window.scrollTo(0,0);});await page.waitForTimeout(200);await page.screenshot({path:"../.mig/screens/waveform-settings-desktop.png",fullPage:true,caret:"initial"});
