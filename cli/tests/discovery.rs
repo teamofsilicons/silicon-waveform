@@ -315,8 +315,8 @@ async fn without_silicon_home_the_os_home_is_used() {
             .await,
     );
     assert_eq!(
-        shown["state_dir"].as_str().unwrap(),
-        home.root.join(".waveform/dir").to_str().unwrap()
+        std::path::Path::new(shown["state_dir"].as_str().unwrap()),
+        home.root.join(".waveform").join("dir")
     );
 }
 
