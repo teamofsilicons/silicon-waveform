@@ -128,7 +128,7 @@ impl ProviderFailureKind {
             Self::InvalidResponse => "The provider returned empty, malformed or unsupported audio.",
         }
     }
-    /// Stable privacy-safe label for structured attempt telemetry.
+    /// Stable privacy-safe label for structured attempt logs.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

@@ -83,7 +83,7 @@ approves again with `POST`. A proof caller can only use access the account gave 
 | `GET /me` (alias `/auth/me`) | the signed-in account: `{authenticated, app_id, account{uuid,id,kind,display_name,pfp_url,custodian}, via, expires_at}`; the name and photo come from Silicon Accounts (read once with the account's own token, then kept current by `account.updated`) |
 | `GET /silicons` | the Silicons the signed-in Carbon looks after that Waveform knows |
 | `GET /jobs`, `GET /jobs/{id}` | history with the first 512 characters of each speech text or transcript, newest first (`operation`, `limit` 1-100, `cursor`); jobs called by another app carry `issuing_app` |
-| `GET`/`PATCH /preferences` | `tts_order`, `stt_order`, `voice_profile`, `telemetry_enabled`, with Waveform's `defaults` |
+| `GET`/`PATCH /preferences` | `tts_order`, `stt_order`, `voice_profile`, with Waveform's `defaults` |
 | `GET /voice-profiles` | the voice catalogue and provider mappings ([voice profiles](voice-profiles.md)) |
 | `GET /provider-keys`, `PUT`/`DELETE /provider-keys/{provider}` | write-only saved keys (`{"api_key":…}`) |
 | `POST /reports` | `{message, pr?, client_version?}` with an `Idempotency-Key`; 202 with the report id |
@@ -91,7 +91,8 @@ approves again with `POST`. A proof caller can only use access the account gave 
 
 Saving or deleting a key, a custodian changing a Silicon's settings, and giving or revoking Briefcase access are
 checked with Silicon Accounts at that moment. Reports are limited to ten per account per hour; retry identical content
-with the same key (changed content answers `409`).
+with the same key (changed content answers `409`). Waveform records no telemetry; a `telemetry_enabled` that an older
+client sends to `PATCH /preferences` is ignored.
 
 ## Account events
 
@@ -102,7 +103,7 @@ ignored). See [Sign in with Silicon Accounts](accounts.md#account-events).
 ## Contract negotiation
 
 Every request may send `X-Waveform-API-Version: v1` and `X-Waveform-Protocol-Version: 1`; answers carry
-`X-Waveform-Contract-Version`. `GET /api/contracts` lists versions, the compatibility matrix (client and CLI 0.6) and
+`X-Waveform-Contract-Version`. `GET /api/contracts` lists versions, the compatibility matrix (client and CLI 0.6 and 0.7) and
 the deprecation policy. See [API compatibility](api-contracts.md).
 
 ## Provider controls and request keys

@@ -50,7 +50,7 @@ impl SpeechText {
         &self.0
     }
 
-    /// Returns the Unicode scalar count used by quotas and telemetry.
+    /// Returns the Unicode scalar count used by quotas and logs.
     #[must_use]
     pub fn character_count(&self) -> usize {
         self.0.chars().count()
@@ -293,7 +293,7 @@ impl Transcript {
         &self.0
     }
 
-    /// Returns the transcript byte length for bounded telemetry.
+    /// Returns the transcript byte length for bounded logs.
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()

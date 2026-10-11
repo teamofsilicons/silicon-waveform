@@ -56,12 +56,13 @@ for line in Path(__file__).with_name('defaults.env').read_text().splitlines():
     if line and not line.startswith('#') and '=' in line:
         k, v = line.split('=', 1)
         env[k] = v
-# Settings of the earlier sign-in system may still sit in the secret record; the service no longer reads them.
+# Settings of the earlier sign-in system and of the removed Space Station recorder may still sit in the secret
+# record; the service no longer reads them.
 RETIRED = {'WAVEFORM_IAM_BASE_URL', 'WAVEFORM_IAM_APP_ID', 'WAVEFORM_IAM_APP_SECRET', 'WAVEFORM_IAM_AUDIENCE',
            'WAVEFORM_IAM_TOKEN_INTROSPECTION_PATH', 'WAVEFORM_IAM_OBO_VERIFY_PATH', 'WAVEFORM_IAM_TTS_ACTION',
            'WAVEFORM_IAM_STT_ACTION', 'WAVEFORM_IAM_TIMEOUT_SECONDS', 'WAVEFORM_WEBHOOK_SIGNING_SECRET',
            'WAVEFORM_WEBHOOK_KEY_VERSION', 'WAVEFORM_WEBHOOK_PUBLIC_URL', 'WAVEFORM_HONEYCOMB_SERVICE_TOKEN',
-           'WAVEFORM_BRIEFCASE_CDN_ORIGIN', 'WAVEFORM_BRIEFCASE_AUDIENCE'}
+           'WAVEFORM_BRIEFCASE_CDN_ORIGIN', 'WAVEFORM_BRIEFCASE_AUDIENCE', 'WAVEFORM_TELEMETRY', 'WAVEFORM_TELEMETRY_KEY'}
 env.update({k: str(v) for k, v in secret.items() if k.startswith('WAVEFORM_') and k not in RETIRED})
 env.update({
     'WAVEFORM_ENVIRONMENT': 'production',
@@ -83,7 +84,6 @@ env.update({
     'WAVEFORM_ELEVENLABS_MAX_CONCURRENCY': '2',
     'WAVEFORM_OPENAI_MAX_CONCURRENCY': '2',
     'WAVEFORM_DEEPGRAM_MAX_CONCURRENCY': '2',
-    'SPACE_STATION_HOME': '/tmp/waveform-telemetry',
     'WAVEFORM_SPEECH_FIXTURES': 'false',
 })
 for key in ['WAVEFORM_' + s for s in ['APP_SECRET', 'ACCOUNTS_WEBHOOK_SECRET', 'ENCRYPTION_KEY', 'IDEMPOTENCY_DIGEST_KEY', 'GEMINI_API_KEY', 'ELEVENLABS_API_KEY', 'OPENAI_API_KEY', 'DEEPGRAM_API_KEY']]:

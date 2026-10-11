@@ -6,7 +6,7 @@ Next.js 16, React 19 and Silicon UI, using the Accounts/Apps theme and workspace
 
 - Speech: text-to-speech and Briefcase speech-to-text, voice profiles, provider order, opt-in TTS fallback, request keys, provider controls, language hints, retry-safe requests, playable/downloadable audio and transcripts.
 - History: account selection, operation filtering, paginated requests, running-state refresh and details (the first 512 characters retained by the service).
-- Settings: own or custodial Silicon preferences and provider keys, Briefcase authorization/revocation, telemetry and bug reporting. Speaking and approving Briefcase access always use the signed-in account.
+- Settings: own or custodial Silicon preferences and provider keys, Briefcase authorization/revocation and bug reporting. Speaking and approving Briefcase access always use the signed-in account.
 
 ## Local setup
 

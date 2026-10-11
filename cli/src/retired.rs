@@ -19,7 +19,7 @@ fn flag_error(name: &str) -> Option<CliError> {
             &format!(
                 "{name} was removed: Waveform has no organizations, and everything you do belongs to the account you signed in as."
             ),
-            "Drop the flag. A Carbon reads and manages a Silicon it looks after with --account si:<id> (jobs, preferences, provider-keys, storage, telemetry); nobody runs speech as another account.",
+            "Drop the flag. A Carbon reads and manages a Silicon it looks after with --account si:<id> (jobs, preferences, provider-keys, storage); nobody runs speech as another account.",
         ),
         "--test" | "--app-secret-file" => refuse(
             "test_environments_removed",

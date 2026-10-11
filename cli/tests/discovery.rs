@@ -6,7 +6,7 @@ use common::{Home, Stubs, json_any, json_out, text};
 use serde_json::json;
 use std::fs;
 
-const COMMANDS: [&str; 20] = [
+const COMMANDS: [&str; 19] = [
     "login",
     "logout",
     "accounts",
@@ -22,7 +22,6 @@ const COMMANDS: [&str; 20] = [
     "voice-profiles",
     "provider-keys",
     "storage",
-    "telemetry",
     "report",
     "capabilities",
     "contracts",
@@ -295,20 +294,9 @@ async fn config_home_moves_state_and_the_pointer_stays_under_silicon_home() {
             .unwrap()
     );
     assert!(home.root.join(".waveform/config.json").is_file());
-    json_out(
-        &home
-            .run(&["config", "telemetry", "off", "--json"], None)
-            .await,
-    );
-    assert!(
-        elsewhere
-            .root
-            .join(".waveform/dir/telemetry.json")
-            .is_file()
-    );
     assert!(!home.root.join(".waveform/dir").exists());
     let shown = json_out(&home.run(&["config", "show", "--json"], None).await);
-    assert_eq!(shown["local_telemetry"], false);
+    assert_eq!(shown["state_dir"], value["state_dir"]);
     assert_eq!(shown["signed_in"], serde_json::Value::Null);
     let missing = home
         .run(&["config", "home", "/definitely/not/here"], None)
@@ -321,12 +309,43 @@ async fn without_silicon_home_the_os_home_is_used() {
     let home = Home::new();
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_waveform"));
     command.env_clear().env("HOME", &home.root);
-    json_out(
+    let shown = json_out(
         &home
-            .run_with(command, &["config", "telemetry", "off", "--json"], None)
+            .run_with(command, &["config", "show", "--json"], None)
             .await,
     );
-    assert!(home.root.join(".waveform/dir/telemetry.json").is_file());
+    assert_eq!(
+        shown["state_dir"].as_str().unwrap(),
+        home.root.join(".waveform/dir").to_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn retired_telemetry_commands_change_nothing_and_exit_zero() {
+    let home = Home::new();
+    let top = text(&home.run(&["--help"], None).await);
+    assert!(!top.contains("  telemetry "), "help no longer offers it");
+    for args in [
+        vec!["telemetry", "off"],
+        vec!["telemetry", "on", "--account", "si:scout"],
+        vec!["config", "telemetry", "off"],
+    ] {
+        let output = home.run(&args, None).await;
+        assert!(output.status.success(), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "Telemetry was removed from Waveform; there is nothing to turn on or off.\n",
+            "{args:?}"
+        );
+        let mut with_json = args.clone();
+        with_json.push("--json");
+        let value = json_out(&home.run(&with_json, None).await);
+        assert_eq!(value["telemetry"], "removed", "{args:?}");
+    }
+    assert!(
+        !home.root.join(".waveform").exists(),
+        "no state is read or written"
+    );
 }
 
 #[tokio::test]

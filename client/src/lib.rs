@@ -39,8 +39,8 @@
 mod client;
 mod error;
 pub mod signin;
-/// Optional local Space Station integration, supported on Unix hosts only.
-#[cfg(unix)]
+/// Retired no-ops: Waveform records no telemetry.
+#[deprecated(since = "0.7.0", note = "Waveform records no telemetry")]
 pub mod telemetry;
 mod tts_options;
 mod types;

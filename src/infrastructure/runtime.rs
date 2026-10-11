@@ -39,7 +39,7 @@ use crate::{
         idempotency::{IdempotencyLeaseId, RequestDigestKey},
         media::{BriefcaseOrigin, MediaSizeLimit},
     },
-    shutdown, telemetry,
+    logging, shutdown,
 };
 
 use super::{
@@ -80,8 +80,8 @@ pub enum RuntimeError {
     #[error(transparent)]
     Configuration(#[from] SettingsError),
     /// The global tracing subscriber could not be installed.
-    #[error("failed to initialize process telemetry")]
-    Telemetry,
+    #[error("failed to initialize process logging")]
+    Logging,
     /// The shared provider client could not be constructed.
     #[error("failed to build the provider HTTP client")]
     ProviderClient,
@@ -111,7 +111,7 @@ pub enum RuntimeError {
     Server,
 }
 
-/// Loads environment configuration, initializes telemetry, and runs the API.
+/// Loads environment configuration, initializes logging, and runs the API.
 ///
 /// A missing `.env` file is normal for deployed processes. A present but
 /// unreadable or malformed file fails closed without echoing its contents.
@@ -128,11 +128,11 @@ pub async fn run_from_env() -> Result<(), RuntimeError> {
     }
 
     let settings = Settings::from_env()?;
-    telemetry::init(&settings).map_err(|_| RuntimeError::Telemetry)?;
+    logging::init(&settings).map_err(|_| RuntimeError::Logging)?;
     if !settings.obsolete_variables.is_empty() {
         tracing::warn!(
             variables = ?settings.obsolete_variables,
-            "these IAM- and Honeycomb-era variables are no longer read; delete them"
+            "these variables of earlier releases are no longer read; delete them"
         );
     }
     run(settings).await

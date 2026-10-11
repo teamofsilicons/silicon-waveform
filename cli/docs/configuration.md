@@ -8,8 +8,6 @@
 | Silicon Accounts | `https://accounts.teamofsilicons.com` | `--accounts-url` or `ACCOUNTS_URL` |
 | Profile (one saved sign-in each) | `default` | `--profile NAME` or `WAVEFORM_PROFILE` |
 | State home | `SILICON_HOME`, otherwise `HOME` | `waveform config home /existing/directory` |
-| Local telemetry | On | `waveform config telemetry off` or `WAVEFORM_TELEMETRY=0` |
-| Account telemetry | On | `waveform telemetry off` or the website's settings |
 
 `waveform config show` prints the effective values. The CLI keeps its sign-ins in private files under the state
 home's `.waveform/dir` (`0600` files in a `0700` directory), one per Silicon Accounts origin and profile, so a
@@ -74,18 +72,12 @@ Waveform's app at Silicon Accounts needs:
 Speech is stored in the account's own Briefcase files. When Briefcase is unavailable, refuses, or the request came
 from another app, the speech still completes and Waveform holds the MP3 for the idempotency retention instead.
 
-### Mail and diagnostics
+### Mail
 
 - `WAVEFORM_POSTMARK_TOKEN`: Postmark server token. Reports fail explicitly if production mail is not configured.
 - `WAVEFORM_POSTMARK_URL`: defaults to `https://api.postmarkapp.com/email`; HTTPS only.
-- `WAVEFORM_TELEMETRY_KEY`: ordinary Space Station table recording key for Waveform diagnostics.
-- `WAVEFORM_TELEMETRY=0`: deployment-wide telemetry opt-out.
-- `SPACE_STATION_URL`: optional Space Station override.
 
-Telemetry is enabled by default when its table key is configured. Missing telemetry configuration never prevents a
-request. Account opt-outs suppress that account's diagnostics; CLI opt-outs are stored separately on the local
-machine. Events contain source, step, progress, outcome and version. Tokens, app secrets, report bodies and speech
-text are excluded.
+Waveform records no telemetry: the service, the CLI and the client send no usage events anywhere.
 
 ### Operator commands
 

@@ -43,7 +43,7 @@ The secret holds, as JSON:
 | `WAVEFORM_ENCRYPTION_KEY`, `WAVEFORM_IDEMPOTENCY_DIGEST_KEY` | Keep these across deployments: saved provider keys, Briefcase access and idempotency records depend on them. |
 | `WAVEFORM_GEMINI_API_KEY`, `WAVEFORM_ELEVENLABS_API_KEY`, `WAVEFORM_OPENAI_API_KEY`, `WAVEFORM_DEEPGRAM_API_KEY` | The speech providers. |
 | `WAVEFORM_POSTGRES_PASSWORD`, `POSTGRES_PASSWORD` | The application role's and the PostgreSQL superuser's passwords. |
-| `WAVEFORM_POSTMARK_TOKEN`, `WAVEFORM_TELEMETRY_KEY` | Optional: bug-report mail and Space Station telemetry. |
+| `WAVEFORM_POSTMARK_TOKEN` | Optional: bug-report mail. |
 
 Settings of the earlier sign-in system that may still be in the record are ignored by the installer. Update only the
 intended fields of the secret, using a private JSON file and `--secret-string file://...`; never expand secret values

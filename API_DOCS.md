@@ -159,9 +159,9 @@ request is authorized.
 
 ### `GET /preferences` and `PATCH /preferences`
 
-`tts_order`, `stt_order`, `voice_profile` and `telemetry_enabled`, with Waveform's `defaults` (stored in the database,
-not in code). `PATCH` accepts any of the four. A custodian changing a Silicon's preferences is checked with Silicon
-Accounts at that moment.
+`tts_order`, `stt_order` and `voice_profile`, with Waveform's `defaults` (stored in the database, not in code). `PATCH`
+accepts any of the three; Waveform records no telemetry, so a `telemetry_enabled` sent by an older client is ignored.
+A custodian changing a Silicon's preferences is checked with Silicon Accounts at that moment.
 
 ### `GET /voice-profiles`
 
@@ -187,12 +187,10 @@ at Silicon Accounts), speech is held with `storage_not_authorized` until the acc
 Accounts; a custodian may do both for a Silicon it looks after. Waveform also revokes it when the account signs out
 everywhere, removes Waveform's access or is deleted.
 
-## Contracts, diagnostics and reports
+## Contracts and reports
 
 - `GET /contracts` (also unversioned `GET /api/contracts`): versions, the compatibility matrix and the deprecation
   policy, without authentication. See [API compatibility](docs/api-contracts.md).
-- `POST /telemetry`: records a diagnostics event from the website (step names only); dropped when the account opted
-  out. `204`.
 - `POST /reports`: `{message, pr?, client_version?}` with an `Idempotency-Key`; `202` with the report id. Ten reports
   per account per hour; reports that contain tokens or secrets are refused; retry identical content with the same key
   (changed content answers `409`). A Waveform without configured mail answers `503 postmark_not_configured`.

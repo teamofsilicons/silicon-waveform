@@ -1,7 +1,7 @@
 # Silicon Waveform Rust client
 
 ```sh
-cargo add silicon-waveform-client@0.6
+cargo add silicon-waveform-client@0.7
 ```
 
 `silicon-waveform-client` is a stateless, typed client for Waveform: text to speech and speech to text for Carbons
@@ -76,7 +76,7 @@ match speech.file_url {
 | The signed-in account | `me()`, `login_status()` (never fails on a refused token), `silicons()` |
 | Speech | `tts`, `stt`, `stt_source_folder` (your Waveform folder in Briefcase), `held_audio` |
 | History | `jobs`, `jobs_page(operation, limit, cursor)`, `job`, `wait_for_job` |
-| Settings | `preferences`, `update_preferences`, `set_telemetry`, `voice_profiles` |
+| Settings | `preferences`, `update_preferences`, `voice_profiles` |
 | Provider keys (write-only) | `provider_keys`, `put_provider_key`, `delete_provider_key` |
 | Briefcase access | `approve_storage`, `storage`, `revoke_storage` |
 | Reports | `report(message, pr, idempotency_key)` |
@@ -115,7 +115,14 @@ Waveform's body: `status`, `code`, `message`, `hint`, `reason` (for example `tok
 ## Version handshake
 
 Every request sends `X-Waveform-API-Version: v1` and `X-Waveform-Protocol-Version: 1`; `contracts()` reads the
-compatibility matrix and deprecation policy (`GET /api/contracts`). Client 0.6 works with Waveform contract 2.
+compatibility matrix and deprecation policy (`GET /api/contracts`). Client 0.7 works with Waveform contract 2.
+
+## Upgrading from 0.6
+
+Waveform records no telemetry, and the client sends none (it also asks Silicon Accounts to record none for its
+sign-in calls). What remains is deprecated and does nothing: `set_telemetry` changes nothing and returns the
+settings, `Preferences::telemetry_enabled` is always `None`, `PreferencesUpdate::telemetry_enabled` is never sent,
+and the `telemetry` module records nothing.
 
 ## Upgrading from 0.5
 

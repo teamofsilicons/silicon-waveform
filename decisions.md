@@ -905,3 +905,15 @@ restores the pre-cutover database (keeping the migrated one under another name) 
 start on the new schema. Account events are subscribed with every update picked, since Waveform needs custodian
 changes. Details: [`docs/migration/decisions.md`](docs/migration/decisions.md#ship-stage-packaging-ci-deployment-docs)
 and the runbook [`docs/migration/cutover.md`](docs/migration/cutover.md).
+
+## 2026-10-12 — Waveform records no telemetry
+
+**Status:** Accepted, at the Carbon's request ("no telemetry"). Release 0.7.0 of the service, client and CLI.
+
+The service, the CLI and the client record and send no telemetry: the Space Station recorder, its dependency and
+`POST /api/v1/telemetry` are removed, and the website sends no browser events. The per-account preference is no
+longer read, written or answered; `telemetry_enabled` from an older client is accepted and ignored, and its column
+stays (no destructive migration). `waveform telemetry` and `waveform config telemetry` remain as hidden commands that
+change nothing, and the client's telemetry API remains as deprecated no-ops, so older scripts and callers keep
+working. The client and the service ask Silicon Accounts to record nothing for their calls. Where D-016, D-033 and
+D-047 say "telemetry" they mean the service's own structured logs on its host, which stay.

@@ -184,7 +184,6 @@ impl Harness {
         let state = Arc::new(ControlState {
             pool: pool.clone(),
             mail,
-            station: None,
             app_id: "waveform".to_owned(),
             accounts_url: accounts.issuer(),
             public_url: "http://127.0.0.1:4161".parse()?,
@@ -710,6 +709,29 @@ async fn a_custodian_manages_its_silicons_settings_keys_and_history_and_nobody_e
         preferences["tts_order"],
         json!(["openai", "gemini", "elevenlabs"])
     );
+    // Waveform records no telemetry: an older client's `telemetry_enabled` is accepted and
+    // ignored, no answer carries it, and the browser-event route is gone.
+    assert!(preferences.get("telemetry_enabled").is_none());
+    let (status, updated) = send(
+        &harness.app,
+        "PATCH",
+        "/api/v1/preferences",
+        &[("authorization", &scout)],
+        Some(json!({"telemetry_enabled": false})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["voice_profile"], "puck");
+    assert!(updated.get("telemetry_enabled").is_none());
+    let (status, _) = send(
+        &harness.app,
+        "POST",
+        "/api/v1/telemetry",
+        &[("authorization", &scout)],
+        Some(json!({"event": "page_view"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (_, keys) = send(
         &harness.app,
         "GET",
@@ -1731,7 +1753,7 @@ async fn contract_negotiation_and_operator_deprecation_are_durable() -> TestResu
     let (status, discovery) = send(&harness.app, "GET", "/api/contracts", &[], None).await?;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(discovery["contracts"][0]["contract_version"], "2.0.0");
-    assert_eq!(discovery["compatibility"][0]["cli"], ">=0.6.0, <0.7.0");
+    assert_eq!(discovery["compatibility"][0]["cli"], ">=0.6.0, <0.8.0");
 
     // Deprecation is an operator command now; it needs an active successor.
     assert!(

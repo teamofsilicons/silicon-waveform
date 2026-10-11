@@ -933,7 +933,7 @@ fn postgres_interval(duration: Duration) -> Result<PgInterval, IdempotencyStoreE
 fn map_sqlx_error(error: sqlx::Error) -> IdempotencyStoreError {
     // PostgreSQL diagnostics can include the rejected row. The row may contain
     // a transcript or signed URL, so even the error display is intentionally
-    // excluded from telemetry.
+    // excluded from logs.
     match &error {
         sqlx::Error::PoolTimedOut => {
             tracing::warn!(

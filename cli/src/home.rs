@@ -143,24 +143,6 @@ pub fn configure_home_at(config_path: &Path, location: &Path) -> CliResult<PathB
     Ok(location)
 }
 
-/// Whether the CLI's own diagnostics are on (`<state dir>/telemetry.json`, default on).
-pub fn local_telemetry_enabled() -> bool {
-    fs::read(state_dir().join("telemetry.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|value| value["enabled"].as_bool())
-        .unwrap_or(true)
-}
-
-pub fn set_local_telemetry(enabled: bool) -> CliResult<()> {
-    write_private(
-        &state_dir().join("telemetry.json"),
-        serde_json::json!({ "enabled": enabled })
-            .to_string()
-            .as_bytes(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

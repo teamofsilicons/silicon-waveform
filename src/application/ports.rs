@@ -21,7 +21,7 @@ use crate::domain::{
 /// Text-to-speech provider boundary.
 #[async_trait]
 pub trait TextToSpeechProvider: Send + Sync {
-    /// Canonical identity used for ordering, telemetry, and normalized output.
+    /// Canonical identity used for ordering, logs, and normalized output.
     fn name(&self) -> ProviderName;
 
     /// Clones this adapter with a request-local key, preserving shared limits.
@@ -45,7 +45,7 @@ pub trait TextToSpeechProvider: Send + Sync {
 /// Speech-to-text provider boundary.
 #[async_trait]
 pub trait SpeechToTextProvider: Send + Sync {
-    /// Canonical identity used for ordering, telemetry, and normalized output.
+    /// Canonical identity used for ordering, logs, and normalized output.
     fn name(&self) -> ProviderName;
 
     /// Clones this adapter with a request-local key, preserving shared limits.

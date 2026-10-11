@@ -142,7 +142,7 @@ async fn custodian_selection_applies_to_account_routes_and_never_to_speech() -> 
                 json!({"account":{"uuid":"K1E","id":"si:scout"},"items":[],"next_cursor":null})
             }
             "/api/v1/preferences" => {
-                json!({"account":{"uuid":"K1E","id":"si:scout"},"voice_profile":"puck","tts_order":["gemini"],"stt_order":["gemini"],"telemetry_enabled":true})
+                json!({"account":{"uuid":"K1E","id":"si:scout"},"voice_profile":"puck","tts_order":["gemini"],"stt_order":["gemini"]})
             }
             _ => {
                 json!({"account":{"uuid":"K1E","id":"si:scout"},"items":[{"provider":"gemini","configured":true,"updated_at":"2026-10-10T00:00:00Z"}]})
@@ -369,12 +369,19 @@ async fn the_polling_deadline_includes_a_slow_answer() -> TestResult {
 #[tokio::test]
 async fn settings_storage_and_reports_use_the_documented_bodies() -> TestResult {
     let server = MockServer::start().await;
-    Mock::given(method("PATCH"))
+    // Waveform records no telemetry: the retired `set_telemetry` only reads the settings (an
+    // older Waveform's `telemetry_enabled` is ignored) and never changes them.
+    Mock::given(method("GET"))
         .and(path("/api/v1/preferences"))
-        .and(body_json(json!({"telemetry_enabled":false})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "account":{"uuid":"zQo","id":"c:ada"},"voice_profile":"puck","tts_order":null,"stt_order":null,"telemetry_enabled":false})))
         .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/preferences"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
         .mount(&server)
         .await;
     Mock::given(method("PUT"))
@@ -403,10 +410,27 @@ async fn settings_storage_and_reports_use_the_documented_bodies() -> TestResult 
         .mount(&server)
         .await;
     let client = Client::new(&server.uri(), Auth::Anonymous)?.with_bearer("eyJ-access");
-    assert_eq!(
-        client.set_telemetry(false).await?.telemetry_enabled,
-        Some(false)
-    );
+    #[allow(deprecated)]
+    {
+        let preferences = client.set_telemetry(false).await?;
+        assert_eq!(preferences.voice_profile.as_deref(), Some("puck"));
+        assert_eq!(preferences.telemetry_enabled, None);
+        let retired_only = PreferencesUpdate {
+            telemetry_enabled: Some(false),
+            ..PreferencesUpdate::default()
+        };
+        assert!(retired_only.is_empty());
+        assert!(client.update_preferences(&retired_only).await.is_err());
+        let with_voice = PreferencesUpdate {
+            telemetry_enabled: Some(true),
+            voice_profile: Some("kore".into()),
+            ..PreferencesUpdate::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&with_voice)?,
+            json!({"voice_profile":"kore"})
+        );
+    }
     assert!(
         client
             .update_preferences(&PreferencesUpdate::default())

@@ -117,7 +117,8 @@ def main():
     native_env["WAVEFORM_APP_SECRET"] = new_key
     native_env["WAVEFORM_BIND_ADDR"] = gateway + ":8080"
     native_env["WAVEFORM_FFMPEG_PATH"] = "/opt/waveform/current/bin/ffmpeg"
-    native_env["SPACE_STATION_HOME"] = "/var/lib/waveform-native/telemetry"
+    for retired in ("SPACE_STATION_HOME", "WAVEFORM_TELEMETRY", "WAVEFORM_TELEMETRY_KEY"):
+        native_env.pop(retired, None)  # Waveform records no telemetry.
     database = urllib.parse.urlsplit(native_env["WAVEFORM_DATABASE_URL"])
     assert database.hostname == "postgres", "Unexpected database host"
     query = dict(urllib.parse.parse_qsl(database.query))

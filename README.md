@@ -93,7 +93,7 @@ The crate is a modular monolith:
 PostgreSQL is required for production idempotency. During the configured retention window (24 hours by default and
 never less) it keeps scoped lifecycle state, completed STT results, and only the durable fields of a completed TTS
 result. Speech providers, audio normalization and content mutations are not repeated on replay. Content-free
-provider-attempt outcomes and latency are emitted as structured telemetry rather than transactional data. Waveform
+provider-attempt outcomes and latency go to the service's structured logs rather than transactional data. Waveform
 never persists request text, source media, credentials, raw provider responses or provider error bodies; generated
 audio is kept only while it is held for an account that Briefcase could not serve. Database access, encryption,
 backups and retention must use the speech-data classification.

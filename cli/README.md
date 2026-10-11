@@ -90,7 +90,7 @@ waveform accounts --json
 ```json
 {"app_id":"waveform","accounts_url":"https://accounts.teamofsilicons.com",
  "api_url":"https://backend.waveform.teamofsilicons.com","docs_url":"https://docs.waveform.teamofsilicons.com",
- "version":"0.6.0","proof_scopes":["waveform.tts","waveform.stt"],
+ "version":"0.7.0","proof_scopes":["waveform.tts","waveform.stt"],
  "sign_in":{"carbon":"waveform login","silicon":"silicon-accounts login --app waveform -q | waveform login --slt-stdin",
  "short_lived_token":"silicon-accounts login --app waveform -q"}}
 ```
@@ -157,7 +157,6 @@ waveform voice-profiles                                               # voices a
 waveform provider-keys                                                # providers with a saved key
 waveform provider-keys set gemini --key-file /private/gemini.key      # - reads stdin
 waveform provider-keys delete gemini
-waveform telemetry off                                                # Waveform's diagnostics for your account
 ```
 
 Saved provider keys are encrypted and never shown again; Waveform's own keys are used for providers without one.
@@ -172,7 +171,6 @@ waveform jobs --account si:scout
 waveform preferences --account si:scout --tts-order gemini
 waveform provider-keys set openai --key-file - --account si:scout
 waveform storage status --account si:scout         # and storage revoke
-waveform telemetry off --account si:scout
 ```
 
 Nobody speaks as another account: `tts`, `stt` and `storage approve` always act as the signed-in account.
@@ -218,10 +216,12 @@ errors are `error:` and `hint:` lines on stderr. Exit codes: `0` success, `1` fa
 | Silicon Accounts | `https://accounts.teamofsilicons.com` | `--accounts-url` or `ACCOUNTS_URL` |
 | Profile | `default` | `--profile` or `WAVEFORM_PROFILE` |
 | State home | `SILICON_HOME`, else `HOME` | `waveform config home DIR` |
-| CLI diagnostics | on | `waveform config telemetry off` or `WAVEFORM_TELEMETRY=0` |
 
 Plain `http://` is accepted only for this machine (`localhost`, `127.0.0.1`, `::1`). `waveform config show` prints
 the effective settings. See [configuration](configuration.md) and [testing](testing.md).
+
+Waveform records no telemetry. `waveform telemetry on|off` and `waveform config telemetry on|off` still run, so older
+scripts keep working, but change nothing.
 
 ## Report a bug
 

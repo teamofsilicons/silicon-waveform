@@ -696,8 +696,7 @@ impl Client {
 // ---- settings, provider keys, Briefcase access, reports --------------------------------
 
 impl Client {
-    /// The account's provider orders, default voice and telemetry choice, with Waveform's
-    /// defaults.
+    /// The account's provider orders and default voice, with Waveform's defaults.
     ///
     /// # Errors
     /// Transport, HTTP or decoding failures.
@@ -719,8 +718,7 @@ impl Client {
     pub async fn update_preferences(&self, update: &PreferencesUpdate) -> Result<Preferences> {
         if update.is_empty() {
             return Err(Error::Invalid(
-                "Nothing to change: set a voice profile, a TTS or STT order, or the telemetry choice."
-                    .into(),
+                "Nothing to change: set a voice profile, a TTS order or an STT order.".into(),
             ));
         }
         let call = Call {
@@ -731,16 +729,17 @@ impl Client {
         self.send_json(Method::PATCH, url, call, Some(update)).await
     }
 
-    /// Turns Waveform's diagnostics for the account on or off.
+    /// Changes nothing and returns the account's settings: Waveform records no telemetry, so
+    /// there is nothing to turn on or off.
     ///
     /// # Errors
-    /// As [`Client::update_preferences`].
-    pub async fn set_telemetry(&self, enabled: bool) -> Result<Preferences> {
-        self.update_preferences(&PreferencesUpdate {
-            telemetry_enabled: Some(enabled),
-            ..PreferencesUpdate::default()
-        })
-        .await
+    /// As [`Client::preferences`].
+    #[deprecated(
+        since = "0.7.0",
+        note = "Waveform records no telemetry; there is nothing to turn on or off"
+    )]
+    pub async fn set_telemetry(&self, _enabled: bool) -> Result<Preferences> {
+        self.preferences().await
     }
 
     /// The voice profiles and their provider mappings.

@@ -260,7 +260,6 @@ def service_env(config: Config, keys: dict[str, str], secret: str) -> dict[str, 
         "WAVEFORM_BRIEFCASE_PERMANENT_ORIGIN": config.permanent_origin,
         "WAVEFORM_FFMPEG_PATH": ffmpeg,
         "WAVEFORM_LOG_FILTER": os.environ.get("WAVEFORM_LOG_FILTER", "silicon_waveform=info,tower_http=info"),
-        "WAVEFORM_TELEMETRY": "0",
     })
     return env
 

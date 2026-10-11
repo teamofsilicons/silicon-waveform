@@ -116,7 +116,7 @@ pub async fn request_id(mut request: Request<Body>, next: Next) -> Response {
 ///
 /// Only the validated request ID, method, matched route template, response
 /// status, and elapsed time are recorded. The raw URI (including its query),
-/// headers, and bodies are deliberately never attached to telemetry.
+/// headers, and bodies are deliberately never attached to logs.
 pub async fn trace_request(request: Request<Body>, next: Next) -> Response {
     let request_id = headers::request_id(request.headers());
     let method = request.method().clone();

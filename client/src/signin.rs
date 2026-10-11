@@ -534,6 +534,8 @@ impl SignIn {
         let accounts = AccountsClient::builder()
             .base_url(accounts_url)
             .user_agent(user_agent.clone())
+            // Waveform records no telemetry and asks Silicon Accounts to record none for its calls.
+            .telemetry(false)
             .build()
             .map_err(|error| SignInError::Configuration {
                 message: error.message(),
@@ -811,6 +813,7 @@ impl SignIn {
                 .http
                 .post(url.clone())
                 .header(reqwest::header::ACCEPT, "application/json")
+                .header(silicon_accounts_client::TELEMETRY_HEADER, "off")
                 .form(form)
                 .send()
                 .await

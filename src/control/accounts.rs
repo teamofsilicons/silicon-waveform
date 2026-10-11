@@ -1,5 +1,5 @@
-//! Account settings: provider order, default voice, telemetry opt-out and
-//! write-only provider keys. A custodian may manage its Silicons' settings.
+//! Account settings: provider order, default voice and write-only provider
+//! keys. A custodian may manage its Silicons' settings.
 //!
 //! Rows written in the Accounts era use the org sentinel `@`. Rows from before
 //! (one per former org) are still read: the newest one stands in until the
@@ -70,23 +70,13 @@ impl ControlState {
     /// Creates the account's `@` preferences row on first use: from its newest
     /// legacy row when there is one, else with Waveform's default voice.
     pub(super) async fn ensure_preferences(&self, storage_key: Uuid) -> Result<(), ControlError> {
-        sqlx::query("INSERT INTO waveform_account_preferences(plane_id, org_id, actor_id, tts_order, stt_order, voice_profile, telemetry_enabled) SELECT d.plane_id, $2, $3, legacy.tts_order, legacy.stt_order, COALESCE(legacy.voice_profile, d.voice_profile), COALESCE(legacy.telemetry_enabled, true) FROM waveform_provider_defaults d LEFT JOIN LATERAL (SELECT tts_order, stt_order, voice_profile, telemetry_enabled FROM waveform_account_preferences p WHERE p.plane_id = d.plane_id AND p.actor_id = $3 AND p.org_id <> $2 ORDER BY p.updated_at DESC LIMIT 1) legacy ON true WHERE d.plane_id = $1 ON CONFLICT (plane_id, org_id, actor_id) DO NOTHING")
+        sqlx::query("INSERT INTO waveform_account_preferences(plane_id, org_id, actor_id, tts_order, stt_order, voice_profile) SELECT d.plane_id, $2, $3, legacy.tts_order, legacy.stt_order, COALESCE(legacy.voice_profile, d.voice_profile) FROM waveform_provider_defaults d LEFT JOIN LATERAL (SELECT tts_order, stt_order, voice_profile FROM waveform_account_preferences p WHERE p.plane_id = d.plane_id AND p.actor_id = $3 AND p.org_id <> $2 ORDER BY p.updated_at DESC LIMIT 1) legacy ON true WHERE d.plane_id = $1 ON CONFLICT (plane_id, org_id, actor_id) DO NOTHING")
             .bind(Uuid::nil())
             .bind(ACCOUNT_SCOPE)
             .bind(storage_key)
             .execute(&self.pool)
             .await?;
         Ok(())
-    }
-
-    /// Whether the account allows diagnostics telemetry (default yes).
-    pub(super) async fn telemetry_enabled(&self, storage_key: Uuid) -> Result<bool, ControlError> {
-        Ok(sqlx::query_scalar("SELECT COALESCE((SELECT telemetry_enabled FROM waveform_account_preferences WHERE plane_id=$1 AND actor_id=$2 ORDER BY (org_id = $3) DESC, updated_at DESC LIMIT 1), true)")
-            .bind(Uuid::nil())
-            .bind(storage_key)
-            .bind(ACCOUNT_SCOPE)
-            .fetch_one(&self.pool)
-            .await?)
     }
 }
 
@@ -102,7 +92,7 @@ pub(super) async fn preferences(
         .target(&caller, query.account.as_deref(), Confirm::Recent)
         .await?;
     state.ensure_preferences(target.storage_key()).await?;
-    let row = sqlx::query("SELECT d.tts_order AS default_tts, d.stt_order AS default_stt, p.tts_order, p.stt_order, d.voice_profile AS default_voice_profile, p.voice_profile, COALESCE(p.telemetry_enabled,true) AS telemetry_enabled FROM waveform_provider_defaults d LEFT JOIN waveform_account_preferences p ON p.plane_id=d.plane_id AND p.org_id=$2 AND p.actor_id=$3 WHERE d.plane_id=$1")
+    let row = sqlx::query("SELECT d.tts_order AS default_tts, d.stt_order AS default_stt, p.tts_order, p.stt_order, d.voice_profile AS default_voice_profile, p.voice_profile FROM waveform_provider_defaults d LEFT JOIN waveform_account_preferences p ON p.plane_id=d.plane_id AND p.org_id=$2 AND p.actor_id=$3 WHERE d.plane_id=$1")
         .bind(Uuid::nil()).bind(ACCOUNT_SCOPE).bind(target.storage_key()).fetch_one(&state.pool).await?;
     let default_voice: String = row.try_get("default_voice_profile")?;
     let voice: Option<String> = row.try_get("voice_profile")?;
@@ -112,7 +102,6 @@ pub(super) async fn preferences(
     let stt: Option<Value> = row.try_get("stt_order")?;
     Ok(Json(json!({
         "account": {"uuid": target.record.uuid, "id": target.record.current_id},
-        "telemetry_enabled": row.try_get::<bool, _>("telemetry_enabled")?,
         "voice_profile": voice.unwrap_or_else(|| default_voice.clone()),
         "tts_order": tts.unwrap_or_else(|| default_tts.clone()),
         "stt_order": stt.unwrap_or_else(|| default_stt.clone()),
@@ -123,7 +112,10 @@ pub(super) async fn preferences(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Preferences {
-    telemetry_enabled: Option<bool>,
+    /// Accepted and ignored: clients before 0.7 may still send it, and Waveform records no
+    /// telemetry.
+    #[serde(default, rename = "telemetry_enabled")]
+    _retired_telemetry_choice: serde::de::IgnoredAny,
     voice_profile: Option<String>,
     tts_order: Option<Vec<String>>,
     stt_order: Option<Vec<String>>,
@@ -183,14 +175,13 @@ pub(super) async fn update_preferences(
         .map(|order| resolve_order(&order, &parse("stt_order")?).map_err(invalid_order))
         .transpose()?;
     state.ensure_preferences(target.storage_key()).await?;
-    let row = sqlx::query("UPDATE waveform_account_preferences SET voice_profile=COALESCE($4, voice_profile), tts_order=COALESCE($5, tts_order), stt_order=COALESCE($6, stt_order), telemetry_enabled=COALESCE($7, telemetry_enabled), updated_at=now() WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3 RETURNING tts_order, stt_order, voice_profile, telemetry_enabled")
+    let row = sqlx::query("UPDATE waveform_account_preferences SET voice_profile=COALESCE($4, voice_profile), tts_order=COALESCE($5, tts_order), stt_order=COALESCE($6, stt_order), updated_at=now() WHERE plane_id=$1 AND org_id=$2 AND actor_id=$3 RETURNING tts_order, stt_order, voice_profile")
         .bind(Uuid::nil())
         .bind(ACCOUNT_SCOPE)
         .bind(target.storage_key())
         .bind(body.voice_profile)
         .bind(tts.map(sqlx::types::Json))
         .bind(stt.map(sqlx::types::Json))
-        .bind(body.telemetry_enabled)
         .fetch_one(&state.pool)
         .await?;
     Ok(Json(json!({
@@ -198,7 +189,6 @@ pub(super) async fn update_preferences(
         "voice_profile": row.try_get::<Option<String>, _>("voice_profile")?,
         "tts_order": row.try_get::<Option<Value>, _>("tts_order")?,
         "stt_order": row.try_get::<Option<Value>, _>("stt_order")?,
-        "telemetry_enabled": row.try_get::<bool, _>("telemetry_enabled")?,
     })))
 }
 

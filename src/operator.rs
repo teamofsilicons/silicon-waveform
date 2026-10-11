@@ -467,7 +467,7 @@ async fn consolidate(
     storage_key: Uuid,
     report: &mut LinkReport,
 ) -> Result<(), sqlx::Error> {
-    report.preferences_consolidated += sqlx::query("INSERT INTO waveform_account_preferences(plane_id, org_id, actor_id, tts_order, stt_order, voice_profile, telemetry_enabled, updated_at) SELECT plane_id, $2, actor_id, tts_order, stt_order, voice_profile, telemetry_enabled, updated_at FROM waveform_account_preferences WHERE plane_id=$1 AND actor_id=$3 AND org_id<>$2 ORDER BY updated_at DESC LIMIT 1 ON CONFLICT (plane_id, org_id, actor_id) DO NOTHING")
+    report.preferences_consolidated += sqlx::query("INSERT INTO waveform_account_preferences(plane_id, org_id, actor_id, tts_order, stt_order, voice_profile, updated_at) SELECT plane_id, $2, actor_id, tts_order, stt_order, voice_profile, updated_at FROM waveform_account_preferences WHERE plane_id=$1 AND actor_id=$3 AND org_id<>$2 ORDER BY updated_at DESC LIMIT 1 ON CONFLICT (plane_id, org_id, actor_id) DO NOTHING")
         .bind(Uuid::nil())
         .bind(ACCOUNT_SCOPE)
         .bind(storage_key)
