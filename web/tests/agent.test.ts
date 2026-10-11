@@ -27,7 +27,7 @@ test("llms.txt says what the app is, how a Silicon installs it and signs in, and
   assert.match(text, /^# Waveform\n\n> Give words a voice. Give audio a transcript\.\n/);
   assert.ok(text.includes("`silicon-apps install waveform`"));
   assert.ok(text.includes("`silicon-accounts login --app waveform -q | waveform login --slt-stdin`"));
-  assert.ok(text.includes("- [Docs](https://github.com/teamofsilicons/silicon-waveform/tree/main/docs)"));
+  assert.ok(text.includes("- [Docs](https://docs.waveform.teamofsilicons.com)"));
   for (const word of ["AI agent", "human", "user account", "organization", " org ", "Honeycomb", "IAM"]) assert.ok(!text.includes(word), `never "${word}"`);
 });
 
