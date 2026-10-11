@@ -479,7 +479,7 @@ pub(crate) mod tests {
             br#"{"id":"ask_old"}"#,
         )
         .unwrap();
-        fs::write(dir.join("telemetry.json"), b"{}").unwrap();
+        fs::write(dir.join("config.json"), b"{}").unwrap();
         assert!(matches!(store.load(), Loaded::Missing));
         // Only a saved sign-in counts as one; a lock left by an earlier sign-out does not.
         assert_eq!(store.legacy_files().len(), 1);

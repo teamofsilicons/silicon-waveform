@@ -42,7 +42,7 @@ tags:
   - name: Jobs
     description: The account's speech history
   - name: Settings
-    description: Provider order, voice, telemetry and provider keys for an account
+    description: Provider order, voice and provider keys for an account
   - name: Briefcase access
     description: The proof Waveform holds to store and read the account's Briefcase files
   - name: Webhooks
@@ -346,7 +346,7 @@ paths:
     get:
       tags: [Settings]
       operationId: getPreferences
-      summary: Get the account's provider order, default voice and telemetry choice
+      summary: Get the account's provider order and default voice
       parameters:
         - $ref: '#/components/parameters/Account'
       responses:
@@ -360,8 +360,10 @@ paths:
     patch:
       tags: [Settings]
       operationId: updatePreferences
-      summary: Change the account's provider order, default voice or telemetry choice
-      description: A custodian changing a Silicon's settings must have a live sign-in (checked with Silicon Accounts).
+      summary: Change the account's provider order or default voice
+      description: >-
+        A custodian changing a Silicon's settings must have a live sign-in (checked with Silicon Accounts).
+        Waveform records no telemetry; a `telemetry_enabled` field sent by an older client is ignored.
       parameters:
         - $ref: '#/components/parameters/Account'
       requestBody:
@@ -526,26 +528,6 @@ paths:
                   policy: { type: object }
         '406': { description: Unsupported API or protocol version }
         '410': { description: The requested API version has sunset; use /api/contracts }
-
-  /telemetry:
-    post:
-      tags: [Accounts]
-      operationId: recordBrowserEvent
-      summary: Record a diagnostics event (dropped when the account opted out)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [event]
-              properties:
-                event: { type: string, enum: [speech_completed, speech_failed, settings_saved, page_view] }
-                elapsed_ms: { type: integer, minimum: 0, maximum: 86400000, default: 0 }
-      responses:
-        '204': { description: Event handled }
-        '401': { $ref: '#/components/responses/Unauthorized' }
 
   /reports:
     post:
@@ -886,7 +868,6 @@ components:
       required: [account, tts_order, stt_order, voice_profile, defaults]
       properties:
         account: { $ref: '#/components/schemas/AccountRef' }
-        telemetry_enabled: { type: boolean, default: true }
         voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
         tts_order: { type: array, items: { type: string, enum: [gemini, elevenlabs, openai] } }
         stt_order: { type: array, items: { type: string, enum: [gemini, openai, deepgram] } }
@@ -1114,7 +1095,6 @@ components:
       type: object
       additionalProperties: false
       properties:
-        telemetry_enabled: { type: boolean, default: true }
         voice_profile: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
         tts_order: { type: [array, 'null'], items: { type: string, enum: [gemini, elevenlabs, openai] } }
         stt_order: { type: [array, 'null'], items: { type: string, enum: [gemini, openai, deepgram] } }

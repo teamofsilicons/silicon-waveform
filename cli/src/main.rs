@@ -14,7 +14,7 @@ use std::{ffi::OsString, process::ExitCode};
 use clap::{Parser as _, error::ErrorKind};
 use serde_json::json;
 
-use args::{Args, Command, LoginCommand};
+use args::{Args, Command, ConfigArgs, ConfigCommand, LoginCommand};
 use auth::Ctx;
 use output::{CliError, EXIT_INVALID, Outcome, Output};
 
@@ -96,27 +96,6 @@ fn warn_retired_environment(out: Output) {
     }
 }
 
-/// The telemetry label of a command: a fixed action name, never user input.
-fn step(command: &Command) -> &'static str {
-    match command {
-        Command::Login(args) if args.command.is_some() => "login_status",
-        Command::Login(_) => "login",
-        Command::Logout => "logout",
-        Command::Refresh => "refresh",
-        Command::Tts(_) => "tts",
-        Command::Stt(_) => "stt",
-        Command::SttFolder(_) => "stt_folder",
-        Command::Audio(_) => "held_audio",
-        Command::Jobs(_) => "jobs",
-        Command::Preferences(_) => "preferences",
-        Command::ProviderKeys(_) => "provider_keys",
-        Command::Storage(_) => "storage",
-        Command::Telemetry(_) => "telemetry_preference",
-        Command::Report(_) => "report",
-        _ => "read_configuration",
-    }
-}
-
 async fn run(args: Args) -> i32 {
     let mut out = Output {
         json: args.json,
@@ -136,6 +115,13 @@ async fn run(args: Args) -> i32 {
         }
         Command::Docs(docs) => {
             out.outcome(&commands::docs(&docs.topic));
+            return 0;
+        }
+        Command::Telemetry(_)
+        | Command::Config(ConfigArgs {
+            command: ConfigCommand::Telemetry { .. },
+        }) => {
+            out.outcome(&commands::telemetry_removed());
             return 0;
         }
         _ => {}
@@ -160,26 +146,7 @@ async fn run(args: Args) -> i32 {
         profile: args.profile.clone(),
         profile_dir,
     };
-    #[cfg(unix)]
-    let telemetry = (home::local_telemetry_enabled()
-        && !matches!(args.command, Command::Config(_)))
-    .then(silicon_waveform_client::telemetry::from_environment)
-    .flatten();
-    #[cfg(unix)]
-    let started = std::time::Instant::now();
     let result = dispatch(&ctx, &args.command).await;
-    #[cfg(unix)]
-    if let Some(station) = &telemetry {
-        silicon_waveform_client::telemetry::record(
-            station,
-            "cli",
-            step(&args.command),
-            result.is_ok(),
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
-    }
-    #[cfg(not(unix))]
-    let _ = step(&args.command);
     finish(out, result, status_json)
 }
 
@@ -230,12 +197,11 @@ async fn dispatch(ctx: &Ctx, command: &Command) -> Result<Outcome, CliError> {
         Command::VoiceProfiles => commands::voice_profiles(ctx).await,
         Command::ProviderKeys(args) => commands::provider_keys(ctx, args).await,
         Command::Storage(args) => commands::storage(ctx, &args.command).await,
-        Command::Telemetry(args) => commands::telemetry(ctx, args).await,
         Command::Report(args) => commands::report(ctx, args).await,
         Command::Capabilities => commands::capabilities(ctx).await,
         Command::Contracts => commands::contracts(ctx).await,
         Command::Config(args) => commands::config(ctx, &args.command),
-        Command::Accounts | Command::Iam | Command::Docs(_) => {
+        Command::Accounts | Command::Iam | Command::Docs(_) | Command::Telemetry(_) => {
             unreachable!("answered before any state is read")
         }
     }

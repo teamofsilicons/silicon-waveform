@@ -15,8 +15,7 @@ use silicon_waveform_client::{
 
 use crate::args::{
     AccountArg, AudioArgs, Command, ConfigCommand, JobsArgs, PreferencesArgs, ProofArg,
-    ProviderKeysArgs, ProviderKeysCommand, ReportArgs, StorageCommand, SttArgs, TelemetryArgs,
-    TtsArgs,
+    ProviderKeysArgs, ProviderKeysCommand, ReportArgs, StorageCommand, SttArgs, TtsArgs,
 };
 use crate::auth::{Ctx, call, proof_client, rfc3339};
 use crate::output::{CliError, CliResult, EXIT_FAILURE, Outcome};
@@ -463,10 +462,10 @@ pub async fn jobs(ctx: &Ctx, args: &JobsArgs) -> CliResult<Outcome> {
 pub async fn preferences(ctx: &Ctx, args: &PreferencesArgs) -> CliResult<Outcome> {
     let account = args.account.account.as_ref();
     let update = PreferencesUpdate {
-        telemetry_enabled: None,
         voice_profile: args.voice_profile.clone(),
         tts_order: list_arg(args.tts_order.as_ref()),
         stt_order: list_arg(args.stt_order.as_ref()),
+        ..PreferencesUpdate::default()
     };
     let update = &update;
     let preferences = call(ctx, move |client| async move {
@@ -576,15 +575,14 @@ pub async fn storage(ctx: &Ctx, command: &StorageCommand) -> CliResult<Outcome> 
     ))
 }
 
-pub async fn telemetry(ctx: &Ctx, args: &TelemetryArgs) -> CliResult<Outcome> {
-    let (enabled, account) = (args.enabled == "on", args.account.account.as_ref());
-    let preferences = call(ctx, move |client| async move {
-        with_account(client, account)?.set_telemetry(enabled).await
-    })
-    .await?;
-    Ok(Outcome::data(
-        serde_json::to_value(preferences).unwrap_or_default(),
-    ))
+/// `waveform telemetry on|off` and `waveform config telemetry on|off`: kept so older scripts
+/// keep working. Waveform records no telemetry, so they change nothing and read no state.
+pub fn telemetry_removed() -> Outcome {
+    const MESSAGE: &str =
+        "Telemetry was removed from Waveform; there is nothing to turn on or off.";
+    let mut outcome = Outcome::new(json!({"telemetry": "removed", "message": MESSAGE}), MESSAGE);
+    outcome.compact = true;
+    outcome
 }
 
 pub async fn report(ctx: &Ctx, args: &ReportArgs) -> CliResult<Outcome> {
@@ -717,7 +715,6 @@ pub fn config(ctx: &Ctx, command: &ConfigCommand) -> CliResult<Outcome> {
                 crate::session::Loaded::Missing => Value::Null,
                 crate::session::Loaded::Unreadable { why, .. } => json!({ "unreadable": why }),
             };
-            let local_telemetry = crate::home::local_telemetry_enabled();
             let json = json!({
                 "state_dir": crate::home::state_dir(),
                 "config_file": crate::home::config_path(),
@@ -727,7 +724,6 @@ pub fn config(ctx: &Ctx, command: &ConfigCommand) -> CliResult<Outcome> {
                 "signed_in": signed_in,
                 "api_url": normalize_url(&ctx.api_url),
                 "accounts_url": normalize_url(&ctx.accounts_url),
-                "local_telemetry": local_telemetry,
             });
             let who = json["signed_in"]["id"]
                 .as_str()
@@ -737,14 +733,13 @@ pub fn config(ctx: &Ctx, command: &ConfigCommand) -> CliResult<Outcome> {
                     |id| format!("signed in as {id}"),
                 );
             let text = format!(
-                "State directory   {}\nProfile           {} ({})\nSession file      {} ({who})\nWaveform API      {}\nSilicon Accounts  {}\nLocal telemetry   {}",
+                "State directory   {}\nProfile           {} ({})\nSession file      {} ({who})\nWaveform API      {}\nSilicon Accounts  {}",
                 crate::home::state_dir().display(),
                 ctx.profile,
                 ctx.profile_dir.display(),
                 store.path().display(),
                 normalize_url(&ctx.api_url),
                 normalize_url(&ctx.accounts_url),
-                if local_telemetry { "on" } else { "off" },
             );
             Ok(Outcome::new(json, text))
         }
@@ -759,15 +754,6 @@ pub fn config(ctx: &Ctx, command: &ConfigCommand) -> CliResult<Outcome> {
                 ),
             ))
         }
-        ConfigCommand::Telemetry { enabled } => {
-            let on = enabled == "on";
-            crate::home::set_local_telemetry(on)?;
-            Ok(Outcome::new(
-                json!({"local_telemetry": on}),
-                format!(
-                    "The CLI's own diagnostics on this machine are {enabled}. (Waveform's diagnostics for your account: waveform telemetry on|off.)"
-                ),
-            ))
-        }
+        ConfigCommand::Telemetry { .. } => Ok(telemetry_removed()),
     }
 }

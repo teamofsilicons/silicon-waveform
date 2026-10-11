@@ -162,8 +162,7 @@ class Run:
     def cli(self, home: Path, *args: str, stdin: str | None = None, binary: Path | None = None,
             timeout: float = 120) -> tuple[int, str, str, object]:
         env = {"HOME": str(home), "SILICON_HOME": str(home), "PATH": "/usr/bin:/bin",
-               "WAVEFORM_URL": self.config.api_url, "ACCOUNTS_URL": self.config.accounts_public,
-               "WAVEFORM_TELEMETRY": "0"}
+               "WAVEFORM_URL": self.config.api_url, "ACCOUNTS_URL": self.config.accounts_public}
         result = subprocess.run([str(binary or CLI), *args], input=stdin, capture_output=True, text=True,
                                 timeout=timeout, env=env)
         parsed = None
@@ -356,7 +355,7 @@ def scenario_1(run: Run) -> None:
 
 
 def cli_env(run: Run, home: Path) -> dict:
-    return {"HOME": str(home), "SILICON_HOME": str(home), "PATH": "/usr/bin:/bin", "WAVEFORM_TELEMETRY": "0",
+    return {"HOME": str(home), "SILICON_HOME": str(home), "PATH": "/usr/bin:/bin",
             "WAVEFORM_URL": run.config.api_url, "ACCOUNTS_URL": run.config.accounts_public}
 
 

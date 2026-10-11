@@ -98,8 +98,8 @@ pub enum Command {
     Me,
     /// List the Silicons you look after that Waveform knows (Carbons; empty for a Silicon).
     ///
-    /// Pass one of their ids to --account on jobs, preferences, provider-keys, storage and
-    /// telemetry to manage that Silicon's Waveform data.
+    /// Pass one of their ids to --account on jobs, preferences, provider-keys and storage to
+    /// manage that Silicon's Waveform data.
     Silicons,
     /// Convert text to speech and store the MP3 in your Briefcase files.
     ///
@@ -152,7 +152,8 @@ pub enum Command {
     /// proof Silicon Accounts issues for you. Your first speech request gives it automatically;
     /// `approve` gives it now, `revoke` takes it back (speech is then held by Waveform).
     Storage(StorageArgs),
-    /// Turn Waveform's diagnostics for your account on or off (local CLI telemetry: `config telemetry`).
+    /// Retired: Waveform records no telemetry. Accepted so older scripts keep working; does nothing.
+    #[command(hide = true)]
     Telemetry(TelemetryArgs),
     /// Report a bug to the Waveform maintainers, optionally with the pull request that fixes it.
     #[command(
@@ -165,7 +166,7 @@ pub enum Command {
     Contracts,
     /// Read the bundled guides.
     Docs(DocsArgs),
-    /// Local CLI settings: where state is kept, local telemetry.
+    /// Local CLI settings: where state is kept.
     Config(ConfigArgs),
     /// Transition alias of `accounts --json` for older Silicon runtimes.
     #[command(hide = true)]
@@ -400,7 +401,7 @@ pub enum StorageCommand {
 
 #[derive(ClapArgs, Debug)]
 pub struct TelemetryArgs {
-    /// on or off.
+    /// on or off (ignored).
     #[arg(value_parser = ["on", "off"])]
     pub enabled: String,
     #[command(flatten)]
@@ -437,16 +438,17 @@ pub struct ConfigArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
-    /// Show the effective settings: state directory, URLs, profile, local telemetry.
+    /// Show the effective settings: state directory, URLs, profile.
     Show,
     /// Keep Waveform's state under another existing directory (<DIR>/.waveform/dir).
     Home {
         /// An existing directory.
         location: PathBuf,
     },
-    /// Turn the CLI's own diagnostics on this machine on or off (on by default).
+    /// Retired: Waveform records no telemetry. Accepted so older scripts keep working; does nothing.
+    #[command(hide = true)]
     Telemetry {
-        /// on or off.
+        /// on or off (ignored).
         #[arg(value_parser = ["on", "off"])]
         enabled: String,
     },

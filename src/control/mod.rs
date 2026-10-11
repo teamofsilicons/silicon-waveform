@@ -10,7 +10,6 @@ mod account_tests;
 mod accounts;
 mod audio;
 pub mod contracts;
-mod events;
 mod jobs;
 mod reporting;
 mod sessions;
@@ -63,7 +62,6 @@ const SWEEP_BATCH: i64 = 50;
 pub struct ControlState {
     pool: PgPool,
     mail: Option<reporting::Mail>,
-    station: Option<space_station::SpaceClient>,
     app_id: String,
     accounts_url: String,
     public_url: url::Url,
@@ -96,7 +94,6 @@ impl ControlState {
             .transpose()?;
         Ok(Self {
             mail: reporting::Mail::from_env()?,
-            station: crate::telemetry::from_environment(),
             pool,
             app_id: settings.accounts.app_id.clone(),
             accounts_url: settings.accounts.issuer(),
@@ -306,7 +303,6 @@ pub fn router(state: Arc<ControlState>) -> Router {
         .route("/api/v1/auth/me", get(sessions::me))
         .route("/api/v1/me", get(sessions::me))
         .route("/api/v1/silicons", get(sessions::silicons))
-        .route("/api/v1/telemetry", post(events::record))
         .route("/api/v1/reports", post(reporting::submit))
         .route(
             "/api/v1/storage-authorizations",

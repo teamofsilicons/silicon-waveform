@@ -442,8 +442,9 @@ pub struct Preferences {
     /// The account these settings belong to.
     #[serde(default)]
     pub account: Option<AccountRef>,
-    /// Whether Waveform records diagnostics for this account (default true).
-    #[serde(default)]
+    /// Always `None`: Waveform records no telemetry.
+    #[deprecated(since = "0.7.0", note = "Waveform records no telemetry; always None")]
+    #[serde(skip)]
     pub telemetry_enabled: Option<bool>,
     /// Default voice profile.
     #[serde(default)]
@@ -476,8 +477,9 @@ pub struct PreferenceDefaults {
 /// A change to an account's settings; `None` fields stay as they are.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct PreferencesUpdate {
-    /// Turn Waveform's diagnostics for the account on or off.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Ignored and never sent: Waveform records no telemetry.
+    #[deprecated(since = "0.7.0", note = "Waveform records no telemetry; ignored")]
+    #[serde(skip)]
     pub telemetry_enabled: Option<bool>,
     /// New default voice profile.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -494,7 +496,7 @@ impl PreferencesUpdate {
     /// True when nothing would change.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self == &Self::default()
+        self.voice_profile.is_none() && self.tts_order.is_none() && self.stt_order.is_none()
     }
 }
 

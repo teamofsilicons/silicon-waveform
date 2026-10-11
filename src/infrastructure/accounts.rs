@@ -148,6 +148,7 @@ impl AccountsGateway {
             .timeout(settings.timeout)
             .connect_timeout(settings.timeout.min(Duration::from_secs(5)))
             .user_agent(USER_AGENT)
+            // Waveform records no telemetry and asks Silicon Accounts to record none for its calls.
             .telemetry(false)
             .max_retries(1)
             .build()
@@ -439,6 +440,7 @@ impl AccountsGateway {
             .post(url)
             .basic_auth(&self.app_id, Some(self.app_secret.expose_secret()))
             .header("idempotency-key", idempotency_key)
+            .header(silicon_accounts_client::TELEMETRY_HEADER, "off")
             .json(&serde_json::json!({
                 "proof_refresh_token": refresh_token,
                 "access_ttl_seconds": 1_800,

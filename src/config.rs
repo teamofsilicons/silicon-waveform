@@ -45,8 +45,9 @@ pub struct Settings {
     /// Synchronous input and media limits.
     pub limits: LimitSettings,
     /// Structured logging settings.
-    pub telemetry: TelemetrySettings,
-    /// Variables from the IAM and Honeycomb era that are still set but no longer read.
+    pub logging: LogSettings,
+    /// Variables of earlier releases (IAM, Honeycomb, Space Station) that are still set but no
+    /// longer read.
     pub obsolete_variables: Vec<&'static str>,
 }
 
@@ -346,7 +347,7 @@ pub struct LimitSettings {
 
 /// Process tracing settings.
 #[derive(Clone, Debug)]
-pub struct TelemetrySettings {
+pub struct LogSettings {
     /// Tracing filter directive.
     pub filter: String,
     /// Whether events are emitted as newline-delimited JSON.
@@ -406,7 +407,7 @@ impl Settings {
         let providers = load_providers(source)?;
         let audio = load_audio(source)?;
         let idempotency = load_idempotency(source)?;
-        let telemetry = load_telemetry(source)?;
+        let logging = load_logging(source)?;
         validate_idempotency_lease(&idempotency, &server)?;
         validate_workflow_deadlines(
             &server, &database, &accounts, &briefcase, &providers, &audio,
@@ -425,7 +426,7 @@ impl Settings {
             audio,
             idempotency,
             limits,
-            telemetry,
+            logging,
             obsolete_variables,
         };
         validate_environment_safety(&settings)?;
@@ -435,7 +436,7 @@ impl Settings {
 
 /// IAM- and Honeycomb-era variables that are no longer read. Their presence is
 /// reported once at boot so operators can delete them.
-const OBSOLETE_VARIABLES: [&str; 15] = [
+const OBSOLETE_VARIABLES: [&str; 19] = [
     "WAVEFORM_IAM_BASE_URL",
     "WAVEFORM_IAM_APP_ID",
     "WAVEFORM_IAM_APP_SECRET",
@@ -451,6 +452,11 @@ const OBSOLETE_VARIABLES: [&str; 15] = [
     "WAVEFORM_HONEYCOMB_SERVICE_TOKEN",
     "SILICON_IAM_CLIENT_AUTO_UPDATE",
     "WAVEFORM_BRIEFCASE_CDN_ORIGIN",
+    // Waveform records no telemetry; these configured the Space Station recorder it removed.
+    "WAVEFORM_TELEMETRY",
+    "WAVEFORM_TELEMETRY_KEY",
+    "SPACE_STATION_HOME",
+    "SPACE_STATION_URL",
 ];
 
 fn obsolete_variables(source: &impl EnvironmentSource) -> Result<Vec<&'static str>, SettingsError> {
@@ -985,8 +991,8 @@ fn validate_idempotency_lease(
     Ok(())
 }
 
-fn load_telemetry(source: &impl EnvironmentSource) -> Result<TelemetrySettings, SettingsError> {
-    Ok(TelemetrySettings {
+fn load_logging(source: &impl EnvironmentSource) -> Result<LogSettings, SettingsError> {
+    Ok(LogSettings {
         filter: bounded_string(
             "WAVEFORM_LOG_FILTER",
             value_or(
@@ -1060,7 +1066,7 @@ fn validate_environment_safety(settings: &Settings) -> Result<(), SettingsError>
             "must be true in production",
         ));
     }
-    if !settings.telemetry.json {
+    if !settings.logging.json {
         return Err(invalid("WAVEFORM_LOG_JSON", "must be true in production"));
     }
     if !settings.audio.ffmpeg_path.is_absolute() {
@@ -1585,12 +1591,14 @@ mod tests {
         let mut environment = TestEnvironment::valid();
         environment.set("WAVEFORM_IAM_APP_SECRET", "old-secret");
         environment.set("WAVEFORM_HONEYCOMB_SERVICE_TOKEN", "old-token");
+        environment.set("WAVEFORM_TELEMETRY_KEY", "old-key");
         let settings = Settings::from_source(&environment)?;
         assert_eq!(
             settings.obsolete_variables,
             vec![
                 "WAVEFORM_IAM_APP_SECRET",
-                "WAVEFORM_HONEYCOMB_SERVICE_TOKEN"
+                "WAVEFORM_HONEYCOMB_SERVICE_TOKEN",
+                "WAVEFORM_TELEMETRY_KEY"
             ]
         );
         Ok(())

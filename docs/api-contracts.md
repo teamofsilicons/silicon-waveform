@@ -6,8 +6,8 @@ Discovery stays reachable when a version is sunset: the client uses the unversio
 
 | Consumer | API | Wire protocol | Contract | Credentials |
 | --- | --- | --- | --- | --- |
-| Waveform Rust client 0.6.x | v1 | 1 (HTTP JSON) | 2.0.0 | Silicon Accounts bearer token or proof |
-| Waveform CLI 0.6.x | v1 | 1 (HTTP JSON) | 2.0.0 | Silicon Accounts bearer token or proof |
+| Waveform Rust client 0.6.x and 0.7.x | v1 | 1 (HTTP JSON) | 2.0.0 | Silicon Accounts bearer token or proof |
+| Waveform CLI 0.6.x and 0.7.x | v1 | 1 (HTTP JSON) | 2.0.0 | Silicon Accounts bearer token or proof |
 | The website and other HTTP consumers | v1 | 1 (default) | 2.0.0 | Silicon Accounts bearer token or proof |
 
 Contract 2.0.0 is the move to Silicon Accounts: every route takes `Authorization: Bearer <access token>` (a Silicon
@@ -48,7 +48,7 @@ version. Deprecation is retry-safe and does not reset its starting timestamp. De
 
 A deprecated version sunsets after seven consecutive days with zero requests, counted from the later of its
 deprecation or its last request, and only while its successor is active. Every admitted versioned request counts,
-even when its operation fails. This contract accounting is independent of optional telemetry.
+even when its operation fails.
 
 Request admission and the periodic maintenance task persist retirement in PostgreSQL. At the quiet-period boundary,
 requests answer `410 api_version_sunset`; incoming traffic cannot revive the version. Discovery stays unversioned and

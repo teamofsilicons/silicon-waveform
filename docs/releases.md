@@ -34,11 +34,11 @@ To package one build on your own machine:
 
 ```sh
 cargo build --release --locked --manifest-path cli/Cargo.toml
-scripts/package-apps.sh 0.6.0 macos-aarch64 cli/target/release/waveform
+scripts/package-apps.sh 0.7.0 macos-aarch64 cli/target/release/waveform
 ```
 
 It needs Python 3.9+ and `silicon-apps` 0.2 (`cargo install --locked silicon-apps-cli --version 0.2.0`), writes
-`dist/apps/waveform-0.6.0-macos-aarch64.tar.gz` and its `.sha256`, and refuses a binary that is not native for the
+`dist/apps/waveform-0.7.0-macos-aarch64.tar.gz` and its `.sha256`, and refuses a binary that is not native for the
 target, a dynamically linked Linux binary, or one that answers the three commands wrongly. A binary this machine
 cannot run is packed with a note: the Silicon Apps validation worker for its target runs the commands at upload.
 
@@ -49,12 +49,12 @@ Silicon Apps validates uploads on its Linux workers today (`linux-x86_64`, `linu
 (a release's packages cannot change afterwards, so those targets join a later release).
 
 ```sh
-silicon-apps upload waveform --target linux-x86_64 waveform-0.6.0-linux-x86_64.tar.gz
-silicon-apps upload waveform --target linux-aarch64 waveform-0.6.0-linux-aarch64.tar.gz
+silicon-apps upload waveform --target linux-x86_64 waveform-0.7.0-linux-x86_64.tar.gz
+silicon-apps upload waveform --target linux-aarch64 waveform-0.7.0-linux-aarch64.tar.gz
 silicon-apps packages waveform
-silicon-apps release waveform --version 0.6.0 --package <linux-x86_64 package id> --package <linux-aarch64 package id>
+silicon-apps release waveform --version 0.7.0 --package <linux-x86_64 package id> --package <linux-aarch64 package id>
 silicon-apps install 'waveform>dev'          # check the development release on a Linux machine
-silicon-apps promote waveform <development release id> --version 0.6.0
+silicon-apps promote waveform <development release id> --version 0.7.0
 ```
 
 Then publish the Rust crates, the client first (Cargo resolves the CLI's client dependency from crates.io):
@@ -74,6 +74,21 @@ Build the native bundle with the **Build native backend bundle** workflow and de
 [`deploy/native`](../deploy/native/README.md): `upgrade.py` for a release, `install-frontend.py` for the website's
 image. The 0.6.0 release moves to Silicon Accounts once, with `accounts_cutover.py`, in the order the
 [cutover runbook](migration/cutover.md) gives.
+
+## 0.7.0: no telemetry
+
+Waveform records no telemetry. The service, client and CLI are 0.7.0; the API stays `/api/v1` with contract 2.0.0,
+and clients and CLIs 0.6 keep working.
+
+- **Service.** The Space Station recorder and `POST /api/v1/telemetry` are gone. `GET`/`PATCH /preferences` no
+  longer answer `telemetry_enabled`; one sent by an older client is ignored. The service logs a reminder to delete
+  `WAVEFORM_TELEMETRY`, `WAVEFORM_TELEMETRY_KEY`, `SPACE_STATION_HOME` or `SPACE_STATION_URL` while they are still
+  set. No migration: the unused `telemetry_enabled` column stays.
+- **CLI.** It records nothing. `waveform telemetry on|off` and `waveform config telemetry on|off` still exit 0 (they
+  print that there is nothing to turn on or off) and are hidden from help; `config show` drops `local_telemetry`.
+- **Rust client.** It records nothing and asks Silicon Accounts to record nothing for its sign-in calls.
+  `set_telemetry`, the `telemetry_enabled` fields and the `telemetry` module are deprecated no-ops
+  ([upgrading from 0.6](client.md#upgrading-from-06)).
 
 ## 0.6.0: Silicon Accounts and Silicon Apps
 

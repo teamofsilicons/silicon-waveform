@@ -12,7 +12,7 @@ export { Page, PageHeader, Section, Stack, Cluster, Grid, Surface, SettingsGroup
 export { api };
 export type Account = {uuid:string;id:string;kind:"carbon"|"silicon";display_name?:string;pfp_url?:string;custodian?:{uuid:string;id:string}};
 export type Voice={id:string;name:string;description:string;revision:number;auditioned:boolean};
-export type Preferences={voice_profile:string|null;telemetry_enabled:boolean;tts_order:string[];stt_order:string[];defaults:{voice_profile:string|null;tts_order:string[];stt_order:string[]}};
+export type Preferences={voice_profile:string|null;tts_order:string[];stt_order:string[];defaults:{voice_profile:string|null;tts_order:string[];stt_order:string[]}};
 export type Job={id:string;operation:"tts"|"stt";status:string;first_line:string;duration_ms:number|null;provider:string|null;error_code:string|null;created_at:string;finished_at:string|null;issuing_app?:string|null;voice_profile?:{id:string;revision:number}};
 export type SpeechResult={request_id:string;provider:string;duration_ms:number|null;file_url?:string|null;audio_url?:string|null;transcript?:string;detected_language?:string|null;storage?:{status:string;message?:string;expires_at?:string}};
 export const providers = {gemini:"Gemini",openai:"OpenAI",elevenlabs:"ElevenLabs",deepgram:"Deepgram"};
