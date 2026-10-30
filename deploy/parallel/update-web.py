@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Replace only the Accounts website after probing an exact ARM64 image; retain rollback."""
-import argparse, hashlib, json, pathlib, re, subprocess, time
+import argparse, hashlib, json, os, pathlib, re, subprocess, time
 p=argparse.ArgumentParser();p.add_argument('--archive',type=pathlib.Path,required=True);p.add_argument('--sha256',required=True);p.add_argument('--revision',required=True);a=p.parse_args()
 assert re.fullmatch('[a-f0-9]{40}',a.revision) and hashlib.sha256(a.archive.read_bytes()).hexdigest()==a.sha256
 def run(args):return subprocess.run(args,check=True,capture_output=True,text=True).stdout
@@ -10,8 +10,11 @@ run(['docker','load','--input',str(a.archive)]);image=json.loads(run(['docker','
 assert image['Architecture']=='arm64' and image['Config']['Labels']['org.opencontainers.image.revision']==a.revision
 image_id=image['Id'];assert re.fullmatch('sha256:[a-f0-9]{64}',image_id)
 old_image=re.findall('sha256:[a-f0-9]{64}',before);assert len(old_image)==1
+if 'REFRESH_STATE_PATH=' not in before:
+ before=before.replace(old_image[0], '--mount type=bind,src=/var/lib/waveform-browser-sessions,dst=/var/lib/browser-sessions --env REFRESH_STATE_PATH=/var/lib/browser-sessions/state.sqlite '+old_image[0])
+state=pathlib.Path('/var/lib/waveform-browser-sessions');state.mkdir(exist_ok=True,mode=0o700);state.chmod(0o700);os.chown(state,1000,1000)
 name='waveform-accounts-frontend-candidate'
-run(['docker','run','-d','--name',name,'--network','waveform','--memory','384m','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--tmpfs','/tmp:rw,nosuid,noexec,size=16m','--tmpfs','/app/.next/cache:rw,nosuid,noexec,size=64m','--env-file','/etc/waveform-accounts/web.docker.env','-e','PORT=4325','-e','HOSTNAME=0.0.0.0',image_id])
+run(['docker','run','-d','--name',name,'--network','waveform','--memory','384m','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--tmpfs','/tmp:rw,nosuid,noexec,size=16m','--tmpfs','/app/.next/cache:rw,nosuid,noexec,size=64m','--mount','type=bind,src=/var/lib/waveform-browser-sessions,dst=/var/lib/browser-sessions','-e','REFRESH_STATE_PATH=/var/lib/browser-sessions/state.sqlite','--env-file','/etc/waveform-accounts/web.docker.env','-e','PORT=4325','-e','HOSTNAME=0.0.0.0',image_id])
 def ready(container):
  for _ in range(45):
   r=subprocess.run(['docker','exec',container,'node','-e',"fetch('http://127.0.0.1:4325/auth/session').then(async r=>{let v=await r.json();process.exit(r.ok&&v.signed_in===false?0:1)}).catch(()=>process.exit(1))"],capture_output=True)

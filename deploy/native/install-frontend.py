@@ -10,7 +10,7 @@ APP_SECRET is copied from native.env's WAVEFORM_APP_SECRET on every run (the web
 Silicon Accounts), and SESSION_SECRET is generated once and kept (a new one signs every browser out).
 
 The image (built from web/Dockerfile) must run the Next.js standalone server as an unprivileged user on PORT, write
-only to /tmp and /app/.next/cache, and answer GET /auth/session with 200.
+only to /tmp, /app/.next/cache, and the persistent browser session volume, and answer GET /auth/session with 200.
 """
 import argparse
 import json
@@ -80,11 +80,16 @@ password = run('aws', 'ecr', 'get-login-password', '--region', 'us-east-1', capt
 run('docker', 'login', '--username', 'AWS', '--password-stdin', args.image.split('/')[0], input=password,
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 run('docker', 'pull', args.image)
+state = Path('/var/lib/waveform-browser-sessions')
+state.mkdir(exist_ok=True, mode=0o700)
+state.chmod(0o700)
+os.chown(state, 1000, 1000)
 previous = unit.read_text()
 command = ['/usr/bin/docker', 'run', '--name', 'waveform-frontend', '--network', 'waveform', '--memory', '256m',
     '--read-only', '--cap-drop', 'ALL', '--pids-limit', '128', '--security-opt', 'no-new-privileges',
     '--tmpfs', '/tmp:rw,nosuid,noexec,size=16m', '--tmpfs', '/app/.next/cache:rw,nosuid,noexec,size=64m',
     '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
+    '--mount','type=bind,src=/var/lib/waveform-browser-sessions,dst=/var/lib/browser-sessions','-e','REFRESH_STATE_PATH=/var/lib/browser-sessions/state.sqlite',
     '--env-file', str(web_env_path),
     '-e', 'NODE_ENV=production', '-e', 'PORT=4325', '-e', 'HOSTNAME=0.0.0.0',
     '-e', 'APP_ID=waveform',

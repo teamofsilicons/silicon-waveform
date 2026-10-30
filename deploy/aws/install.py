@@ -196,7 +196,11 @@ commands={
      '-v',str(data/'caddy-config')+':/config',*common,pinned['proxy']],
 }
 if frontend_image:
-    # The website keeps sessions in sealed cookies: no state on the host. Its secrets reach it through --env-file;
+    state = Path('/var/lib/waveform-browser-sessions')
+    state.mkdir(exist_ok=True, mode=0o700)
+    state.chmod(0o700)
+    os.chown(state, 1000, 1000)
+    # Encrypted refresh state persists on the host. Secrets reach the website through --env-file;
     # SESSION_SECRET is generated once and kept (a new one signs every browser out).
     web_env = {}
     if (config/'web.env').exists():
@@ -207,6 +211,7 @@ if frontend_image:
     commands['frontend'] = ['docker','run','--name','waveform-frontend','--memory','256m',
         '--read-only','--cap-drop','ALL','--pids-limit','128',
         '--tmpfs','/tmp:rw,nosuid,noexec,size=16m','--tmpfs','/app/.next/cache:rw,nosuid,noexec,size=64m',
+        '--mount','type=bind,src=/var/lib/waveform-browser-sessions,dst=/var/lib/browser-sessions','-e','REFRESH_STATE_PATH=/var/lib/browser-sessions/state.sqlite',
         '--env-file',str(config/'web.env'),
         '-e','NODE_ENV=production','-e','PORT=4325','-e','HOSTNAME=0.0.0.0','-e','APP_ID=waveform',
         '-e','ACCOUNTS_URL='+env['ACCOUNTS_URL'],
